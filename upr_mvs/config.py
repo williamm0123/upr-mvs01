@@ -8,6 +8,12 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_DTU_TRAIN_ROOT = Path("E:/documents/DATASET/DTU/dtu_training")
+DEFAULT_DTU_TEST_ROOT = Path("E:/documents/DATASET/DTU/dtu_test")
+DEFAULT_DA3_ROOT = Path("E:/documents/DATASET/pre_trained/DA3")
+DEFAULT_DA3_MONO_MODEL_DIR = DEFAULT_DA3_ROOT / "DA3MONO-LARGE"
+DEFAULT_DINOV3_PRETRAINED_ROOT = Path("E:/documents/DATASET/pre_trained/DINOv3/pre_trained")
+DEFAULT_DINOV3_WEIGHTS_FILE = DEFAULT_DINOV3_PRETRAINED_ROOT / "dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth"
 
 
 def _env_path(name: str, default: str | Path) -> Path:
@@ -17,21 +23,12 @@ def _env_path(name: str, default: str | Path) -> Path:
 @dataclass(frozen=True)
 class ProjectPaths:
     repo_root: Path = REPO_ROOT
-    upr_mvs_root: Path = field(
-        default_factory=lambda: _env_path("UPR_MVS_PROJECT_ROOT", "/home/william/project/UPR-MVS")
-    )
-    dtu_train_root: Path = field(
-        default_factory=lambda: _env_path("DTU_TRAIN_ROOT", "/home/william/project/dataset/DTU/dtu_training")
-    )
-    dtu_test_root: Path = field(
-        default_factory=lambda: _env_path("DTU_TEST_ROOT", "/home/william/project/dataset/DTU/dtu_test")
-    )
+    upr_mvs_root: Path = field(default_factory=lambda: _env_path("UPR_MVS_PROJECT_ROOT", REPO_ROOT))
+    dtu_train_root: Path = field(default_factory=lambda: _env_path("DTU_TRAIN_ROOT", DEFAULT_DTU_TRAIN_ROOT))
+    dtu_test_root: Path = field(default_factory=lambda: _env_path("DTU_TEST_ROOT", DEFAULT_DTU_TEST_ROOT))
     dtu_list_path: Path = field(default_factory=lambda: REPO_ROOT / "lists/dtu/test.txt")
     dinov3_weights_file: Path = field(
-        default_factory=lambda: _env_path(
-            "DINOV3_WEIGHTS_FILE",
-            "/home/william/project/dataset/DINOv3/pre_trained/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth",
-        )
+        default_factory=lambda: _env_path("DINOV3_WEIGHTS_FILE", DEFAULT_DINOV3_WEIGHTS_FILE)
     )
 
 
