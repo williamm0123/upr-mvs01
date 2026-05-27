@@ -9,9 +9,9 @@ from typing import Literal
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
-MACHINE: Literal["ubuntu", "windows", "umhpc"] = "ubuntu"
+MACHINE: Literal["ubuntu", "windows", "umhpc"] = "umhpc"
 
-TRAIN_PROFILE: Literal["local", "umhpc"] = "local"
+TRAIN_PROFILE: Literal["local", "umhpc"] = "umhpc"
 
 
 def _default_paths() -> dict[str, Path]:
