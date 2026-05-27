@@ -1,6 +1,0 @@
-[submodule "models/vggt"]
-	path = models/vggt
-	url = https://github.com/facebookresearch/vggt.git
-[submodule "models/Depth-Anything-3"]
-	path = models/Depth-Anything-3
-	url = https://github.com/ByteDance-Seed/Depth-Anything-3.git
