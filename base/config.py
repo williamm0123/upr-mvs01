@@ -23,8 +23,10 @@ def _default_paths() -> dict[str, Path]:
 
     if MACHINE == "windows":
         project_path = Path(r"E:/documents/Project/point based/uprmvs01")
+        output_root = project_path / "outputs"
         return {
             "project_path": project_path,
+            "output_root": output_root,
             "dtu_train_root": Path(r"E:/documents/dataset/DTU/dtu_training"),
             "dtu_test_root": Path(r"E:/documents/dataset/DTU/dtu_testing"),
             "dtu_list_path": project_path / "lists/dtu/test.txt",
@@ -33,13 +35,15 @@ def _default_paths() -> dict[str, Path]:
             ),
             "da3_weights_file": Path("E:/documents/dataset/pretrained/DA3/DA3MONO-LARGE"),
             "vggt_weights_path": Path("E:/documents/dataset/VGGT/pretrained/VGGT-1B"),
-            "offline_prior_root": project_path / "outputs/vggt_da3_normal_fill_denoised",
+            "offline_prior_root": output_root / "vggt_da3_normal_fill_denoised",
         }
 
     if MACHINE == "umhpc":
         project_path = Path("/scr/user/qinglong/projects/upr-mvs01")
+        output_root = Path("/scr/user/qinglong/projects/uprmvs_outputs")
         return {
             "project_path": project_path,
+            "output_root": output_root,
             "dtu_train_root": Path("/scr/user/qinglong/dataset/DTU/dtu_training"),
             "dtu_test_root": Path("/scr/user/qinglong/dataset/DTU/dtu_testing"),
             "dtu_list_path": project_path / "lists/dtu/test.txt",
@@ -48,12 +52,14 @@ def _default_paths() -> dict[str, Path]:
             ),
             "da3_weights_file": Path("/scr/user/qinglong/dataset/pretrained/DA3/DA3MONO-LARGE"),
             "vggt_weights_path": Path("/scr/user/qinglong/dataset/VGGT/pretrained/VGGT-1B"),
-            "offline_prior_root": project_path / "outputs/vggt_da3_normal_fill_denoised",
+            "offline_prior_root": output_root / "vggt_da3_normal_fill_denoised",
         }
 
     project_path = Path("/home/william/project/uprmvs01")
+    output_root = project_path / "outputs"
     return {
         "project_path": project_path,
+        "output_root": output_root,
         "dtu_train_root": Path("/home/william/project/dataset/DTU/dtu_training"),
         "dtu_test_root": Path("/home/william/project/dataset/DTU/dtu_test"),
         "dtu_list_path": project_path / "lists/dtu/test.txt",
@@ -62,7 +68,7 @@ def _default_paths() -> dict[str, Path]:
         ),
         "da3_weights_file": Path("/home/william/project/dataset/DA3/DA3MONO-LARGE"),
         "vggt_weights_path": Path("/home/william/project/dataset/VGGT/pretrained/VGGT-1B"),
-        "offline_prior_root": project_path / "outputs/vggt_da3_normal_fill_denoised",
+        "offline_prior_root": output_root / "vggt_da3_normal_fill_denoised",
     }
 
 
@@ -82,7 +88,7 @@ class ProjectPaths:
     train_list_file: Path = _DEFAULT_PATHS["project_path"] / "lists/dtu/train.txt"
     val_list_file: Path = _DEFAULT_PATHS["project_path"] / "lists/dtu/val.txt"
     test_list_file: Path = _DEFAULT_PATHS["project_path"] / "lists/dtu/test.txt"
-    output_root: Path = _DEFAULT_PATHS["project_path"] / "outputs"
+    output_root: Path = _DEFAULT_PATHS["output_root"]
 
 
 @dataclass(frozen=True)
