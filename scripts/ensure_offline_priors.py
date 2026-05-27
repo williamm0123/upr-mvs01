@@ -12,7 +12,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from base.config import build_mvs_config
-from models.prior_precompute import ensure_offline_priors
+from data.prior_precompute import ensure_offline_priors
 
 
 def main() -> None:

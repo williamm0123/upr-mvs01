@@ -33,7 +33,7 @@ def _default_paths() -> dict[str, Path]:
             ),
             "da3_weights_file": Path("E:/documents/dataset/pretrained/DA3/DA3MONO-LARGE"),
             "vggt_weights_path": Path("E:/documents/dataset/VGGT/pretrained/VGGT-1B"),
-            "offline_prior_root": project_path / "outputs/sfm_da3_loggrad_fill_testset_denoised",
+            "offline_prior_root": project_path / "outputs/vggt_da3_normal_fill_denoised",
         }
 
     if MACHINE == "umhpc":
@@ -48,7 +48,7 @@ def _default_paths() -> dict[str, Path]:
             ),
             "da3_weights_file": Path("/scr/user/qinglong/dataset/pretrained/DA3/DA3MONO-LARGE"),
             "vggt_weights_path": Path("/scr/user/qinglong/dataset/VGGT/pretrained/VGGT-1B"),
-            "offline_prior_root": project_path / "outputs/sfm_da3_loggrad_fill_testset_denoised",
+            "offline_prior_root": project_path / "outputs/vggt_da3_normal_fill_denoised",
         }
 
     project_path = Path("/home/william/project/uprmvs01")
@@ -62,7 +62,7 @@ def _default_paths() -> dict[str, Path]:
         ),
         "da3_weights_file": Path("/home/william/project/dataset/DA3/DA3MONO-LARGE"),
         "vggt_weights_path": Path("/home/william/project/dataset/VGGT/pretrained/VGGT-1B"),
-        "offline_prior_root": project_path / "outputs/sfm_da3_loggrad_fill_testset_denoised",
+        "offline_prior_root": project_path / "outputs/vggt_da3_normal_fill_denoised",
     }
 
 
@@ -117,7 +117,7 @@ class FPNConfig:
 
 @dataclass(frozen=True)
 class VGGTPriorConfig:
-    # offline: use precomputed depth_fill priors from ProjectPaths.offline_prior_root.
+    # offline: use precomputed VGGT point-cloud + depth_fill priors from ProjectPaths.offline_prior_root.
     # online: run VGGT inside the training step.
     # auto: use offline when present, otherwise run VGGT.
     # none: train without a geometric prior.

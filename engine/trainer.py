@@ -11,9 +11,9 @@ from torch.utils.data.distributed import DistributedSampler
 
 from base.config import MVSConfig
 from data.dtu import DTUMVSDataset
+from data.prior_precompute import ensure_offline_priors
 from losses import MVSLoss
 from models.mvsnet import UprMVSNet
-from models.prior_precompute import ensure_offline_priors
 from utils.logging_utils import MetricMeter, StepTimer, TensorBoardLogger, dump_metrics, get_logger
 from utils.path_utils import make_run_dir
 from utils.vis import save_depth_vis

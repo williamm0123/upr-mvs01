@@ -40,10 +40,16 @@ from dataclasses import dataclass
 
 from PIL import Image
 
+_DA3_SRC = Path(__file__).resolve().parent / "Depth-Anything-3" / "src"
+if _DA3_SRC.is_dir() and str(_DA3_SRC) not in sys.path:
+    sys.path.insert(0, str(_DA3_SRC))
+
+_DA3_IMPORT_ERROR: Exception | None = None
 try:
     from depth_anything_3.api import DepthAnything3
-except ModuleNotFoundError:
+except ModuleNotFoundError as exc:
     DepthAnything3 = None
+    _DA3_IMPORT_ERROR = exc
 
 
 # import models.sfm as sfm
@@ -451,7 +457,9 @@ def load_da3_model(model_path, device=None):
     if DepthAnything3 is None:
         raise ModuleNotFoundError(
             "depth_anything_3 is required for DA3 depth generation. "
-            "Use the uprmvs environment or install Depth-Anything-3 dependencies."
+            f"Tried vendored source path: {_DA3_SRC}. "
+            "Use the uprmvs environment or install Depth-Anything-3 dependencies. "
+            f"Original import error: {_DA3_IMPORT_ERROR}"
         )
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"

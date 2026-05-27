@@ -5,6 +5,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from data.camera_utils import backproject_depth_to_world_points
+
 def save_binary_ply(points: np.ndarray, colors: np.ndarray, output_path: str | Path) -> Path:
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -87,45 +89,7 @@ def backproject_depth_to_points(
     K: np.ndarray,
     extrinsic: np.ndarray | None = None,
 ) -> np.ndarray:
-
-    H, W = depth.shape
-
-    v, u = np.indices((H, W))
-
-    valid = np.isfinite(depth) & (depth > 0)
-
-    z = depth[valid].astype(np.float64)
-    u = u[valid].astype(np.float64)
-    v = v[valid].astype(np.float64)
-
-    fx = K[0, 0]
-    fy = K[1, 1]
-    cx = K[0, 2]
-    cy = K[1, 2]
-
-    x = (u - cx) * z / fx
-    y = (v - cy) * z / fy
-
-    points_cam = np.stack([x, y, z], axis=1)
-
-    if extrinsic is None:
-        return points_cam.astype(np.float32)
-
-    if extrinsic.shape == (3, 4):
-        ext4 = np.eye(4, dtype=np.float64)
-        ext4[:3, :4] = extrinsic
-        extrinsic = ext4
-
-    R = extrinsic[:3, :3]
-    t = extrinsic[:3, 3]
-
-    # extrinsic 是 world -> camera:
-    # X_cam = R @ X_world + t
-    # 所以:
-    # X_world = R.T @ (X_cam - t)
-    points_world = (points_cam - t[None, :]) @ R
-
-    return points_world.astype(np.float32)
+    return backproject_depth_to_world_points(depth, K, extrinsic)
 
 
 def resize_image_and_intrinsic(image, K, target_h=378, target_w=504):

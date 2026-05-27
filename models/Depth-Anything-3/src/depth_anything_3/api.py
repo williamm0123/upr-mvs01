@@ -36,7 +36,6 @@ from depth_anything_3.utils.geometry import affine_inverse
 from depth_anything_3.utils.io.input_processor import InputProcessor
 from depth_anything_3.utils.io.output_processor import OutputProcessor
 from depth_anything_3.utils.logger import logger
-from depth_anything_3.utils.pose_align import align_poses_umeyama
 
 torch.backends.cudnn.benchmark = False
 # logger.info("CUDNN Benchmark Disabled")
@@ -349,6 +348,8 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
         """Align depth map to input extrinsics"""
         if extrinsics is None:
             return prediction
+        from depth_anything_3.utils.pose_align import align_poses_umeyama
+
         prediction.intrinsics = intrinsics.numpy()
         _, _, scale, aligned_extrinsics = align_poses_umeyama(
             prediction.extrinsics,

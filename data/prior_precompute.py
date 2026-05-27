@@ -1,6 +1,7 @@
+"""Offline VGGT + DA3 prior cache generation for DTU training."""
+
 from __future__ import annotations
 
-import sys
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,16 +13,15 @@ import torch
 from PIL import Image
 
 from base.config import MVSConfig
-from data.camera_utils import resize_and_crop_image
+from data.camera_utils import (
+    backproject_depth_to_world_points,
+    project_world_points_to_depth,
+    resize_and_crop_image,
+)
 from data.dtu import DTUMVSDataset, _read_dtu_cam_file
 from models.vggt_prior import VGGTPrior
 
-
-_DA3_SRC = Path(__file__).resolve().parent / "Depth-Anything-3" / "src"
-if _DA3_SRC.is_dir() and str(_DA3_SRC) not in sys.path:
-    sys.path.insert(0, str(_DA3_SRC))
-
-from models.depth_fill import (  # noqa: E402
+from models.depth_fill import (
     NormalConstraintDepthFillConfig,
     PointCloudDenoiseConfig,
     denoise_pointcloud_points,
@@ -58,7 +58,7 @@ def expected_prior_path(
     view_id: int,
 ) -> Path:
     rect = f"rect_{view_id + 1:03d}_{light_idx}_r5000"
-    return Path(prior_root) / f"{scan}_light{light_idx}_ref{ref_view:03d}" / "npy" / f"{rect}_da3_loggrad_filled_depth.npy"
+    return Path(prior_root) / f"{scan}_light{light_idx}_ref{ref_view:03d}" / "npy" / f"{rect}_normal_constraint_filled_depth.npy"
 
 
 def _prior_candidates(
@@ -245,65 +245,6 @@ def _select_confident_mask(depth: np.ndarray, confidence: np.ndarray, cfg: MVSCo
     return mask
 
 
-def _backproject_pixels_to_world(
-    depth: np.ndarray,
-    confidence: np.ndarray,
-    valid: np.ndarray,
-    K: np.ndarray,
-    E: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    idx = np.flatnonzero(valid.reshape(-1))
-    if idx.size == 0:
-        return np.empty((0, 3), dtype=np.float32), np.empty((0,), dtype=np.float32)
-
-    height, width = depth.shape
-    yy, xx = np.divmod(idx, width)
-    z = depth.reshape(-1)[idx].astype(np.float32)
-    x = (xx.astype(np.float32) - float(K[0, 2])) * z / max(float(K[0, 0]), 1e-6)
-    y = (yy.astype(np.float32) - float(K[1, 2])) * z / max(float(K[1, 1]), 1e-6)
-    points_cam = np.stack((x, y, z), axis=1)
-    points_cam_h = np.concatenate((points_cam, np.ones((points_cam.shape[0], 1), dtype=np.float32)), axis=1)
-    points_world = (np.linalg.inv(E).astype(np.float32) @ points_cam_h.T).T[:, :3]
-    point_conf = confidence.reshape(-1)[idx].astype(np.float32)
-    return points_world.astype(np.float32), point_conf
-
-
-def _project_world_points_to_depth(
-    points_world: np.ndarray,
-    K: np.ndarray,
-    E: np.ndarray,
-    shape_hw: tuple[int, int],
-) -> tuple[np.ndarray, np.ndarray]:
-    height, width = shape_hw
-    sparse = np.full(height * width, np.inf, dtype=np.float32)
-    if points_world.size == 0:
-        out = np.zeros((height, width), dtype=np.float32)
-        return out, np.zeros((height, width), dtype=bool)
-
-    points_h = np.concatenate((points_world.astype(np.float32), np.ones((len(points_world), 1), dtype=np.float32)), axis=1)
-    points_cam = (E.astype(np.float32) @ points_h.T).T[:, :3]
-    z = points_cam[:, 2]
-    keep = np.isfinite(z) & (z > 1e-6)
-    if not keep.any():
-        out = np.zeros((height, width), dtype=np.float32)
-        return out, np.zeros((height, width), dtype=bool)
-
-    points_cam = points_cam[keep]
-    z = z[keep]
-    u = np.rint(points_cam[:, 0] * float(K[0, 0]) / z + float(K[0, 2])).astype(np.int64)
-    v = np.rint(points_cam[:, 1] * float(K[1, 1]) / z + float(K[1, 2])).astype(np.int64)
-    in_frame = (u >= 0) & (u < width) & (v >= 0) & (v < height)
-    if not in_frame.any():
-        out = np.zeros((height, width), dtype=np.float32)
-        return out, np.zeros((height, width), dtype=bool)
-
-    flat = v[in_frame] * width + u[in_frame]
-    np.minimum.at(sparse, flat, z[in_frame].astype(np.float32))
-    valid = np.isfinite(sparse)
-    out = np.where(valid, sparse, 0.0).reshape(height, width).astype(np.float32)
-    return out, valid.reshape(height, width)
-
-
 def _limit_points(points: np.ndarray, confidences: np.ndarray, max_points: int) -> tuple[np.ndarray, np.ndarray]:
     if max_points <= 0 or len(points) <= max_points:
         return points, confidences
@@ -323,7 +264,9 @@ def _build_denoised_world_points(
     for i, view in enumerate(views):
         valid = _select_confident_mask(depths[i], confidences[i], cfg)
         selected_pixels += int(valid.sum())
-        points, point_conf = _backproject_pixels_to_world(depths[i], confidences[i], valid, view.K, view.E)
+        sparse_depth = np.where(valid, depths[i], 0.0).astype(np.float32)
+        points = backproject_depth_to_world_points(sparse_depth, view.K, view.E)
+        point_conf = confidences[i][valid].astype(np.float32)
         if len(points):
             points_all.append(points)
             conf_all.append(point_conf)
@@ -423,7 +366,7 @@ def _generate_group_priors(
         if out_path.is_file():
             continue
 
-        sparse_depth, valid = _project_world_points_to_depth(world_points, view.K, view.E, depths[i].shape)
+        sparse_depth, valid = project_world_points_to_depth(world_points, view.K, view.E, depths[i].shape)
         if int(valid.sum()) < fill_cfg.align_min_points:
             sparse_depth, valid = _fallback_sparse_from_vggt(depths[i], confidences[i], cfg)
             fallback += 1
@@ -492,6 +435,7 @@ def ensure_offline_priors(
 
     device = torch.device(device) if device is not None else torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     Path(cfg.paths.offline_prior_root).mkdir(parents=True, exist_ok=True)
+    _log(logger, "[offline-prior] source: VGGT depth -> denoised point cloud -> DA3 normal-constraint fill")
     _log(logger, f"[offline-prior] generating missing priors under {cfg.paths.offline_prior_root}")
     vggt_prior = VGGTPrior(cfg.vggt_prior, weights_path=cfg.paths.vggt_weights_path, device=device).eval()
     da3_model, _da3_device = load_da3_model(cfg.paths.da3_weights_file, device=device)

@@ -77,6 +77,83 @@ def build_projection_matrix(K: np.ndarray, extrinsic: np.ndarray) -> np.ndarray:
     return proj
 
 
+def backproject_depth_to_world_points(
+    depth: np.ndarray,
+    K: np.ndarray,
+    extrinsic: np.ndarray | None = None,
+) -> np.ndarray:
+    """Back-project valid z-depth pixels to camera or world coordinates.
+
+    DTU extrinsics are world-to-camera. When ``extrinsic`` is provided, the
+    returned points are transformed back to the world frame.
+    """
+    height, width = depth.shape
+    yy, xx = np.indices((height, width))
+    valid = np.isfinite(depth) & (depth > 0)
+    if not valid.any():
+        return np.empty((0, 3), dtype=np.float32)
+
+    z = depth[valid].astype(np.float64)
+    x = (xx[valid].astype(np.float64) - float(K[0, 2])) * z / max(float(K[0, 0]), 1e-12)
+    y = (yy[valid].astype(np.float64) - float(K[1, 2])) * z / max(float(K[1, 1]), 1e-12)
+    points_cam = np.stack((x, y, z), axis=1)
+    if extrinsic is None:
+        return points_cam.astype(np.float32)
+
+    ext = np.asarray(extrinsic, dtype=np.float64)
+    if ext.shape == (3, 4):
+        ext4 = np.eye(4, dtype=np.float64)
+        ext4[:3, :4] = ext
+        ext = ext4
+    points_h = np.concatenate((points_cam, np.ones((len(points_cam), 1), dtype=np.float64)), axis=1)
+    points_world = (np.linalg.inv(ext) @ points_h.T).T[:, :3]
+    return points_world.astype(np.float32)
+
+
+def project_world_points_to_depth(
+    points_world: np.ndarray,
+    K: np.ndarray,
+    extrinsic: np.ndarray,
+    shape_hw: tuple[int, int],
+    min_depth: float = 1e-6,
+    max_depth: float | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Project world-frame points into a z-buffer depth map."""
+    height, width = shape_hw
+    depth_flat = np.full(height * width, np.inf, dtype=np.float32)
+    if points_world.size == 0:
+        depth = np.zeros((height, width), dtype=np.float32)
+        return depth, np.zeros((height, width), dtype=bool)
+
+    points_h = np.concatenate(
+        (points_world.astype(np.float32), np.ones((len(points_world), 1), dtype=np.float32)),
+        axis=1,
+    )
+    points_cam = (np.asarray(extrinsic, dtype=np.float32) @ points_h.T).T[:, :3]
+    z = points_cam[:, 2]
+    valid = np.isfinite(z) & (z > min_depth)
+    if max_depth is not None:
+        valid &= z < max_depth
+    if not valid.any():
+        depth = np.zeros((height, width), dtype=np.float32)
+        return depth, np.zeros((height, width), dtype=bool)
+
+    points_cam = points_cam[valid]
+    z = z[valid]
+    u = np.rint(points_cam[:, 0] * float(K[0, 0]) / z + float(K[0, 2])).astype(np.int64)
+    v = np.rint(points_cam[:, 1] * float(K[1, 1]) / z + float(K[1, 2])).astype(np.int64)
+    in_frame = (u >= 0) & (u < width) & (v >= 0) & (v < height)
+    if not in_frame.any():
+        depth = np.zeros((height, width), dtype=np.float32)
+        return depth, np.zeros((height, width), dtype=bool)
+
+    flat_idx = v[in_frame] * width + u[in_frame]
+    np.minimum.at(depth_flat, flat_idx, z[in_frame].astype(np.float32))
+    valid_flat = np.isfinite(depth_flat)
+    depth = np.where(valid_flat, depth_flat, 0.0).reshape(height, width).astype(np.float32)
+    return depth, valid_flat.reshape(height, width)
+
+
 def camera_center_world(extrinsic: np.ndarray) -> np.ndarray:
     R = extrinsic[:3, :3]
     t = extrinsic[:3, 3]
