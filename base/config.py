@@ -50,7 +50,7 @@ def _default_paths() -> dict[str, Path]:
             "dinov3_weights_file": Path(
                 "/scr/user/qinglong/dataset/DINOv3/pre_trained/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth"
             ),
-            "da3_weights_file": Path("/scr/user/qinglong/dataset/pretrained/DA3/DA3MONO-LARGE"),
+            "da3_weights_file": Path("/scr/user/qinglong/dataset/DA3/pretrained/DA3MONO-LARGE/"),
             "vggt_weights_path": Path("/scr/user/qinglong/dataset/VGGT/pretrained/VGGT-1B"),
             "offline_prior_root": output_root / "vggt_da3_normal_fill_denoised",
         }

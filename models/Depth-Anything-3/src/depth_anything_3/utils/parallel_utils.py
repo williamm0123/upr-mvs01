@@ -18,7 +18,6 @@ from functools import wraps
 from multiprocessing.pool import ThreadPool
 from threading import Thread
 from typing import Callable, Dict, List
-import imageio
 from tqdm import tqdm
 
 
@@ -46,6 +45,8 @@ def async_call(fn):
 
 def _save_image_impl(save_img, save_path):
     """Common implementation for saving images synchronously or asynchronously"""
+    import imageio
+
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     imageio.imwrite(save_path, save_img)
 

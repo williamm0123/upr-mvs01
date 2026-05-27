@@ -16,5 +16,5 @@ checkpoints/
 *.pth
 *.pt
 *.ckpt
-
+*.md
 experiments/
