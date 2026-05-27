@@ -16,7 +16,5 @@ checkpoints/
 *.pth
 *.pt
 *.ckpt
-models/Depth_Anything-3/
-models/dinov3/
-scripts/
+
 experiments/
