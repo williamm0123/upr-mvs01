@@ -38,6 +38,7 @@ from __future__ import annotations
 import argparse
 import math
 import os
+from dataclasses import replace
 from datetime import datetime
 
 import numpy as np
@@ -239,6 +240,22 @@ def _ensure_priors(cfg, device, overwrite: bool = False) -> None:
 # --------------------------------------------------------------------------- #
 def main_worker(rank: int, world_size: int, device_ids: list[int], args) -> None:
     cfg = build_mvs_config(profile=args.profile)
+    train_overrides = {}
+    if args.batch_size is not None:
+        train_overrides["batch_size"] = args.batch_size
+    if args.num_workers is not None:
+        train_overrides["num_workers"] = args.num_workers
+    if args.num_views is not None:
+        train_overrides["num_views"] = args.num_views
+    if args.lr is not None:
+        train_overrides["lr"] = args.lr
+    if args.warmup_steps is not None:
+        train_overrides["warmup_steps"] = args.warmup_steps
+    if args.amp is not None:
+        train_overrides["amp"] = args.amp == "on"
+    if train_overrides:
+        cfg = replace(cfg, train=replace(cfg.train, **train_overrides))
+
     is_ddp = world_size > 1
     is_main = rank == 0
 
@@ -282,7 +299,10 @@ def main_worker(rank: int, world_size: int, device_ids: list[int], args) -> None
     if is_main:
         n_params = sum(p.numel() for p in model.parameters()) / 1e6
         print(f"[rank {rank}] device={device} ddp={is_ddp} world_size={world_size} "
-              f"params={n_params:.1f}M profile={cfg.train.profile}")
+              f"params={n_params:.1f}M profile={cfg.train.profile} "
+              f"batch={cfg.train.batch_size} views={cfg.train.num_views} "
+              f"workers={cfg.train.num_workers} lr={cfg.train.lr:g} "
+              f"warmup={cfg.train.warmup_steps} amp={cfg.train.amp}")
 
     if args.smoke:
         _run_smoke(model, loss_fn, optimizer, scaler, cfg, device, args, logger, is_main)
@@ -409,6 +429,12 @@ def main() -> None:
     parser.add_argument("--gpus", type=int, default=1, help="number of GPUs (ignored if --devices given)")
     parser.add_argument("--devices", type=str, default="", help="explicit CUDA ids, e.g. '0,1,2,3'")
     parser.add_argument("--steps", type=int, default=0, help="override max training steps (0 = config default)")
+    parser.add_argument("--batch-size", type=int, default=None, help="per-GPU batch size override")
+    parser.add_argument("--num-workers", type=int, default=None, help="DataLoader worker count override")
+    parser.add_argument("--num-views", type=int, default=None, help="number of MVS input views override")
+    parser.add_argument("--lr", type=float, default=None, help="learning-rate override")
+    parser.add_argument("--warmup-steps", type=int, default=None, help="LR warmup steps override")
+    parser.add_argument("--amp", choices=["on", "off"], default=None, help="AMP override")
     parser.add_argument("--master-port", type=str, default="29500")
     parser.add_argument("--build-priors", choices=["auto", "force", "skip"], default="auto",
                         help="auto: precompute missing priors; force: recompute all; skip: assume cached")
