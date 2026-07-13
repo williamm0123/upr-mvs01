@@ -22,6 +22,9 @@ mkdir -p logs
 source ~/.bashrc
 conda activate "$CONDA_ENV"
 
+export UPRMVS_MACHINE=umhpc
+export UPRMVS_PROFILE=umhpc
+export PYTHONPATH="$PROJECT_DIR:$PROJECT_DIR/models/vggt:$PROJECT_DIR/models/Depth-Anything-3/src:${PYTHONPATH:-}"
 export OMP_NUM_THREADS=4
 export PYTHONUNBUFFERED=1
 export NCCL_DEBUG=WARN
@@ -36,11 +39,11 @@ MASTER_PORT=$((20000 + SLURM_JOB_ID % 20000))
 echo "=== job=$SLURM_JOB_ID host=$(hostname) gpus=$NPROC port=$MASTER_PORT ==="
 nvidia-smi -L
 
-torchrun \
-    --standalone \
-    --nproc_per_node=$NPROC \
-    --master_port=$MASTER_PORT \
-    train.py \
-        --profile umhpc \
-        --ddp on \
-        --name "$RUN_NAME"
+# train.py owns process spawning. Do not wrap it in torchrun.
+python train.py \
+    --profile umhpc \
+    --gpus "$NPROC" \
+    --ddp on \
+    --master-port "$MASTER_PORT" \
+    --build-priors "${BUILD_PRIORS:-auto}" \
+    --name "$RUN_NAME"

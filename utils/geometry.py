@@ -54,51 +54,66 @@ def homography_warp_features(
     B, C, H, W = src_features.shape
     D = depth_hypos.shape[1]
     device = src_features.device
-    dtype = src_features.dtype
+    feat_dtype = src_features.dtype
+    # Geometry (matrix inverse, projection) is always fp32 for numerical
+    # stability; only the feature sampling runs in ``feat_dtype`` (which may be
+    # fp16 to save memory on the [B*D, C, H, W] warp tensor). Autocast MUST be
+    # disabled here: under fp16 autocast the projection K @ cam (focal * depth)
+    # overflows fp16's ~65504 range and produces inf/NaN.
+    geo_dtype = torch.float32
 
-    K_ref_s = K_ref.clone()
-    K_src_s = K_src.clone()
-    K_ref_s[:, 0, :] = K_ref_s[:, 0, :] / feature_stride
-    K_ref_s[:, 1, :] = K_ref_s[:, 1, :] / feature_stride
-    K_src_s[:, 0, :] = K_src_s[:, 0, :] / feature_stride
-    K_src_s[:, 1, :] = K_src_s[:, 1, :] / feature_stride
+    with torch.autocast(device_type=device.type, enabled=False):
+        K_ref_s = K_ref.to(geo_dtype).clone()
+        K_src_s = K_src.to(geo_dtype).clone()
+        K_ref_s[:, 0, :] = K_ref_s[:, 0, :] / feature_stride
+        K_ref_s[:, 1, :] = K_ref_s[:, 1, :] / feature_stride
+        K_src_s[:, 0, :] = K_src_s[:, 0, :] / feature_stride
+        K_src_s[:, 1, :] = K_src_s[:, 1, :] / feature_stride
 
-    R_ref = E_ref[:, :3, :3]
-    t_ref = E_ref[:, :3, 3:4]
-    R_src = E_src[:, :3, :3]
-    t_src = E_src[:, :3, 3:4]
+        E_ref_g = E_ref.to(geo_dtype)
+        E_src_g = E_src.to(geo_dtype)
+        R_ref = E_ref_g[:, :3, :3]
+        t_ref = E_ref_g[:, :3, 3:4]
+        R_src = E_src_g[:, :3, :3]
+        t_src = E_src_g[:, :3, 3:4]
 
-    R_src_inv = R_src.transpose(1, 2)
-    R_rel = R_ref @ R_src_inv
-    t_rel = t_ref - R_rel @ t_src
+        R_src_inv = R_src.transpose(1, 2)
+        R_rel = R_ref @ R_src_inv
+        t_rel = t_ref - R_rel @ t_src
 
-    grid = make_pixel_grid(H, W, device, dtype).view(3, -1).unsqueeze(0).expand(B, -1, -1)
-    K_ref_inv = torch.inverse(K_ref_s)
-    rays = torch.bmm(K_ref_inv, grid)
+        grid = make_pixel_grid(H, W, device, geo_dtype).view(3, -1).unsqueeze(0).expand(B, -1, -1)
+        K_ref_inv = torch.inverse(K_ref_s)
+        rays = torch.bmm(K_ref_inv, grid)
 
-    rays_d = rays.unsqueeze(1) * depth_hypos.view(B, D, 1, H * W)
-    rays_d = rays_d.reshape(B * D, 3, H * W)
+        rays_d = rays.unsqueeze(1) * depth_hypos.to(geo_dtype).view(B, D, 1, H * W)
+        rays_d = rays_d.reshape(B * D, 3, H * W)
 
-    R_rel_d = R_rel.unsqueeze(1).expand(B, D, 3, 3).reshape(B * D, 3, 3)
-    t_rel_d = t_rel.unsqueeze(1).expand(B, D, 3, 1).reshape(B * D, 3, 1)
-    cam_src = torch.bmm(R_rel_d.transpose(1, 2), rays_d - t_rel_d)
-    K_src_d = K_src_s.unsqueeze(1).expand(B, D, 3, 3).reshape(B * D, 3, 3)
-    pix_src = torch.bmm(K_src_d, cam_src)
-    z_src = pix_src[:, 2:3].clamp(min=1e-6)
-    uv = pix_src[:, :2] / z_src
+        R_rel_d = R_rel.unsqueeze(1).expand(B, D, 3, 3).reshape(B * D, 3, 3)
+        t_rel_d = t_rel.unsqueeze(1).expand(B, D, 3, 1).reshape(B * D, 3, 1)
+        cam_src = torch.bmm(R_rel_d.transpose(1, 2), rays_d - t_rel_d)
+        K_src_d = K_src_s.unsqueeze(1).expand(B, D, 3, 3).reshape(B * D, 3, 3)
+        pix_src = torch.bmm(K_src_d, cam_src)
+        z_src = pix_src[:, 2:3].clamp(min=1e-6)
+        uv = pix_src[:, :2] / z_src
 
-    uv_x = uv[:, 0] / (W - 1) * 2.0 - 1.0
-    uv_y = uv[:, 1] / (H - 1) * 2.0 - 1.0
-    grid_sample = torch.stack([uv_x, uv_y], dim=-1).view(B * D, H, W, 2)
+        uv_x = uv[:, 0] / (W - 1) * 2.0 - 1.0
+        uv_y = uv[:, 1] / (H - 1) * 2.0 - 1.0
+        grid_sample = torch.stack([uv_x, uv_y], dim=-1)
+        # Sanitize before the (possibly fp16) cast: pixels behind the camera or far
+        # out of frustum produce huge / non-finite coords that overflow fp16 and turn
+        # grid_sample's output into NaN. Anything with |coord| > 1 is out of bounds
+        # anyway (padding_mode="zeros" -> 0), so mapping bad values to +/-2 is safe.
+        grid_sample = torch.nan_to_num(grid_sample, nan=2.0, posinf=2.0, neginf=-2.0)
+        grid_sample = grid_sample.clamp(-2.0, 2.0).view(B * D, H, W, 2).to(feat_dtype)
 
-    src_features_d = src_features.unsqueeze(1).expand(B, D, C, H, W).reshape(B * D, C, H, W)
-    warped = F.grid_sample(
-        src_features_d,
-        grid_sample,
-        mode="bilinear",
-        padding_mode="zeros",
-        align_corners=True,
-    )
+        src_features_d = src_features.unsqueeze(1).expand(B, D, C, H, W).reshape(B * D, C, H, W)
+        warped = F.grid_sample(
+            src_features_d,
+            grid_sample,
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=True,
+        )
     return warped.view(B, D, C, H, W).permute(0, 2, 1, 3, 4).contiguous()
 
 

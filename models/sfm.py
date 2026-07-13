@@ -1,331 +1,316 @@
-"""Reusable fixed-camera SfM utilities for DTU experiments."""
+"""Lightweight two-view SfM for DTU samples with known camera poses.
+
+DTU provides metric (millimetre) intrinsics/extrinsics, so we do not need to
+solve for camera poses. We only need correspondences: detect + match features
+between the reference view and each source view, reject outliers with RANSAC,
+then triangulate the surviving matches with the *known* projection matrices.
+The triangulated world points are projected into the reference camera to form a
+sparse, metric-scale depth map that can later anchor the (scale-free) VGGT
+prior.
+"""
 
 from __future__ import annotations
 
-import shutil
-import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
-import pycolmap
+
+import cv2
 import numpy as np
-from PIL import Image
 
-
-import models.general as G
-
-#忽略pycolmap的日志输出，设置minloglevel为2表示只显示错误信息，忽略警告和信息日志
-pycolmap.logging.minloglevel = 2
-
-# 这个常量 COLMAP_PAIR_ID_MULTIPLIER = 2_147_483_647 是 COLMAP 用来生成图像对唯一标识符（Pair ID）的一个计算基数。
-# 使用这么大的数字作为乘法因子，可以确保即使你有成千上万张图片，任意两张图片的 ID 组合生成的 pair_id 也绝对不会重复（碰撞）
-COLMAP_PAIR_ID_MULTIPLIER = 2_147_483_647
+import data.camera_utils as C
 
 
 @dataclass
-class SFMConfig:
-    output_root: Path = Path("outputs/sfm_dtu_fixed_camera")
-    max_image_size: int = 1200
-    max_num_features: int = 8192
-    max_ratio: float = 0.8
-    max_view_gap: int = 8
-    min_pair_matches: int = 30
-    min_depth: float = 1e-6
-    max_depth: float = 2000.0
+class SfMConfig:
+    max_features: int = 8000
+    ratio_test: float = 0.75
     max_reproj_error: float = 2.0
-    min_tri_angle: float = 1.0
-    voxel_size: float = 1.0
-    # splat_radius: int = 2
-    # range_percentiles: tuple[float, float] = (2.0, 98.0)
-    overlay_alpha: float = 0.72
-    overview_images: int = 8
-    gpu: bool = False
-    clean: bool = True
+    min_depth: float = 1e-3
+    max_depth: float = 2000.0
+    # per-point confidence (conf = f_reproj * f_angle * w_pair, all in [0,1])
+    conf_tau_e: float = 1.0          # reprojection-error decay scale (px)
+    conf_theta_sat_deg: float = 10.0 # triangulation-angle saturation (deg)
+    conf_pair_n0: float = 100.0      # pair-inlier soft-saturation constant
 
 
-def prepare_image_subset(image_paths, image_out_dir: Path, clean: bool = True) -> list[Path]:
-    if clean and image_out_dir.exists():
-        shutil.rmtree(image_out_dir)
-
-    image_out_dir.mkdir(parents=True, exist_ok=True)
-
-    linked_paths = []
-
-    for source in image_paths:
-        source = Path(source)
-        target = image_out_dir / source.name
-
-        if not target.exists():
-            target.symlink_to(source)
-
-        linked_paths.append(target)
-
-    return linked_paths
+def _to_uint8_rgb(image) -> np.ndarray:
+    """sample["images"][i] is a [C, H, W] float tensor in 0-255 RGB."""
+    arr = image.detach().cpu().numpy() if hasattr(image, "detach") else np.asarray(image)
+    if arr.ndim == 3 and arr.shape[0] in (1, 3):
+        arr = np.transpose(arr, (1, 2, 0))
+    if arr.ndim == 3 and arr.shape[2] == 1:
+        arr = np.repeat(arr, 3, axis=2)
+    return np.clip(arr, 0, 255).astype(np.uint8)
 
 
-def configure_reader_options(intrinsic: np.ndarray) -> pycolmap.ImageReaderOptions:
-    intrinsic = intrinsic.astype(np.float64)
-
-    options = pycolmap.ImageReaderOptions()
-    options.camera_model = "PINHOLE"
-    options.camera_params = (
-        f"{float(intrinsic[0, 0])},"
-        f"{float(intrinsic[1, 1])},"
-        f"{float(intrinsic[0, 2])},"
-        f"{float(intrinsic[1, 2])}"
-    )
-    return options
+def _build_detector(max_features: int):
+    """Prefer SIFT (metric-friendly float descriptors); fall back to ORB."""
+    if hasattr(cv2, "SIFT_create"):
+        return cv2.SIFT_create(nfeatures=int(max_features)), "SIFT", cv2.NORM_L2
+    return cv2.ORB_create(nfeatures=int(max_features)), "ORB", cv2.NORM_HAMMING
 
 
-def project_cloud_to_depth(points: np.ndarray,
-                           intrinsic,extrinsic, H, W, 
-                           min_depth = 1e-6, max_depth = 2000.0):
-    
-    points_h = np.concatenate([points, np.ones((points.shape[0], 1), dtype=np.float64)], axis=1)
-    camera_points = points_h @ extrinsic.T
-    z = camera_points[:, 2]
-    pixel_h = camera_points[:, :3] @ intrinsic.T
-    uv = pixel_h[:, :2] / np.clip(pixel_h[:, 2:3], 1e-12, None)
-    u = np.rint(uv[:, 0]).astype(np.int32)
-    v = np.rint(uv[:, 1]).astype(np.int32)
-    z = z.astype(np.float32)
+def _projection_matrix(K: np.ndarray, extrinsic: np.ndarray) -> np.ndarray:
+    return (np.asarray(K, np.float64) @ np.asarray(extrinsic, np.float64)[:3, :4])
 
-    valid = (
-        np.isfinite(u) &
-        np.isfinite(v) &
-        np.isfinite(z) &
-        (z > min_depth) &
-        (z < max_depth) &
-        (u >= 0) &
-        (u < W) &
-        (v >= 0) &
-        (v < H)
-    )
 
-    u_valid = u[valid]
-    v_valid = v[valid]
-    z_valid = z[valid]
+def _camera_depth(extrinsic: np.ndarray, points_h: np.ndarray) -> np.ndarray:
+    """Z of homogeneous world points in the given camera frame."""
+    return (points_h @ np.asarray(extrinsic, np.float64)[:3, :4].T)[:, 2]
 
-    print("valid projected points:", valid.sum(), "/", len(valid))
 
-    depth = np.full((H, W), np.inf, dtype=np.float32)
+def _reproj_error(P: np.ndarray, points_h: np.ndarray, pixels: np.ndarray) -> np.ndarray:
+    proj = points_h @ P.T
+    uv = proj[:, :2] / np.clip(proj[:, 2:3], 1e-12, None)
+    return np.linalg.norm(uv - pixels, axis=1)
 
-    np.minimum.at(depth, (v_valid, u_valid), z_valid)
 
-    depth[~np.isfinite(depth)] = np.nan
+def _camera_center(extrinsic: np.ndarray) -> np.ndarray:
+    """World-frame camera centre from a world->camera extrinsic: C = -R^T t."""
+    R = np.asarray(extrinsic, np.float64)[:3, :3]
+    t = np.asarray(extrinsic, np.float64)[:3, 3]
+    return -R.T @ t
 
-    return np.asarray(depth)
-    
 
-def generate_sfm_pointcloud(config, database_path: Path, sample: dict):
+def _point_confidence(points, err_ref, err_src, E_ref, E_src, n_pair, cfg) -> np.ndarray:
+    """Per-point triangulation confidence in [0, 1].
+
+        conf = f_reproj * f_angle * w_pair
+          f_reproj : reprojection consistency, taken over the *worse* of the two
+                     views  -> exp(-(max(err_ref, err_src) / tau_e)^2)
+          f_angle  : parallax angle at the 3D point between the rays to each
+                     camera; small angle -> uncertain depth. conf ~ sin(theta),
+                     saturating at theta_sat.
+          w_pair   : pair-level reliability from the RANSAC inlier count
+                     (soft-saturating: N / (N + N0)).
     """
-    使用已知的精准内外参进行特征点三角化，并通过 Point-Only BA 和重投影误差过滤提升点云质量。
-    """
-    output_dir = config.output_root
-    output_dir.mkdir(parents=True, exist_ok=True)
-    colmap_dir = output_dir / "colmap"
-    colmap_dir.mkdir(parents=True, exist_ok=True)
-    image_dir = colmap_dir / "images"
-    database_path = Path(database_path)
-    if database_path.parent == output_dir:
-        database_path = colmap_dir / database_path.name
-    ply_output_path = config.output_root / "sfm_points.ply"
+    if len(points) == 0:
+        return np.empty((0,), np.float32)
 
-    if config.clean:
-        for stale_name in ("cameras.bin", "images.bin", "points3D.bin", "rigs.bin", "frames.bin", "database.db"):
-            stale_path = output_dir / stale_name
-            if stale_path.exists():
-                stale_path.unlink()
-        stale_image_dir = output_dir / "images"
-        if stale_image_dir.exists() and stale_image_dir != image_dir:
-            shutil.rmtree(stale_image_dir)
-    
-    # 1. 创建重建对象并注入完美相机参数
-    reconstruction = pycolmap.Reconstruction()
-    image_paths = sample["image_paths"]
-    intrinsics = sample["intrinsics"]
-    extrinsics = sample["extrinsics"]
+    e = np.maximum(err_ref, err_src)
+    f_reproj = np.exp(-((e / max(cfg.conf_tau_e, 1e-6)) ** 2))
 
-    prepare_image_subset(image_paths, image_dir, clean=config.clean)
+    C_ref = _camera_center(E_ref)
+    C_src = _camera_center(E_src)
+    v_ref = C_ref[None, :] - points
+    v_src = C_src[None, :] - points
+    denom = np.clip(np.linalg.norm(v_ref, axis=1) * np.linalg.norm(v_src, axis=1), 1e-12, None)
+    cos_theta = np.clip(np.sum(v_ref * v_src, axis=1) / denom, -1.0, 1.0)
+    sin_theta = np.sin(np.arccos(cos_theta))
+    sin_sat = max(np.sin(np.radians(cfg.conf_theta_sat_deg)), 1e-6)
+    f_angle = np.clip(sin_theta / sin_sat, 0.0, 1.0)
 
-    if config.clean and database_path.exists():
-        database_path.unlink()
+    w_pair = float(n_pair) / (float(n_pair) + max(cfg.conf_pair_n0, 1e-6))
 
-    if not database_path.exists():
-        reader_options = configure_reader_options(intrinsics[0])
+    return (f_reproj * f_angle * w_pair).astype(np.float32)
 
-        extraction_options = pycolmap.FeatureExtractionOptions()
-        extraction_options.use_gpu = bool(config.gpu)
-        extraction_options.max_image_size = int(config.max_image_size)
-        extraction_options.sift.max_num_features = int(config.max_num_features)
 
-        matching_options = pycolmap.FeatureMatchingOptions()
-        matching_options.use_gpu = bool(config.gpu)
-        matching_options.sift.max_ratio = float(config.max_ratio)
+def _triangulate_pair(gray_ref, gray_src, K_ref, E_ref, K_src, E_src, detector, norm_type, cfg):
+    """Return (world_points [M,3], ref_pixels [M,2], stats dict) for one pair."""
+    stats = {"matches": 0, "ransac_matches": 0, "triangulated_points": 0}
 
-        device = pycolmap.Device.cuda if config.gpu else pycolmap.Device.cpu
-        print(f"Extracting features for {len(image_paths)} images")
-        pycolmap.extract_features(
-            database_path,
-            image_dir,
-            camera_mode=pycolmap.CameraMode.PER_IMAGE,
-            reader_options=reader_options,
-            extraction_options=extraction_options,
-            device=device,
-        )
-        print("Running exhaustive matching")
-        pycolmap.match_exhaustive(
-            database_path,
-            matching_options,
-            device=device,
-        )
-    
-    imgs_shape = sample["images"].shape
-    if imgs_shape[-1] == 3:  
-        H, W = imgs_shape[1:3]
-    else:                    
-        H, W = imgs_shape[2:4]
+    kp_ref, des_ref = detector.detectAndCompute(gray_ref, None)
+    kp_src, des_src = detector.detectAndCompute(gray_src, None)
+    if des_ref is None or des_src is None or len(kp_ref) < 2 or len(kp_src) < 2:
+        return np.empty((0, 3), np.float32), np.empty((0, 2), np.float32), np.empty((0,), np.float32), stats
 
-    sample_by_name = {Path(path).name: i for i, path in enumerate(image_paths)}
-    with sqlite3.connect(database_path) as connection:
-        database_images = [
-            (int(image_id), str(name), int(camera_id))
-            for image_id, name, camera_id in connection.execute(
-                "SELECT image_id, name, camera_id FROM images ORDER BY image_id"
-            )
-        ]
+    matcher = cv2.BFMatcher(norm_type)
+    knn = matcher.knnMatch(des_ref, des_src, k=2)
+    good = [m for pair in knn if len(pair) == 2 for m, n in [pair] if m.distance < cfg.ratio_test * n.distance]
+    stats["matches"] = len(good)
+    if len(good) < 8:
+        return np.empty((0, 3), np.float32), np.empty((0, 2), np.float32), np.empty((0,), np.float32), stats
 
-    if not database_images:
-        raise RuntimeError(f"No images were written to COLMAP database: {database_path}")
+    pts_ref = np.float64([kp_ref[m.queryIdx].pt for m in good])
+    pts_src = np.float64([kp_src[m.trainIdx].pt for m in good])
 
-    added_camera_ids = set()
-    for image_id, image_name, camera_id in database_images:
-        basename = Path(image_name).name
-        if basename not in sample_by_name:
-            raise RuntimeError(
-                f"Database image {image_name!r} is not part of the current sample. "
-                "Run with clean=True to rebuild the SfM database."
-            )
-
-        i = sample_by_name[basename]
-        
-        # 注入内参
-        K = intrinsics[i]
-        if camera_id not in added_camera_ids:
-            camera = pycolmap.Camera(
-                model="PINHOLE",
-                width=W,
-                height=H,
-                params=[K[0, 0], K[1, 1], K[0, 2], K[1, 2]],
-            )
-            camera.camera_id = camera_id
-            reconstruction.add_camera_with_trivial_rig(camera)
-            added_camera_ids.add(camera_id)
-
-        
-        # 注入外参
-        E = extrinsics[i] 
-        E_3x4 = np.asarray(E[:3, :4], dtype=np.float64)
-        cam_from_world = pycolmap.Rigid3d(E_3x4)
-        image = pycolmap.Image(
-            image_id=image_id,
-            name=image_name,
-            camera_id=camera_id,
-        )
-        reconstruction.add_image_with_trivial_frame(image, cam_from_world)
-    # ================= 修正 1：初始三角化 =================
-    # print("正在根据真实位姿进行特征三角化...")
-    
-    # 报错指出：必须使用 IncrementalPipelineOptions
-    pipeline_options = pycolmap.IncrementalPipelineOptions()
-    # 将三角化的参数设置在 .triangulation 子模块下
-    pipeline_options.triangulation.min_angle = getattr(config, 'min_tri_angle', 1.5)
-    pipeline_options.triangulation.ignore_two_view_tracks = False 
-    
-    reconstruction = pycolmap.triangulate_points(
-        reconstruction, 
-        database_path, 
-        image_dir, 
-        output_path=colmap_dir, 
-        clear_points=True,
-        options=pipeline_options  # <--- 传入修正后的 pipeline_options
+    F, mask = cv2.findFundamentalMat(
+        pts_ref, pts_src, cv2.FM_RANSAC, cfg.max_reproj_error, 0.99
     )
-    print(f"初始三角化获得 {reconstruction.num_points3D()} 个 3D 点。")
+    if F is None or mask is None:
+        return np.empty((0, 3), np.float32), np.empty((0, 2), np.float32), np.empty((0,), np.float32), stats
+    inliers = mask.ravel().astype(bool)
+    pts_ref, pts_src = pts_ref[inliers], pts_src[inliers]
+    stats["ransac_matches"] = int(inliers.sum())
+    if len(pts_ref) < 1:
+        return np.empty((0, 3), np.float32), np.empty((0, 2), np.float32), np.empty((0,), np.float32), stats
 
-    # ==================== 核心改进模块开始 ====================
+    P_ref = _projection_matrix(K_ref, E_ref)
+    P_src = _projection_matrix(K_src, E_src)
+    pts4d = cv2.triangulatePoints(P_ref, P_src, pts_ref.T, pts_src.T)
+    w = pts4d[3:4]
+    w = np.where(np.abs(w) < 1e-12, 1e-12, w)  # guard zero only; keep sign of w
+    points = (pts4d[:3] / w).T  # [M, 3] world
+    points_h = np.concatenate([points, np.ones((len(points), 1))], axis=1)
 
-# ================= 修正 2 & 3：Bundle Adjustment =================
-    # print("开始进行 Bundle Adjustment (锁死相机，仅优化 3D 点坐标)...")
-    
-    # A. 求解器选项 (Options)
-    ba_options = pycolmap.BundleAdjustmentOptions()
-    ba_options.refine_focal_length = False
-    ba_options.refine_principal_point = False
-    ba_options.refine_extra_params = False
-    ba_options.refine_rig_from_world = False
-    ba_options.refine_sensor_from_rig = False
-    ba_options.refine_points3D = True
+    z_ref = _camera_depth(E_ref, points_h)
+    z_src = _camera_depth(E_src, points_h)
+    err_ref = _reproj_error(P_ref, points_h, pts_ref)
+    err_src = _reproj_error(P_src, points_h, pts_src)
+    keep = (
+        (z_ref > cfg.min_depth) & (z_ref < cfg.max_depth)
+        & (z_src > cfg.min_depth)
+        & (err_ref <= cfg.max_reproj_error) & (err_src <= cfg.max_reproj_error)
+    )
+    stats["triangulated_points"] = int(keep.sum())
+    conf = _point_confidence(
+        points[keep], err_ref[keep], err_src[keep], E_ref, E_src, stats["ransac_matches"], cfg
+    )
+    return points[keep].astype(np.float32), pts_ref[keep].astype(np.float32), conf, stats
 
-    # B. 问题配置 (Config)
-    ba_config = pycolmap.BundleAdjustmentConfig()
-    for image_id in reconstruction.reg_image_ids():
-        ba_config.add_image(image_id)
-    for point3D_id in reconstruction.point3D_ids():
-        ba_config.add_variable_point(point3D_id)
-    for camera_id in reconstruction.cameras:
-        ba_config.set_constant_cam_intrinsics(camera_id)
 
-    # C. 运行优化
-    if hasattr(pycolmap, "create_default_bundle_adjuster"):
-        bundle_adjuster = pycolmap.create_default_bundle_adjuster(
-            ba_options,
-            ba_config,
-            reconstruction,
+def generate_sparse_depth_from_sample(sample, ref_idx: int = 0, config: SfMConfig | None = None):
+    """Build a metric sparse depth map for the reference view via two-view SfM.
+
+    Returns a dict with ``sparse_depth`` [H, W], ``sparse_conf`` [H, W] in [0,1]
+    (per-pixel confidence of the point that won each pixel), ``valid_mask``
+    [H, W] bool, ``points_world`` [N, 3], ``points_conf`` [N] in [0,1],
+    ``source_weights`` [num_views-1] in [0,1] (one per-view cost-volume weight,
+    aligned to the non-ref source order), ``points_color`` [N, 3] uint8 and an
+    ``info`` dict. ``sparse_depth`` is identical to before (nearest-point
+    z-buffer); confidence is additive only.
+    """
+    cfg = config or SfMConfig()
+    images = sample["images"]
+    intrinsics = np.asarray(sample["intrinsics"], np.float64)
+    extrinsics = np.asarray(sample["extrinsics"], np.float64)
+    num_views = len(images)
+
+    rgb = [_to_uint8_rgb(images[i]) for i in range(num_views)]
+    gray = [cv2.cvtColor(img, cv2.COLOR_RGB2GRAY) for img in rgb]
+    H, W = gray[ref_idx].shape[:2]
+
+    detector, feature_type, norm_type = _build_detector(cfg.max_features)
+    K_ref, E_ref = intrinsics[ref_idx], extrinsics[ref_idx]
+
+    all_points, all_pixels, all_conf, source_weights, pairs = [], [], [], [], []
+    for src_idx in range(num_views):
+        if src_idx == ref_idx:
+            continue
+        points, pixels, conf, stats = _triangulate_pair(
+            gray[ref_idx], gray[src_idx], K_ref, E_ref,
+            intrinsics[src_idx], extrinsics[src_idx], detector, norm_type, cfg,
         )
-        ba_summary = bundle_adjuster.solve()
-        if hasattr(ba_summary, "brief_report"):
-            print("BA summary:", ba_summary.brief_report())
-    elif hasattr(pycolmap, "bundle_adjustment"):
-        pycolmap.bundle_adjustment(reconstruction, ba_options)
+        all_points.append(points)
+        all_pixels.append(pixels)
+        all_conf.append(conf)
+        # per-view weight for cost-volume fusion: median of this source's point
+        # confidences (0.0 if the pair produced no triangulated points).
+        w = float(np.median(conf)) if len(conf) else 0.0
+        source_weights.append(w)
+        pairs.append({"src_idx": src_idx, "weight": w, **stats})
+
+    points_world = np.concatenate(all_points, axis=0) if all_points else np.empty((0, 3), np.float32)
+    pixels = np.concatenate(all_pixels, axis=0) if all_pixels else np.empty((0, 2), np.float32)
+    points_conf = np.concatenate(all_conf, axis=0) if all_conf else np.empty((0,), np.float32)
+    # aligned to the non-ref source order (src_idx ascending, ref skipped)
+    source_weights = np.asarray(source_weights, np.float32)
+
+    # Sample reference-image colours at the matched keypoints for the PLY.
+    if len(pixels):
+        u = np.clip(np.rint(pixels[:, 0]).astype(np.int32), 0, W - 1)
+        v = np.clip(np.rint(pixels[:, 1]).astype(np.int32), 0, H - 1)
+        points_color = rgb[ref_idx][v, u]
     else:
-        print("提示：当前 pycolmap 版本不支持独立 BA，跳过此步骤 (三角化阶段可能已自带优化)")
+        points_color = np.empty((0, 3), np.uint8)
 
-    # 4. 剔除劣质噪点 (Filtering)
-    print("开始过滤重投影误差过大的噪点...")
-    max_reproj_err = getattr(config, 'max_reproj_error', 2.0)
-    min_track_length = 2  # 如果你想要更干净的图，可以改成 3 (即至少在3个视角中被看到)
-    
-    points_to_delete = []
-    # 遍历所有生成的 3D 点
-    for point3D_id, point3D in reconstruction.points3D.items():
-        # 条件A：重投影误差过大（比如大于 2 个像素）
-        # 条件B：Track长度不足（视野太少，不可靠）
-        if point3D.error > max_reproj_err or point3D.track.length() < min_track_length:
-            points_to_delete.append(point3D_id)
-            
-    # 执行删除
-    for point3D_id in points_to_delete:
-        reconstruction.delete_point3D(point3D_id)
-
-    # ==================== 核心改进模块结束 ====================
-
-    # 5. 导出结果
-    points = np.asarray(
-        [point3D.xyz for point3D in reconstruction.points3D.values()],
-        dtype=np.float32,
-    ).reshape(-1, 3)
-    sparse_depth = project_cloud_to_depth(
-        points,
-        intrinsics[0],
-        extrinsics[0],
-        H,
-        W,
-        min_depth=config.min_depth,
-        max_depth=config.max_depth,
+    # conf is per-point; the z-buffer inside keeps nearest-point-wins, so
+    # sparse_depth is unchanged vs passing None -- we only additionally get the
+    # per-pixel confidence of whichever point won each pixel.
+    sparse_depth, sparse_conf = C.project_world_points_to_depth(
+        points_world, points_conf, K_ref, E_ref, (W, H)
     )
-    num_points = points.shape[0]
-    # reconstruction.export_PLY(str(ply_output_path))
-    
-    print(f"✅ 优化并过滤完成！最终保留 {num_points} 个高质量 3D 点。")
-    # print(f"📁 点云已保存至: {ply_output_path}")
-   
-    return points, sparse_depth
+    valid_mask = sparse_depth > 0
+
+    info = {
+        "feature_type": feature_type,
+        "num_points_world": int(len(points_world)),
+        "pairs": pairs,
+    }
+    return {
+        "sparse_depth": sparse_depth,
+        "sparse_conf": sparse_conf,
+        "valid_mask": valid_mask,
+        "points_world": points_world,
+        "points_conf": points_conf,
+        "source_weights": source_weights,
+        "points_color": points_color,
+        "info": info,
+    }
+
+
+def load_or_compute_sparse_depth(
+    images,
+    intrinsics,
+    extrinsics,
+    cache_path,
+    ref_idx: int = 0,
+    config: SfMConfig | None = None,
+    save_vis: bool = True,
+):
+    """Return the ref-view SfM sparse depth at the input image resolution.
+
+    Loads ``cache_path`` (an ``.npy``) if it exists, otherwise runs two-view SfM
+    on the given (multi-view) arrays, caches the result and an optional ``.png``
+    visualisation next to it. ``images`` may be ``[V, H, W, 3]`` uint8 or
+    ``[V, C, H, W]``; ``intrinsics`` ``[V, 3, 3]``; ``extrinsics`` ``[V, 4, 4]``.
+    """
+    cache_path = Path(cache_path)
+    if cache_path.exists():
+        return np.load(cache_path).astype(np.float32)
+
+    sfm_sample = {"images": images, "intrinsics": intrinsics, "extrinsics": extrinsics}
+    out = generate_sparse_depth_from_sample(sfm_sample, ref_idx=ref_idx, config=config)
+    sparse_depth = out["sparse_depth"].astype(np.float32)
+
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    np.save(cache_path, sparse_depth)
+    if save_vis:
+        C.save_depth_png(sparse_depth, cache_path.with_suffix(".png"), valid=out["valid_mask"])
+    return sparse_depth
+
+
+def metric_scale_from_sparse(depth, sparse_depth, sparse_valid=None, min_pairs: int = 20):
+    """Global VGGT->metric scale s.t. ``depth * scale`` matches ``sparse_depth``.
+
+    VGGT depth is metric-consistent up to a single global scale, so the scale is
+    the median of the per-pixel ratio ``sparse_depth / depth`` over the pixels
+    where both are valid. Using the (零稀释的) mean of ``sparse_depth`` is wrong.
+    Returns ``(scale, info)``; ``scale`` falls back to 1.0 when too few overlaps.
+    """
+    depth = np.asarray(depth, np.float32)
+    sparse_depth = np.asarray(sparse_depth, np.float32)
+    if sparse_valid is None:
+        sparse_valid = sparse_depth > 0
+    mask = (
+        np.asarray(sparse_valid, bool)
+        & np.isfinite(depth) & (depth > 0)
+        & np.isfinite(sparse_depth) & (sparse_depth > 0)
+    )
+    num_pairs = int(mask.sum())
+    if num_pairs < min_pairs:
+        return 1.0, {"num_pairs": num_pairs, "valid": False, "scale": 1.0}
+    ratio = sparse_depth[mask] / depth[mask]
+    scale = float(np.median(ratio))
+    return scale, {"num_pairs": num_pairs, "valid": True, "scale": scale}
+
+
+def calibrate_depth_to_metric(sample, depth, ref_idx: int = 0, config: SfMConfig | None = None):
+    """Rescale ``depth`` to metric using the sample's SfM sparse depth.
+
+    Prefers ``sample["sfm_depth"]`` (precomputed/cropped by the dataset) and only
+    falls back to running SfM when it is absent. ``depth`` must already be at the
+    sample's reference-view resolution. Returns ``(depth_metric, scale, sfm_out)``.
+    """
+    cached = sample.get("sfm_depth") if hasattr(sample, "get") else None
+    if cached is not None:
+        sparse_depth = np.asarray(cached, np.float32)
+        valid_mask = sparse_depth > 0
+        sfm_out = {"sparse_depth": sparse_depth, "valid_mask": valid_mask, "info": {"source": "sample"}}
+    else:
+        sfm_out = generate_sparse_depth_from_sample(sample, ref_idx=ref_idx, config=config)
+        sfm_out["info"]["source"] = "computed"
+
+    scale, scale_info = metric_scale_from_sparse(depth, sfm_out["sparse_depth"], sfm_out["valid_mask"])
+    sfm_out["info"]["scale"] = scale_info
+    return (np.asarray(depth, np.float32) * scale).astype(np.float32), scale, sfm_out

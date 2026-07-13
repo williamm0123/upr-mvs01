@@ -4,20 +4,34 @@ import torch
 
 from base.config import LossConfig, StageWeights
 
-from .depth_loss import depth_cross_entropy_loss, depth_l1_loss
-from .feat_loss import feature_cosine_loss
-from .grad_normal import depth_gradient_loss, normal_consistency_loss
-from .residual import residual_laplacian_loss
-from .ssim import ssim_reprojection_loss
-
-
-def _phase_weight(step: int, warmup: int) -> float:
-    if step < warmup:
-        return 0.0
-    return 1.0
+from .depth_loss import depth_cross_entropy_loss, depth_smooth_l1_loss
 
 
 class MVSLoss:
+    """MVSFormer++-style cascade loss.
+
+    For every cascade stage we combine two complementary terms on that stage's
+    outputs (both masked, both resampled to the stage resolution):
+
+      * **Cross-entropy (classification)** on the probability volume: the GT
+        depth is snapped to its nearest depth hypothesis and we maximise the
+        predicted probability of that bin. This is the main signal in
+        MVSFormer++ and gives a well-shaped probability volume.
+      * **Smooth-L1 (regression)** on the soft-argmin depth: sharpens the final
+        sub-pixel depth estimate.
+
+    Stages are weighted by ``StageWeights`` (finer stages weigh more, matching
+    MVSFormer++'s ``depth_loss_weights``). Total = Σ_stage w_stage · (w_ce·CE + w_reg·L1).
+
+    Call signature ``(outputs, batch, step) -> (total_loss, logs)`` is kept so the
+    existing trainer works unchanged.
+
+    Required ``batch`` keys: ``depth_gt`` [B, H, W] (reference GT depth) and
+    optionally ``mask`` [B, H, W] (defaults to depth_gt > 0).
+    """
+
+    stage_names = ("stage1", "stage2", "stage3")
+
     def __init__(self, cfg: LossConfig, stage_weights: StageWeights) -> None:
         self.cfg = cfg
         self.stage_weights = stage_weights
@@ -26,69 +40,36 @@ class MVSLoss:
         self,
         outputs: dict,
         batch: dict,
-        step: int,
-        dino_features: torch.Tensor | None = None,
+        step: int = 0,
+        **_: object,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         cfg = self.cfg
         sw = self.stage_weights
+        weights = {"stage1": sw.stage1, "stage2": sw.stage2, "stage3": sw.stage3}
+
+        device = outputs["stage1"]["depth"].device
+        depth_gt = batch["depth_gt"].to(device).float()
+        mask = batch.get("mask")
+        mask = (depth_gt > 0).float() if mask is None else mask.to(device).float()
+
+        total = outputs["stage1"]["depth"].new_zeros(())
         logs: dict[str, float] = {}
 
-        total = outputs["depth_full"].new_zeros(())
-        stage_keys = [("stage1", sw.stage1, 8), ("stage2", sw.stage2, 4), ("stage3", sw.stage3, 4)]
-
-        for name, weight, stride in stage_keys:
+        for name in self.stage_names:
             stage = outputs[name]
-            gt = batch["depth_gt_multiscale"][stride].to(stage["depth"].device)
-            mask = batch["mask_multiscale"][stride].to(stage["depth"].device)
-            l_d = depth_l1_loss(stage["depth"], gt, mask)
-            l_g = depth_gradient_loss(stage["depth"], gt, mask)
-            l = cfg.w_depth * l_d + cfg.w_grad * l_g
-            if cfg.use_cross_entropy:
-                l = l + cfg.w_depth * depth_cross_entropy_loss(
-                    stage["prob"], stage["hypos"], gt, mask
-                )
-            total = total + weight * l
-            logs[f"{name}/l_depth"] = float(l_d.detach())
-            logs[f"{name}/l_grad"] = float(l_g.detach())
+            prob = stage["prob"]
+            hypos = stage["depth_hypos"]
+            depth = stage["depth"]
 
-        depth_full = outputs["depth_full"]
-        gt_full = batch["depth_gt_full"].to(depth_full.device)
-        mask_full = batch["mask_full"].to(depth_full.device)
-        K_full = batch["intrinsics"].to(depth_full.device)
-        E_full = batch["extrinsics"].to(depth_full.device)
+            l_ce = depth_cross_entropy_loss(prob, hypos, depth_gt, mask) if cfg.use_cross_entropy \
+                else depth.new_zeros(())
+            l_reg = depth_smooth_l1_loss(depth, depth_gt, mask)
 
-        if _phase_weight(step, cfg.residual_warmup_steps) > 0 and outputs.get("prior") is not None:
-            prior_depth = outputs["prior"]["depth_sparse"][:, 0]
-            prior_conf = outputs["prior"].get("confidence", None)
-            prior_conf_ref = prior_conf[:, 0] if prior_conf is not None else None
-            l_res = residual_laplacian_loss(
-                depth_full,
-                prior_depth,
-                mask_full,
-                confidence=prior_conf_ref,
-                b_scale=cfg.residual_b_scale,
-                min_confidence=cfg.residual_min_confidence,
-                relative=cfg.residual_relative,
-            )
-            total = total + cfg.w_residual * l_res
-            logs["l_residual"] = float(l_res.detach())
+            l_stage = cfg.w_depth * l_ce + cfg.w_reg * l_reg
+            total = total + weights[name] * l_stage
 
-        l_norm = normal_consistency_loss(depth_full, gt_full, K_full[:, 0], mask_full)
-        total = total + cfg.w_normal * l_norm
-        logs["l_normal"] = float(l_norm.detach())
+            logs[f"{name}/ce"] = float(l_ce.detach())
+            logs[f"{name}/reg"] = float(l_reg.detach())
 
-        if _phase_weight(step, cfg.ssim_warmup_steps) > 0:
-            imgs = batch["imgs_raw"].to(depth_full.device)
-            l_ssim = ssim_reprojection_loss(depth_full, imgs, K_full, E_full, mask_full)
-            total = total + cfg.w_ssim * l_ssim
-            logs["l_ssim"] = float(l_ssim.detach())
-
-        if dino_features is None:
-            dino_features = outputs.get("dino_features")
-        if _phase_weight(step, cfg.feat_warmup_steps) > 0 and dino_features is not None:
-            l_feat = feature_cosine_loss(depth_full, dino_features, K_full, E_full, mask_full)
-            total = total + cfg.w_feat * l_feat
-            logs["l_feat"] = float(l_feat.detach())
-
-        logs["loss"] = float(total.detach().cpu())
+        logs["loss"] = float(total.detach())
         return total, logs

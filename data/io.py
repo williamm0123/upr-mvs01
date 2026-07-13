@@ -32,11 +32,7 @@ def read_pfm(filename: str) -> np.ndarray:
         return np.flipud(data).copy()
 
 def write_pfm(filename, data):
-    """
-    写入 PFM 格式文件（对标 read_pfm）
-    支持：单通道灰度图(depth) / 3通道彩色图
-    默认使用小端序(little-endian)，兼容 DTU 数据集
-    """
+
     with open(filename, 'wb') as file:
         # 判断是彩色图还是深度图
         if data.dtype != np.float32:

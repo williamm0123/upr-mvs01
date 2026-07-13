@@ -1,5 +1,0 @@
-
-Pillow
-huggingface_hub
-einops
-safetensors

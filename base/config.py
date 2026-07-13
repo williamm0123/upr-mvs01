@@ -9,67 +9,40 @@ from typing import Literal
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
-MACHINE: Literal["ubuntu", "windows", "umhpc"] = "umhpc"
+# Machine (which filesystem layout to use) is resolved at import time because
+# ProjectPaths() is constructed ad-hoc in several places (dtu / norm_fill /
+# pre_prior / dinov3). Drive it from the environment so a cluster job switches
+# *all* of them at once, e.g. the Slurm script does `export UPRMVS_MACHINE=umhpc`.
+MACHINE: Literal["ubuntu", "umhpc"] = os.environ.get("UPRMVS_MACHINE", "ubuntu")  # type: ignore[assignment]
 
-TRAIN_PROFILE: Literal["local", "umhpc"] = "umhpc"
+# Default training profile follows the machine (still overridable by --profile).
+TRAIN_PROFILE: Literal["local", "umhpc"] = os.environ.get(  # type: ignore[assignment]
+    "UPRMVS_PROFILE", "umhpc" if MACHINE == "umhpc" else "local"
+)
 
 
 def _default_paths() -> dict[str, Path]:
-    if MACHINE not in {"ubuntu", "windows", "umhpc"}:
-        raise ValueError(
-            f"Unsupported MACHINE={MACHINE!r}. "
-            "Expected one of: 'ubuntu', 'windows', 'umhpc'."
-        )
-
-    if MACHINE == "windows":
-        project_path = Path(r"E:/documents/Project/point based/uprmvs01")
-        output_root = project_path / "outputs"
-        return {
-            "project_path": project_path,
-            "output_root": output_root,
-            "dtu_train_root": Path(r"E:/documents/dataset/DTU/dtu_training"),
-            "dtu_test_root": Path(r"E:/documents/dataset/DTU/dtu_testing"),
-            "dtu_list_path": project_path / "lists/dtu/test.txt",
-            "dinov3_weights_file": Path(
-                r"E:/documents/dataset/DINOv3/pre_trained/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth"
-            ),
-            "da3_weights_file": Path("E:/documents/dataset/pretrained/DA3/DA3MONO-LARGE"),
-            "vggt_weights_path": Path("E:/documents/dataset/VGGT/pretrained/VGGT-1B"),
-            "offline_prior_root": output_root / "vggt_da3_normal_fill_denoised",
-        }
-
     if MACHINE == "umhpc":
         project_path = Path("/scr/user/qinglong/projects/upr-mvs01")
-        output_root = Path("/scr/user/qinglong/projects/uprmvs_outputs")
-        return {
+        data_path = Path("/scr/user/qinglong/dataset")
+    else:
+        project_path = Path("/home/william/project/uprmvs01")
+        data_path = Path("/home/william/project/dataset")
+
+    return {
             "project_path": project_path,
-            "output_root": output_root,
-            "dtu_train_root": Path("/scr/user/qinglong/dataset/DTU/dtu_training"),
-            "dtu_test_root": Path("/scr/user/qinglong/dataset/DTU/dtu_testing"),
-            "dtu_list_path": project_path / "lists/dtu/test.txt",
-            "dinov3_weights_file": Path(
-                "/scr/user/qinglong/dataset/DINOv3/pre_trained/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth"
-            ),
-            "da3_weights_file": Path("/scr/user/qinglong/dataset/DA3/pretrained/DA3MONO-LARGE/"),
-            "vggt_weights_path": Path("/scr/user/qinglong/dataset/VGGT/pretrained/VGGT-1B"),
-            "offline_prior_root": output_root / "vggt_da3_normal_fill_denoised",
+            "output_root": project_path/ "uprmvs_outputs",
+            "dtu_train_root": data_path / "DTU/dtu_training",
+            "dtu_test_root": data_path / "DTU/dtu_testing",
+            "dtu_list_path": project_path / "lists/dtu/train.txt",
+            "sfm_cache_path":project_path / "log/sfm_depth",
+            "resnet50_weights_file": data_path / "Resnet50/Model_v2.pth",
+            "dinov3_weights_file":
+                data_path/"DINOv3/pre_trained/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth",
+            "da3_weights_file": data_path / "DA3/pretrained/DA3MONO-LARGE/",
+            "vggt_weights_path": data_path / "VGGT/pretrained/VGGT-1B",
         }
 
-    project_path = Path("/home/william/project/uprmvs01")
-    output_root = project_path / "outputs"
-    return {
-        "project_path": project_path,
-        "output_root": output_root,
-        "dtu_train_root": Path("/home/william/project/dataset/DTU/dtu_training"),
-        "dtu_test_root": Path("/home/william/project/dataset/DTU/dtu_test"),
-        "dtu_list_path": project_path / "lists/dtu/test.txt",
-        "dinov3_weights_file": Path(
-            "/home/william/project/dataset/DINOv3/pre_trained/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth"
-        ),
-        "da3_weights_file": Path("/home/william/project/dataset/DA3/DA3MONO-LARGE"),
-        "vggt_weights_path": Path("/home/william/project/dataset/VGGT/pretrained/VGGT-1B"),
-        "offline_prior_root": output_root / "vggt_da3_normal_fill_denoised",
-    }
 
 
 _DEFAULT_PATHS = _default_paths()
@@ -81,10 +54,11 @@ class ProjectPaths:
     dtu_train_root: Path = _DEFAULT_PATHS["dtu_train_root"]
     dtu_test_root: Path = _DEFAULT_PATHS["dtu_test_root"]
     dtu_list_path: Path = _DEFAULT_PATHS["dtu_list_path"]
+    sfm_cache_path: Path = _DEFAULT_PATHS["sfm_cache_path"]
+    resnet50_weights_file: Path = _DEFAULT_PATHS["resnet50_weights_file"]
     dinov3_weights_file: Path = _DEFAULT_PATHS["dinov3_weights_file"]
     da3_weights_file: Path = _DEFAULT_PATHS["da3_weights_file"]
     vggt_weights_path: Path = _DEFAULT_PATHS["vggt_weights_path"]
-    offline_prior_root: Path = _DEFAULT_PATHS["offline_prior_root"]
     train_list_file: Path = _DEFAULT_PATHS["project_path"] / "lists/dtu/train.txt"
     val_list_file: Path = _DEFAULT_PATHS["project_path"] / "lists/dtu/val.txt"
     test_list_file: Path = _DEFAULT_PATHS["project_path"] / "lists/dtu/test.txt"
@@ -96,67 +70,20 @@ class DataConfig:
     target_h: int = 512
     target_w: int = 640
     nviews: int = 3
-    feature_strides: tuple[int, ...] = (4, 8, 16)
+    feature_strides: tuple[int, ...] = (1, 2, 4)
     pair_min_overlap: float = 0.30
     pair_min_baseline_deg: float = 5.0
     pair_max_baseline_deg: float = 45.0
     use_pair_filter: bool = True
 
 
-@dataclass(frozen=True)
-class DINOConfig:
-    patch_size: int = 16
-    input_max_side: int = 512
-    layers: tuple[int, ...] = (3, 6, 9, 11)
-    project_channels: int = 128
-    random_projection_seed: int = 20260416
-    mean: tuple[float, float, float] = (0.485, 0.456, 0.406)
-    std: tuple[float, float, float] = (0.229, 0.224, 0.225)
 
 
 @dataclass(frozen=True)
 class FPNConfig:
-    backbone: str = "resnet50"
     out_channels: int = 128
-    pretrained: bool = True
+    base_channel: int = 32
 
-
-@dataclass(frozen=True)
-class VGGTPriorConfig:
-    # offline: use precomputed VGGT point-cloud + depth_fill priors from ProjectPaths.offline_prior_root.
-    # online: run VGGT inside the training step.
-    # auto: use offline when present, otherwise run VGGT.
-    # none: train without a geometric prior.
-    prior_source: Literal["offline", "online", "auto", "none"] = "offline"
-    offline_confidence: float = 0.9
-    offline_prior_required: bool = False
-    generate_missing_offline: bool = True
-    offline_generation_light_idx: int = 3
-    offline_generation_include_val: bool = True
-    offline_generation_max_groups: int = 0
-    offline_sparse_min_confidence: float = 0.5
-    offline_sparse_keep_ratio: float = 0.35
-    offline_denoise_points: bool = True
-    offline_denoise_max_points: int = 50000
-    confidence_w_vggt: float = 0.5
-    confidence_w_reproj: float = 0.3
-    confidence_w_normal: float = 0.2
-    sor_k: int = 20
-    sor_std_ratio: float = 2.0
-    normal_neighbor_k: int = 16
-    normal_consistency_deg: float = 30.0
-    reproj_threshold_px: float = 4.0
-    enabled: bool = True
-
-
-@dataclass(frozen=True)
-class GeoFusionConfig:
-    geo_channels: int = 128
-    encoder_hidden: int = 64
-    init_alpha: float = 0.0
-    alpha_warmup_steps: int = 10000
-    alpha_release_steps: int = 30000
-    alpha_max_during_warmup: float = 0.1
 
 
 @dataclass(frozen=True)
@@ -170,22 +97,23 @@ class DepthRangeConfig:
 class CostVolumeConfig:
     num_groups: int = 8
     num_depths_stage1: int = 48
-    num_depths_stage2: int = 32
+    num_depths_stage2: int = 16
     num_depths_stage3: int = 16
     num_depths_uncertain: int = 64
     interval_ratio_stage2: float = 0.5
-    interval_ratio_stage3: float = 0.25
-
-
-@dataclass(frozen=True)
-class AnchorPEConfig:
-    num_anchors: int = 24
-    min_visible_views_ratio: float = 0.5
-    min_confidence: float = 0.7
-    pe_hidden: int = 64
-    pe_out_channels: int = 64
-    lambda_warmup_steps: int = 20000
-    lambda_release_steps: int = 30000
+    interval_ratio_stage3: float = 0.125
+    # warp-channel width per cascade stage (must be divisible by num_groups).
+    # Shrinks as resolution grows so the full-res stage does not OOM: the warp
+    # intermediate is [B, warp_channels, D, H, W].
+    warp_channels_stage1: int = 128
+    warp_channels_stage2: int = 64
+    warp_channels_stage3: int = 32
+    # sample/correlate features in fp16 on CUDA (geometry stays fp32) for a
+    # further ~2x memory cut over the channel reduction alone.
+    warp_use_half: bool = True
+    # per-source cost-volume weighting: True uses batch["src_weights"]; False
+    # forces uniform averaging regardless of what the batch provides.
+    use_src_weights: bool = False
 
 
 @dataclass(frozen=True)
@@ -206,7 +134,8 @@ class DecoderConfig:
 
 @dataclass(frozen=True)
 class LossConfig:
-    w_depth: float = 1.0
+    w_depth: float = 1.0      # weight of the per-stage cross-entropy (classification) term
+    w_reg: float = 1.0        # weight of the per-stage smooth-L1 (regression) term
     w_grad: float = 0.5
     w_normal: float = 0.5
     w_residual: float = 0.1
@@ -234,9 +163,6 @@ class TrainConfig:
     batch_size: int = 1
     num_workers: int = 2
     num_views: int = 3
-    num_depths_stage1: int = 48
-    num_depths_stage2: int = 32
-    num_depths_stage3: int = 16
     lr: float = 1.0e-4
     weight_decay: float = 1.0e-4
     max_steps: int = 200000
@@ -251,7 +177,6 @@ class TrainConfig:
     ckpt_interval: int = 5000
     devices: tuple[int, ...] = (0,)
     distributed: bool = False
-    use_vggt_prior: bool = True
     use_anchor_pe: bool = True
     use_geo_fusion: bool = True
     use_points_alignment: bool = True
@@ -263,17 +188,14 @@ def _train_local() -> TrainConfig:
         batch_size=1,
         num_workers=2,
         num_views=3,
-        num_depths_stage1=32,
-        num_depths_stage2=24,
-        num_depths_stage3=8,
         lr=1.0e-4,
         weight_decay=1.0e-4,
-        max_steps=5000,
+        max_steps=200000,
         warmup_steps=200,
         grad_clip=1.0,
         amp=True,
         seed=20260526,
-        log_interval=10,
+        log_interval=20,
         vis_interval=100,
         vis_max_views=3,
         val_interval=500,
@@ -289,9 +211,6 @@ def _train_umhpc() -> TrainConfig:
         batch_size=4,
         num_workers=8,
         num_views=5,
-        num_depths_stage1=96,
-        num_depths_stage2=48,
-        num_depths_stage3=24,
         lr=2.0e-4,
         weight_decay=1.0e-4,
         max_steps=200000,
@@ -322,13 +241,9 @@ def get_train_config(profile: str | None = None) -> TrainConfig:
 class MVSConfig:
     paths: ProjectPaths = field(default_factory=ProjectPaths)
     data: DataConfig = field(default_factory=DataConfig)
-    dino: DINOConfig = field(default_factory=DINOConfig)
     fpn: FPNConfig = field(default_factory=FPNConfig)
-    vggt_prior: VGGTPriorConfig = field(default_factory=VGGTPriorConfig)
-    geo_fusion: GeoFusionConfig = field(default_factory=GeoFusionConfig)
     depth_range: DepthRangeConfig = field(default_factory=DepthRangeConfig)
     cost_volume: CostVolumeConfig = field(default_factory=CostVolumeConfig)
-    anchor_pe: AnchorPEConfig = field(default_factory=AnchorPEConfig)
     points_alignment: PointsAlignmentConfig = field(default_factory=PointsAlignmentConfig)
     decoder: DecoderConfig = field(default_factory=DecoderConfig)
     loss: LossConfig = field(default_factory=LossConfig)

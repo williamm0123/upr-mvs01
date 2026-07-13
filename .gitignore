@@ -5,6 +5,10 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+
+*.png
+*.ply
+*.npz
 .ipynb_checkpoints/
 .env
 .venv/
@@ -18,3 +22,9 @@ checkpoints/
 *.ckpt
 *.md
 experiments/
+log/
+docs/
+.claude/
+.agents/
+.vscode/
+.codex

@@ -16,6 +16,22 @@ def depth_l1_loss(
     return diff[m].mean()
 
 
+def depth_smooth_l1_loss(
+    depth_pred: torch.Tensor,
+    depth_gt: torch.Tensor,
+    mask: torch.Tensor,
+    beta: float = 1.0,
+) -> torch.Tensor:
+    """Masked smooth-L1 regression on the soft-argmin depth (MVSFormer++ reg)."""
+    if depth_gt.shape[-2:] != depth_pred.shape[-2:]:
+        depth_gt = F.interpolate(depth_gt.unsqueeze(1), size=depth_pred.shape[-2:], mode="nearest").squeeze(1)
+        mask = F.interpolate(mask.unsqueeze(1).float(), size=depth_pred.shape[-2:], mode="nearest").squeeze(1)
+    m = mask.bool() & (depth_gt > 0)
+    if not m.any():
+        return depth_pred.new_zeros(())
+    return F.smooth_l1_loss(depth_pred[m], depth_gt[m], beta=beta)
+
+
 def depth_cross_entropy_loss(
     prob_volume: torch.Tensor,
     depth_hypos: torch.Tensor,
