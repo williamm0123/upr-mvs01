@@ -7,8 +7,16 @@
 #SBATCH --cpus-per-task=64
 #SBATCH --mem=96G
 #SBATCH --qos=long
+#SBATCH --time=3-00:00:00
 #SBATCH --output=log/%x_%j.out
 #SBATCH --error=log/%x_%j.err
-#SBATCH --chdir=/scr/user/qinglong/projects/upr-mvs01
+
+cd /scr/user/qinglong/projects/upr-mvs01
+source ~/.bashrc
+conda activate mvs
+
+export UPRMVS_MACHINE=umhpc
+export UPRMVS_PROFILE=umhpc
+export OMP_NUM_THREADS=4
 
 torchrun --standalone --nnodes=1 --nproc-per-node=2 train.py

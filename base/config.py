@@ -208,7 +208,7 @@ def _train_local() -> TrainConfig:
 def _train_umhpc() -> TrainConfig:
     return TrainConfig(
         profile="umhpc",
-        batch_size=4,
+        batch_size=3,
         num_workers=8,
         num_views=5,
         lr=2.0e-4,
