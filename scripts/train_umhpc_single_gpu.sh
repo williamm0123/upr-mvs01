@@ -17,11 +17,10 @@ TRAIN_PROFILE=${TRAIN_PROFILE:-local}
 RUN_NAME=${RUN_NAME:-uprmvs_1gpu_${SLURM_JOB_ID:-manual}}
 
 # 核心训练参数（命令行会覆盖 TRAIN_PROFILE 中的同名参数）
-BATCH_SIZE=${BATCH_SIZE:-1}       # 单卡 batch size；显存不足时保持 1
-NUM_VIEWS=${NUM_VIEWS:-3}         # MVS 总视图数：1 个参考视图 + 2 个源视图
+BATCH_SIZE=${BATCH_SIZE:-2}       # 单卡 batch size；显存不足时保持 1
+NUM_VIEWS=${NUM_VIEWS:-5}         # MVS 总视图数：1 个参考视图 + 2 个源视图
 NUM_WORKERS=${NUM_WORKERS:-8}     # DataLoader 进程数；32 CPU 下建议 8
 LEARNING_RATE=${LEARNING_RATE:-1e-4}
-WARMUP_STEPS=${WARMUP_STEPS:-1000}
 AMP=${AMP:-on}                    # on/off；A100 建议 on
 STEPS=${STEPS:-0}                 # 0=使用 profile 默认值；测试可设 2
 
@@ -43,7 +42,7 @@ export PYTHONUNBUFFERED=1
 
 echo "=== job=${SLURM_JOB_ID:-manual} host=$(hostname) profile=$TRAIN_PROFILE ==="
 nvidia-smi -L
-echo "=== batch=$BATCH_SIZE views=$NUM_VIEWS workers=$NUM_WORKERS lr=$LEARNING_RATE warmup=$WARMUP_STEPS amp=$AMP steps=$STEPS build_priors=$BUILD_PRIORS smoke=$SMOKE ==="
+echo "=== batch=$BATCH_SIZE views=$NUM_VIEWS workers=$NUM_WORKERS lr=$LEARNING_RATE amp=$AMP steps=$STEPS build_priors=$BUILD_PRIORS smoke=$SMOKE ==="
 
 train_args=(
     --profile "$TRAIN_PROFILE"
@@ -53,7 +52,6 @@ train_args=(
     --num-views "$NUM_VIEWS"
     --num-workers "$NUM_WORKERS"
     --lr "$LEARNING_RATE"
-    --warmup-steps "$WARMUP_STEPS"
     --amp "$AMP"
     --name "$RUN_NAME"
 )
