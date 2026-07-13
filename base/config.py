@@ -191,7 +191,7 @@ def _train_local() -> TrainConfig:
         lr=1.0e-4,
         weight_decay=1.0e-4,
         max_steps=200000,
-        warmup_steps=200,
+        warmup_steps=1000,
         grad_clip=1.0,
         amp=True,
         seed=20260526,

@@ -111,7 +111,19 @@ def _norm_map(x: torch.Tensor, vmin: float, vmax: float) -> torch.Tensor:
 
 
 class TrainLogger:
-    """TensorBoard scalars/images (MVSFormer++-style) + latest/best checkpoints."""
+    """TensorBoard scalars/images (MVSFormer++-style) + latest/best checkpoints.
+
+    Every summary tag lives below ``train/``.  TensorBoard uses the text before
+    the first slash as the card group, so this keeps all training charts and
+    images expanded together in one ``train`` grid instead of creating one
+    collapsible row per tag.
+    """
+
+    TAG_PREFIX = "train"
+
+    @classmethod
+    def _tag(cls, name: str) -> str:
+        return f"{cls.TAG_PREFIX}/{name}"
 
     def __init__(self, run_name: str, enabled: bool) -> None:
         self.enabled = enabled
@@ -132,11 +144,11 @@ class TrainLogger:
     def log_scalars(self, logs: dict, lr: float, metrics: dict, step: int) -> None:
         if not self.enabled or self.tb is None:
             return
-        self.tb.add_scalar("loss_total", logs["loss"], step)
+        self.tb.add_scalar(self._tag("loss_total"), logs["loss"], step)
         for name in ("stage1", "stage2", "stage3"):
-            self.tb.add_scalar(f"loss_{name}_ce", logs[f"{name}/ce"], step)
-            self.tb.add_scalar(f"loss_{name}_reg", logs[f"{name}/reg"], step)
-        self.tb.add_scalar("learning_rate", lr, step)
+            self.tb.add_scalar(self._tag(f"loss_{name}_ce"), logs[f"{name}/ce"], step)
+            self.tb.add_scalar(self._tag(f"loss_{name}_reg"), logs[f"{name}/reg"], step)
+        self.tb.add_scalar(self._tag("learning_rate"), lr, step)
         # metric_abs_err_mm : single overall mean-|pred-gt| in mm (no per-scale
         #   variant -- one number over all valid pixels).
         # metric_acc_{2,4,8}mm : the *scale* metrics -- fraction of pixels whose
@@ -144,11 +156,11 @@ class TrainLogger:
         #   in this run) so there is no ambiguity about which scale is which and
         #   no add_scalars sub-run folders.
         if "abs_err" in metrics:
-            self.tb.add_scalar("metric_abs_err", metrics["abs_err"], step)
+            self.tb.add_scalar(self._tag("metric_abs_err"), metrics["abs_err"], step)
         for thr in ("2mm", "4mm", "8mm"):
             key = f"acc_{thr}"
             if key in metrics:
-                self.tb.add_scalar(f"metric_acc_{thr}", metrics[key], step)
+                self.tb.add_scalar(self._tag(f"metric_acc_{thr}"), metrics[key], step)
 
     def log_images(self, batch: dict, outputs: dict, step: int) -> None:
         if not self.enabled or self.tb is None:
@@ -162,16 +174,16 @@ class TrainLogger:
         else:
             vmin, vmax = 0.0, 1.0
         err = (depth_pred - depth_gt).abs() * mask
-        self.tb.add_image("image_ref", batch["images"][0, 0].detach().float() / 255.0, step)
-        self.tb.add_image("depth_pred", _norm_map(depth_pred, vmin, vmax), step)
-        self.tb.add_image("depth_gt", _norm_map(depth_gt, vmin, vmax), step)
+        self.tb.add_image(self._tag("image_ref"), batch["images"][0, 0].detach().float() / 255.0, step)
+        self.tb.add_image(self._tag("depth_pred"), _norm_map(depth_pred, vmin, vmax), step)
+        self.tb.add_image(self._tag("depth_gt"), _norm_map(depth_gt, vmin, vmax), step)
         self.tb.add_image(
-            "depth_abs_err",
+            self._tag("depth_abs_err"),
             _norm_map(err, 0.0, max(vmax - vmin, 1.0) * 0.1),
             step,
         )
         prob = outputs["stage3"]["prob"][0].detach().amax(dim=0)  # confidence
-        self.tb.add_image("stage3_confidence", _norm_map(prob, 0.0, 1.0), step)
+        self.tb.add_image(self._tag("stage3_confidence"), _norm_map(prob, 0.0, 1.0), step)
 
     def save(self, model, optimizer, step: int, metric: float) -> None:
         if not self.enabled:
