@@ -4,8 +4,8 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:4
-#SBATCH --cpus-per-task=32
-#SBATCH --mem=64G
+#SBATCH --cpus-per-task=64
+#SBATCH --mem=96G
 #SBATCH --qos=long
 #SBATCH --output=log/%x_%j.out
 #SBATCH --error=log/%x_%j.err
