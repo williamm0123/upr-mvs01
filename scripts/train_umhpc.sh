@@ -3,11 +3,11 @@
 #SBATCH --partition=gpu-a100
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --gres=gpu:4
+#SBATCH --gres=gpu:2
 #SBATCH --cpus-per-task=64
-#SBATCH --mem=64G
+#SBATCH --mem=96G
 #SBATCH --qos=normal
-#SBATCH --time=08:00:00
+#SBATCH --time=3-00:00:00
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err
 
@@ -23,7 +23,7 @@ export OMP_NUM_THREADS=16
 
 python train.py \
   --profile umhpc \
-  --gpus 4 \
+  --gpus 2 \
   --ddp on \
   --batch-size 3 \
   --num-views 5 \
@@ -33,4 +33,4 @@ python train.py \
   --amp on \
   --steps 0 \
   --build-priors skip \
-  --name uprmvs_ddp
+  --name uprmvs01
