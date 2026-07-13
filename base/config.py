@@ -107,7 +107,7 @@ class CostVolumeConfig:
     # intermediate is [B, warp_channels, D, H, W].
     warp_channels_stage1: int = 128
     warp_channels_stage2: int = 64
-    warp_channels_stage3: int = 64
+    warp_channels_stage3: int = 32
     # sample/correlate features in fp16 on CUDA (geometry stays fp32) for a
     # further ~2x memory cut over the channel reduction alone.
     warp_use_half: bool = True
