@@ -119,8 +119,9 @@ class UprMVSNet(nn.Module):
 
     def forward(self, batch: dict, step: int | None = None) -> dict:
         # Normalize to [0, 1] before the FPN: raw 0-255 pixels flow through the
-        # full-res input_proj/smooth_p1 branch, which has no BatchNorm, so their
-        # magnitude propagates into the cost-volume correlation and blows up fp16.
+        # full-res input_proj/smooth_p1 branch (whose final conv + smooth carry no
+        # norm), so their magnitude propagates into the cost-volume correlation and
+        # blows up fp16.
         images = batch["images"].float() / 255.0
         K = batch["intrinsics"].float()
         E = batch["extrinsics"].float()
