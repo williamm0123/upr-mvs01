@@ -7,8 +7,8 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=64G
 #SBATCH --qos=long
-#SBATCH --output=logs/%x_%j.out
-#SBATCH --error=logs/%x_%j.err
+#SBATCH --output=log/%x_%j.out
+#SBATCH --error=log/%x_%j.err
 
 set -euo pipefail
 
@@ -17,7 +17,7 @@ CONDA_ENV=mvs
 RUN_NAME=${RUN_NAME:-uprmvs_${SLURM_JOB_ID:-manual}}
 
 cd "$PROJECT_DIR"
-mkdir -p logs
+mkdir -p log
 
 source ~/.bashrc
 conda activate "$CONDA_ENV"
