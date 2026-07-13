@@ -5,63 +5,52 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-def _group_norm(num_channels: int, max_groups: int = 8) -> nn.GroupNorm:
-    """GroupNorm 组数：取 <=max_groups 且能整除通道数的最大值。
-
-    GN 的统计量按通道分组、每张图独立计算，与 batch size 无关，避免了
-    B*V=3 张图时 BN 统计量高方差、train/eval 行为不一致的问题
-    （3D 解码器 decoder.py 的 ConvGN3d 同样风格）。
-    """
-    groups = min(max_groups, num_channels)
-    while num_channels % groups != 0:
-        groups -= 1
-    return nn.GroupNorm(groups, num_channels)
 
 
-class ConvGnReLU(nn.Module):
+class ConvBnReLU(nn.Module):
     def __init__(self, in_ch: int, out_ch: int, stride: int = 1) -> None:
         super().__init__()
-        self.conv_gn_relu = nn.Sequential(
+        self.conv_bn_relu = nn.Sequential(
             nn.Conv2d(in_ch, out_ch, 3, stride=stride, padding=1, bias=False),
-            _group_norm(out_ch),
+            nn.BatchNorm2d(out_ch),
             nn.ReLU(inplace=True),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.conv_gn_relu(x)
+        return self.conv_bn_relu(x)
 
 
 class ResidualBlock(nn.Module):
     def __init__(self, channels: int) -> None:
         super().__init__()
-        self.convgn1 = nn.Sequential(
+        self.convbn1 = nn.Sequential(
             nn.Conv2d(channels, channels, 3, padding=1, bias=False),
-            _group_norm(channels),
+            nn.BatchNorm2d(channels),
             nn.ReLU(inplace=True),
         )
-        self.convgn2 = nn.Sequential(
+        self.convbn2 = nn.Sequential(
             nn.Conv2d(channels, channels, 3, padding=1, bias=False),
-            _group_norm(channels),
+            nn.BatchNorm2d(channels),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = self.convgn1(x)
-        out = self.convgn2(out)
+        out = self.convbn1(x)
+        out = self.convbn2(out)
         return F.relu(out + x, inplace=True)
 
 
 class ScaleTower(nn.Module):
     """自底向上单个尺度塔：stride-2 降采样 + 一层同尺度 conv + 残差块。
 
-    每尺度共 4 个 3x3 卷积层（2 个 ConvGnReLU + 1 个残差块），比原来的
+    每尺度共 4 个 3x3 卷积层（2 个 ConvBnReLU + 1 个残差块），比原来的
     (stride conv + 残差) 更深，扩大感受野；下探一级（多一次 stride-2）
     对感受野的贡献是翻倍级的。
     """
 
     def __init__(self, in_ch: int, out_ch: int) -> None:
         super().__init__()
-        self.down = ConvGnReLU(in_ch, out_ch, stride=2)   # 降采样并换通道
-        self.conv = ConvGnReLU(out_ch, out_ch)            # 同尺度加深
+        self.down = ConvBnReLU(in_ch, out_ch, stride=2)   # 降采样并换通道
+        self.conv = ConvBnReLU(out_ch, out_ch)            # 同尺度加深
         self.res = ResidualBlock(out_ch)                  # 同尺度残差增强
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -101,9 +90,9 @@ class FPNFeatureExtractor(nn.Module):
         self.lateral_quarter = nn.Conv2d(c_quarter, out_channels, 1)
         self.lateral_eighth = nn.Conv2d(c_eighth, out_channels, 1)
 
-        # ---- 全分辨率分支：2 层 conv（Conv-GN-ReLU-Conv），非单层线性投影 ----
+        # ---- 全分辨率分支：2 层 conv（Conv-BN-ReLU-Conv），非单层线性投影 ----
         self.input_proj = nn.Sequential(
-            ConvGnReLU(3, out_channels),
+            ConvBnReLU(3, out_channels),
             nn.Conv2d(out_channels, out_channels, 3, padding=1),
         )
 
