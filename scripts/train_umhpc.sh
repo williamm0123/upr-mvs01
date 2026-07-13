@@ -1,5 +1,5 @@
 #!/bin/bash -l
-#SBATCH --job-name=uprmvs_4gpu
+#SBATCH --job-name=uprmvs01
 #SBATCH --partition=gpu-a100
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
