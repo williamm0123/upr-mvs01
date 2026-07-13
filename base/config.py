@@ -185,10 +185,10 @@ class TrainConfig:
 def _train_local() -> TrainConfig:
     return TrainConfig(
         profile="local",
-        batch_size=1,
-        num_workers=2,
-        num_views=3,
-        lr=1.0e-4,
+        batch_size=4,
+        num_workers=8,
+        num_views=5,
+        lr=2.0e-4,
         weight_decay=1.0e-4,
         max_steps=200000,
         warmup_steps=1000,
@@ -197,7 +197,7 @@ def _train_local() -> TrainConfig:
         seed=20260526,
         log_interval=20,
         vis_interval=100,
-        vis_max_views=3,
+        vis_max_views=5,
         val_interval=500,
         ckpt_interval=1000,
         devices=(0,),

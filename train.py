@@ -1,13 +1,16 @@
 """Training entry point for UprMVSNet.
 
-Single-card and multi-card (2 / 4 GPU) DistributedDataParallel training with
-explicit switches for *whether* to use DDP and *how many* GPUs:
+Single-card and multi-card DistributedDataParallel training.  Multi-GPU jobs
+should normally be launched with ``torchrun``:
 
     # single GPU
     python train.py --profile umhpc --gpus 1
 
-    # 2 / 4 GPU DDP on one node (spawns one process per GPU automatically)
-    python train.py --profile umhpc --gpus 2 --ddp on
+    # 4 GPU DDP on one node
+    torchrun --standalone --nnodes=1 --nproc-per-node=4 train.py
+
+Direct ``python`` multi-GPU launching is retained for backwards compatibility:
+
     python train.py --profile umhpc --gpus 4 --ddp on
 
     # pick specific device ids
@@ -19,7 +22,9 @@ explicit switches for *whether* to use DDP and *how many* GPUs:
     # validate the full model + loss + DDP + logging path on synthetic data
     python train.py --gpus 2 --ddp on --smoke
 
-``--ddp auto`` (default) turns DDP on iff the effective GPU count > 1.
+When launched by ``torchrun``, rank, world size, and the CUDA device are read
+from ``RANK``, ``WORLD_SIZE``, and ``LOCAL_RANK``.  ``--ddp auto`` applies only
+to direct ``python`` launches and turns DDP on iff the selected GPU count > 1.
 
 Artifacts (under <project>/log/):
     log/prior_cache/   precomputed {depth_prior, conf_prior, norm_depth_fill, src_weights}
@@ -257,7 +262,13 @@ def _ensure_priors(cfg, device, overwrite: bool = False) -> None:
 # --------------------------------------------------------------------------- #
 # Per-process worker
 # --------------------------------------------------------------------------- #
-def main_worker(rank: int, world_size: int, device_ids: list[int], args) -> None:
+def main_worker(
+    rank: int,
+    world_size: int,
+    device_ids: list[int],
+    args,
+    local_rank: int | None = None,
+) -> None:
     cfg = build_mvs_config(profile=args.profile)
     train_overrides = {}
     if args.batch_size is not None:
@@ -280,10 +291,16 @@ def main_worker(rank: int, world_size: int, device_ids: list[int], args) -> None
 
     if is_ddp:
         backend = "nccl" if torch.cuda.is_available() else "gloo"
-        dist.init_process_group(backend, rank=rank, world_size=world_size)
+        if local_rank is not None:
+            # torchrun supplies rendezvous information and ranks through the
+            # environment; passing them again can conflict with elastic launch.
+            dist.init_process_group(backend=backend)
+        else:
+            dist.init_process_group(backend, rank=rank, world_size=world_size)
 
     if torch.cuda.is_available():
-        device = torch.device(f"cuda:{device_ids[rank]}")
+        device_id = local_rank if local_rank is not None else device_ids[rank]
+        device = torch.device(f"cuda:{device_id}")
         torch.cuda.set_device(device)
     else:
         device = torch.device("cpu")
@@ -460,6 +477,20 @@ def main() -> None:
     parser.add_argument("--smoke", action="store_true", help="run synthetic steps to validate the pipeline")
     parser.add_argument("--smoke-steps", type=int, default=3)
     args = parser.parse_args()
+
+    # torchrun creates one process per GPU and assigns each process a local CUDA
+    # rank.  Do not enter the legacy mp.spawn path in this mode.
+    if "LOCAL_RANK" in os.environ:
+        rank = int(os.environ.get("RANK", "0"))
+        local_rank = int(os.environ["LOCAL_RANK"])
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        if rank == 0:
+            print(
+                f"launch: torchrun ddp={world_size > 1} "
+                f"world_size={world_size} mode={'smoke' if args.smoke else 'train'}"
+            )
+        main_worker(rank, world_size, [], args, local_rank=local_rank)
+        return
 
     device_ids = _parse_devices(args)
     world_size = len(device_ids)
