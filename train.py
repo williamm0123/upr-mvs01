@@ -167,23 +167,30 @@ class TrainLogger:
             return
         depth_pred = outputs["depth_full"][0].detach()
         depth_gt = batch["depth_gt"][0].float()
+        depth_prior = batch["depth_prior"][0].detach().float()
         mask = batch["mask"][0].bool() & (depth_gt > 0)
         if mask.any():
             vmin = float(depth_gt[mask].min())
             vmax = float(depth_gt[mask].max())
         else:
             vmin, vmax = 0.0, 1.0
-        err = (depth_pred - depth_gt).abs() * mask
-        self.tb.add_image(self._tag("image_ref"), batch["images"][0, 0].detach().float() / 255.0, step)
-        self.tb.add_image(self._tag("depth_pred"), _norm_map(depth_pred, vmin, vmax), step)
-        self.tb.add_image(self._tag("depth_gt"), _norm_map(depth_gt, vmin, vmax), step)
+
+        # TensorBoard sorts cards by tag, so numeric prefixes keep this visual
+        # comparison in a stable left-to-right order.
         self.tb.add_image(
-            self._tag("depth_abs_err"),
-            _norm_map(err, 0.0, max(vmax - vmin, 1.0) * 0.1),
+            self._tag("01_ref_image"),
+            batch["images"][0, 0].detach().float() / 255.0,
             step,
         )
+        self.tb.add_image(self._tag("02_depth_gt"), _norm_map(depth_gt, vmin, vmax), step)
+        self.tb.add_image(
+            self._tag("03_depth_prior"),
+            _norm_map(depth_prior, vmin, vmax),
+            step,
+        )
+        self.tb.add_image(self._tag("04_depth_pred"), _norm_map(depth_pred, vmin, vmax), step)
         prob = outputs["stage3"]["prob"][0].detach().amax(dim=0)  # confidence
-        self.tb.add_image(self._tag("stage3_confidence"), _norm_map(prob, 0.0, 1.0), step)
+        self.tb.add_image(self._tag("05_stage3_confidence"), _norm_map(prob, 0.0, 1.0), step)
 
     def save(self, model, optimizer, step: int, metric: float) -> None:
         if not self.enabled:
