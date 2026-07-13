@@ -6,8 +6,8 @@
 #SBATCH --gres=gpu:4
 #SBATCH --cpus-per-task=64
 #SBATCH --mem=64G
-#SBATCH --qos=long
-#SBATCH --time=3-00:00:00
+#SBATCH --qos=normal
+#SBATCH --time=08:00:00
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err
 
