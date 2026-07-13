@@ -37,7 +37,7 @@ mkdir -p logs
 export UPRMVS_MACHINE=umhpc
 export UPRMVS_PROFILE="$TRAIN_PROFILE"
 export PYTHONPATH="$PROJECT_DIR:$PROJECT_DIR/models/vggt:$PROJECT_DIR/models/Depth-Anything-3/src:${PYTHONPATH:-}"
-export OMP_NUM_THREADS=${OMP_NUM_THREADS:-4}
+export OMP_NUM_THREADS=${OMP_NUM_THREADS:-16}
 export PYTHONUNBUFFERED=1
 
 echo "=== job=${SLURM_JOB_ID:-manual} host=$(hostname) profile=$TRAIN_PROFILE ==="
