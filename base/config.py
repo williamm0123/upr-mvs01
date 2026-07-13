@@ -100,8 +100,8 @@ class CostVolumeConfig:
     num_depths_stage2: int = 16
     num_depths_stage3: int = 16
     num_depths_uncertain: int = 64
-    interval_ratio_stage2: float = 0.25
-    interval_ratio_stage3: float = 0.1
+    interval_ratio_stage2: float = 0.4
+    interval_ratio_stage3: float = 0.125
     # warp-channel width per cascade stage (must be divisible by num_groups).
     # Shrinks as resolution grows so the full-res stage does not OOM: the warp
     # intermediate is [B, warp_channels, D, H, W].
