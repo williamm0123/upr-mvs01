@@ -29,7 +29,7 @@ python train.py \
   --profile umhpc \
   --gpus 2 \
   --ddp on \
-  --batch-size 3 \
+  --batch-size 4 \
   --num-views 5 \
   --num-workers 16 \
   --lr 2e-4 \
