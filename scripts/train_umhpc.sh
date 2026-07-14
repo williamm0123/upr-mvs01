@@ -20,6 +20,7 @@ export UPRMVS_PROFILE=umhpc
 export PYTHONPATH=/scr/user/qinglong/projects/upr-mvs01:/scr/user/qinglong/projects/upr-mvs01/models:/scr/user/qinglong/projects/upr-mvs01/models/Depth-Anything-3/src
 export PYTHONNOUSERSITE=1
 export OMP_NUM_THREADS=16
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # 换过 val 列表(lists/dtu/val.txt)后, 首次需单进程预构建 val 先验缓存,
 # 避免 DDP 下 rank0 长时间构建导致 NCCL barrier 超时:
