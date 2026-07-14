@@ -42,6 +42,7 @@ export PYTHONPATH="$PROJECT_DIR:$PROJECT_DIR/models:$PROJECT_DIR/models/Depth-An
 export PYTHONNOUSERSITE=1
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-16}
 export PYTHONUNBUFFERED=1
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 echo "=== job=${SLURM_JOB_ID:-manual} host=$(hostname) profile=$TRAIN_PROFILE ==="
 nvidia-smi -L
