@@ -13,14 +13,15 @@ RUN_NAME=${RUN_NAME:-uprmvs_1gpu_${SLURM_JOB_ID:-manual}}
 BATCH_SIZE=${BATCH_SIZE:-3}       # 单卡 batch size；显存不足时保持 1
 NUM_VIEWS=${NUM_VIEWS:-5}         # MVS 总视图数：1 个参考视图 + 4 个源视图
 NUM_WORKERS=${NUM_WORKERS:-16}    # DataLoader 进程数；32 CPU 下建议 8~16
-LEARNING_RATE=${LEARNING_RATE:-1e-4}
+LEARNING_RATE=${LEARNING_RATE:-2e-4}
 WARMUP_STEPS=${WARMUP_STEPS:-1000}
 AMP=${AMP:-on}                    # on/off；A100 建议 on
 STEPS=${STEPS:-0}                 # 0=使用 profile 默认值；测试可设 2
 
 # 先验与跑通测试
 BUILD_PRIORS=${BUILD_PRIORS:-auto}
-# BUILD_PRIORS: auto=补齐缺失先验，force=全部重算，skip=要求缓存已存在
+# BUILD_PRIORS: auto=补齐缺失先验，force=全部重算，skip=要求缓存已存在，
+#               only=只构建先验然后退出（换 val 列表后先跑一次这个）
 SMOKE=${SMOKE:-0}                 # 1=合成数据跑通测试；0=真实数据训练
 SMOKE_STEPS=${SMOKE_STEPS:-2}     # SMOKE=1 时执行的训练步数
 # =============================================================================

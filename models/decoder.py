@@ -71,9 +71,11 @@ class DepthDecoder(nn.Module):
         self,
         cost_volume: torch.Tensor,
         depth_hypos: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         logits = self.unet(cost_volume)
+        # max-shift keeps softmax finite under AMP; log_softmax downstream is
+        # shift-invariant so the loss sees the same distribution.
         logits = logits - logits.amax(dim=1, keepdim=True).detach()
         prob = F.softmax(logits.float(), dim=1)
         depth, sigma = soft_argmin(prob, depth_hypos.float())
-        return depth, sigma, prob
+        return depth, sigma, prob, logits

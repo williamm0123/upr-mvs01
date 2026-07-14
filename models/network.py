@@ -21,7 +21,7 @@ class UprMVSNet(nn.Module):
         for each stage k:
             ref/src features + cameras + hypotheses ──► CostVolumeBuilder ──► cost volume
             cost volume ──► DepthDecoder (3D UNet) ──► prob volume ──► soft-argmin ──► depth
-            depth + prob ──► refine_range_from_prob ──► next-stage hypotheses (upsampled)
+            depth + sigma ──► refine_range_from_prob ──► next-stage hypotheses (upsampled)
 
     Stage resolutions follow ``fpn_stage_strides`` = (4, 2, 1): 1/4 -> 1/2 -> full.
 
@@ -96,7 +96,7 @@ class UprMVSNet(nn.Module):
         depth_hypos: torch.Tensor,
         feature_stride: int,
         src_weights: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         cost = self.cost_builders[stage_idx](
             feats_stage[:, 0],
             feats_stage[:, 1:],
@@ -108,8 +108,8 @@ class UprMVSNet(nn.Module):
             feature_stride=feature_stride,
             src_weights=src_weights,
         )
-        depth, sigma, prob = self.decoders[stage_idx](cost, depth_hypos)
-        return depth, sigma, prob
+        depth, sigma, prob, logits = self.decoders[stage_idx](cost, depth_hypos)
+        return depth, sigma, prob, logits
 
     @staticmethod
     def _upsample_hypos(hypos: torch.Tensor, target_hw: tuple[int, int]) -> torch.Tensor:
@@ -145,37 +145,46 @@ class UprMVSNet(nn.Module):
             num_depths=self.num_depths[0],
             target_hw=feat1.shape[-2:],
         )
-        depth1, sigma1, prob1 = self._run_stage(0, feat1, K, E, depth_hypos1, s1, src_weights)
+        depth1, sigma1, prob1, logits1 = self._run_stage(0, feat1, K, E, depth_hypos1, s1, src_weights)
 
-        # ---------- Stages 2 & 3: refine range from the previous prob volume ----------
+        # ---------- Stages 2 & 3: refine range from the previous prediction ----------
         stage_out = {
-            "stage1": {"depth": depth1, "sigma": sigma1, "prob": prob1, "depth_hypos": depth_hypos1},
+            "stage1": {
+                "depth": depth1, "sigma": sigma1, "prob": prob1,
+                "logits": logits1, "depth_hypos": depth_hypos1,
+            },
         }
-        prev_prob, prev_hypos, prev_depth = prob1, depth_hypos1, depth1
+        # The sigma-adaptive width needs a minimally trained prob volume; during
+        # warmup (and always at inference, where step is None -> adaptive) the
+        # schedule is decided by adaptive_warmup_steps.
+        adaptive = step is None or step >= self.range_cfg.adaptive_warmup_steps
+        prev_hypos, prev_depth, prev_sigma = depth_hypos1, depth1, sigma1
         for k in (1, 2):
             feat_k = feats[strides[k]]
             hypos_k = refine_range_from_prob(
-                prev_prob,
                 prev_hypos,
                 prev_depth,
+                prev_sigma,
                 self.range_cfg,
                 num_depths=self.num_depths[k],
                 interval_ratio=self.interval_ratios[k - 1],
+                adaptive=adaptive,
             )
             hypos_k = self._upsample_hypos(hypos_k, feat_k.shape[-2:])
-            # refine_range_from_prob recenters on the previous prediction and, when
-            # uncertain, re-expands the half-range; without a clamp the hypotheses can
-            # drift below depth_min (even negative), which makes the warp project to
+            # refine_range_from_prob recenters on the previous prediction with a
+            # sigma-widened range; without a clamp the hypotheses can drift below
+            # depth_min (even negative), which makes the warp project to
             # degenerate pixels. Keep them inside the scene's valid depth range.
             hypos_k = hypos_k.clamp(
                 min=depth_min.view(-1, 1, 1, 1),
                 max=depth_max.view(-1, 1, 1, 1),
             )
-            depth_k, sigma_k, prob_k = self._run_stage(k, feat_k, K, E, hypos_k, strides[k], src_weights)
+            depth_k, sigma_k, prob_k, logits_k = self._run_stage(k, feat_k, K, E, hypos_k, strides[k], src_weights)
             stage_out[f"stage{k + 1}"] = {
-                "depth": depth_k, "sigma": sigma_k, "prob": prob_k, "depth_hypos": hypos_k,
+                "depth": depth_k, "sigma": sigma_k, "prob": prob_k,
+                "logits": logits_k, "depth_hypos": hypos_k,
             }
-            prev_prob, prev_hypos, prev_depth = prob_k, hypos_k, depth_k
+            prev_hypos, prev_depth, prev_sigma = hypos_k, depth_k, sigma_k
 
         depth3 = stage_out["stage3"]["depth"]
         depth_full = F.interpolate(

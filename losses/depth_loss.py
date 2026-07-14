@@ -20,33 +20,45 @@ def depth_smooth_l1_loss(
     depth_pred: torch.Tensor,
     depth_gt: torch.Tensor,
     mask: torch.Tensor,
-    beta: float = 1.0,
+    interval: torch.Tensor,
+    err_clamp: float = 3.0,
 ) -> torch.Tensor:
-    """Masked smooth-L1 regression on the soft-argmin depth (MVSFormer++ reg)."""
-    if depth_gt.shape[-2:] != depth_pred.shape[-2:]:
-        depth_gt = F.interpolate(depth_gt.unsqueeze(1), size=depth_pred.shape[-2:], mode="nearest").squeeze(1)
-        mask = F.interpolate(mask.unsqueeze(1).float(), size=depth_pred.shape[-2:], mode="nearest").squeeze(1)
-    m = mask.bool() & (depth_gt > 0)
+    """Interval-normalized masked smooth-L1 on the soft-argmin depth.
+
+    The error is measured in units of the per-pixel hypothesis interval, so the
+    term stays O(1) at every cascade stage and on every scene scale instead of
+    inheriting the dataset's metric units. Errors are clamped at ``err_clamp``
+    bins: beyond that a pixel contributes a constant (zero gradient) and pulling
+    it back is left to the cross-entropy term, which keeps single hard pixels
+    from spiking the batch loss.
+
+    ``mask`` must already encode validity and GT-in-range at the stage
+    resolution (see MVSLoss); all inputs share the stage's [B, H, W] shape.
+    """
+    m = mask.bool()
     if not m.any():
         return depth_pred.new_zeros(())
-    return F.smooth_l1_loss(depth_pred[m], depth_gt[m], beta=beta)
+    err = (depth_pred - depth_gt).abs() / interval.clamp(min=1e-6)
+    err = err.clamp(max=err_clamp)
+    return F.smooth_l1_loss(err[m], torch.zeros_like(err[m]), beta=1.0)
 
 
 def depth_cross_entropy_loss(
-    prob_volume: torch.Tensor,
+    logits: torch.Tensor,
     depth_hypos: torch.Tensor,
     depth_gt: torch.Tensor,
     mask: torch.Tensor,
 ) -> torch.Tensor:
-    B, D, H, W = prob_volume.shape
-    if depth_gt.shape[-2:] != (H, W):
-        depth_gt = F.interpolate(depth_gt.unsqueeze(1), size=(H, W), mode="nearest").squeeze(1)
-        mask = F.interpolate(mask.unsqueeze(1).float(), size=(H, W), mode="nearest").squeeze(1)
-    m = mask.bool() & (depth_gt > 0)
+    """Masked cross-entropy on the logits volume against the nearest bin.
+
+    Works on logits with ``log_softmax`` (numerically stable under AMP) rather
+    than ``log(clamp(softmax))``. ``mask`` must already encode validity and
+    GT-in-range at the stage resolution (see MVSLoss).
+    """
+    m = mask.bool()
     if not m.any():
-        return prob_volume.new_zeros(())
-    diff = (depth_hypos - depth_gt.unsqueeze(1)).abs()
-    target_idx = diff.argmin(dim=1)
-    log_prob = torch.log(prob_volume.clamp(min=1e-8))
+        return logits.new_zeros(())
+    log_prob = F.log_softmax(logits.float(), dim=1)
+    target_idx = (depth_hypos - depth_gt.unsqueeze(1)).abs().argmin(dim=1)
     ll = log_prob.gather(1, target_idx.unsqueeze(1)).squeeze(1)
     return -ll[m].mean()

@@ -90,7 +90,10 @@ class FPNConfig:
 class DepthRangeConfig:
     sigma_max_ratio: float = 0.15
     k_sigma: float = 3.0
-    uncertain_threshold: float = 0.3
+    # refine_range_from_prob: steps before the sigma-adaptive width takes over.
+    # Early prob volumes are near-uniform, so their soft-argmin sigma carries no
+    # signal; until then the fixed interval_ratio schedule applies.
+    adaptive_warmup_steps: int = 2000
 
 
 @dataclass(frozen=True)
@@ -99,7 +102,6 @@ class CostVolumeConfig:
     num_depths_stage1: int = 48
     num_depths_stage2: int = 16
     num_depths_stage3: int = 16
-    num_depths_uncertain: int = 64
     interval_ratio_stage2: float = 0.4
     interval_ratio_stage3: float = 0.125
     # warp-channel width per cascade stage (must be divisible by num_groups).
@@ -134,20 +136,14 @@ class DecoderConfig:
 
 @dataclass(frozen=True)
 class LossConfig:
-    w_depth: float = 1.0      # weight of the per-stage cross-entropy (classification) term
-    w_reg: float = 1.0        # weight of the per-stage smooth-L1 (regression) term
-    w_grad: float = 0.5
-    w_normal: float = 0.5
-    w_residual: float = 0.1
-    w_ssim: float = 0.1
-    w_feat: float = 0.05
-    residual_b_scale: float = 0.1
-    residual_min_confidence: float = 0.3
-    residual_relative: bool = True
+    w_ce: float = 1.0         # weight of the per-stage cross-entropy (classification) term
+    w_reg: float = 1.0        # weight of the per-stage interval-normalized smooth-L1 term
+    # Regression error is measured in units of the per-pixel hypothesis interval
+    # and clamped here: pixels further off than this many bins contribute no reg
+    # gradient (CE alone drives them back), which keeps hard batches from
+    # spiking the loss.
+    reg_err_clamp: float = 3.0
     use_cross_entropy: bool = True
-    residual_warmup_steps: int = 20000
-    ssim_warmup_steps: int = 20000
-    feat_warmup_steps: int = 50000
 
 
 @dataclass(frozen=True)
@@ -213,7 +209,10 @@ def _train_umhpc() -> TrainConfig:
         num_views=5,
         lr=2.0e-4,
         weight_decay=1.0e-4,
-        max_steps=200000,
+        # Cosine horizon must match what the SLURM walltime can actually deliver
+        # (~2.9 s/step -> ~70k steps in <60h of the 3-day limit incl. validation),
+        # otherwise the LR never anneals before the job is killed.
+        max_steps=70000,
         warmup_steps=1000,
         grad_clip=1.0,
         amp=True,

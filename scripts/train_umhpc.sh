@@ -21,6 +21,9 @@ export PYTHONPATH=/scr/user/qinglong/projects/upr-mvs01:/scr/user/qinglong/proje
 export PYTHONNOUSERSITE=1
 export OMP_NUM_THREADS=16
 
+# 换过 val 列表(lists/dtu/val.txt)后, 首次需单进程预构建 val 先验缓存,
+# 避免 DDP 下 rank0 长时间构建导致 NCCL barrier 超时:
+#   python train.py --profile umhpc --gpus 1 --ddp off --build-priors only
 python train.py \
   --profile umhpc \
   --gpus 2 \
@@ -28,9 +31,10 @@ python train.py \
   --batch-size 3 \
   --num-views 5 \
   --num-workers 16 \
-  --lr 1e-4 \
+  --lr 2e-4 \
   --warmup-steps 1000 \
   --amp on \
   --steps 0 \
-  --build-priors skip \
+  --build-priors auto \
+  --resume auto \
   --name uprmvs01

@@ -135,30 +135,47 @@ def initial_range_from_prior(
 
 
 def refine_range_from_prob(
-    prob_volume: torch.Tensor,
     depth_hypos_prev: torch.Tensor,
     depth_pred_prev: torch.Tensor,
+    sigma_prev: torch.Tensor,
     config: DepthRangeConfig,
     num_depths: int,
     interval_ratio: float,
+    adaptive: bool = True,
 ) -> torch.Tensor:
-    device = depth_pred_prev.device
+    """Next-stage hypotheses centered on the previous stage's prediction.
 
-    B, D, H, W = prob_volume.shape
-    p_max = prob_volume.max(dim=1).values
-    uncertain = p_max < config.uncertain_threshold
+    The half-width is continuous in the previous stage's soft-argmin sigma:
 
+        half = clamp(k_sigma * sigma, min=0.5 * span_prev * interval_ratio,
+                     max=0.5 * span_prev)
+
+    A sharp prob volume (small sigma) narrows the range down to the fixed
+    ``interval_ratio`` floor; a flat one keeps up to the full previous span.
+    Monotonic and threshold-free, so neighbouring pixels / consecutive steps
+    never see a discontinuous range jump (the previous hard
+    ``p_max < uncertain_threshold`` branch re-expanded the range 5x at a
+    flip of one probability bit, which destabilised early training).
+
+    ``adaptive=False`` (range warmup, see DepthRangeConfig.adaptive_warmup_steps)
+    always uses the fixed floor.
+    """
     d_min = depth_hypos_prev.min(dim=1).values
     d_max = depth_hypos_prev.max(dim=1).values
     span_prev = d_max - d_min
-    half_range_new = 0.5 * span_prev * interval_ratio
+    half_floor = 0.5 * span_prev * interval_ratio
+    if adaptive:
+        half = torch.minimum(
+            torch.maximum(config.k_sigma * sigma_prev, half_floor),
+            0.5 * span_prev,
+        )
+    else:
+        half = half_floor
 
-    half_range_used = torch.where(uncertain, 0.5 * span_prev, half_range_new)
-
-    steps = torch.linspace(-1.0, 1.0, num_depths, device=device, dtype=depth_pred_prev.dtype)
-    hypos = depth_pred_prev.unsqueeze(1) + half_range_used.unsqueeze(1) * steps.view(1, num_depths, 1, 1)
-
-    return hypos
+    steps = torch.linspace(
+        -1.0, 1.0, num_depths, device=depth_pred_prev.device, dtype=depth_pred_prev.dtype
+    )
+    return depth_pred_prev.unsqueeze(1) + half.unsqueeze(1) * steps.view(1, num_depths, 1, 1)
 
 
 def fallback_global_range(

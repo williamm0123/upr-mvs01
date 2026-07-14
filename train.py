@@ -29,7 +29,16 @@ to direct ``python`` launches and turns DDP on iff the selected GPU count > 1.
 Artifacts (under <project>/log/):
     log/prior_cache/   precomputed {depth_prior, conf_prior, norm_depth_fill, src_weights}
     log/tensorboard/   TensorBoard event files (loss / lr / depth metrics / images)
-    log/model/         latest.pth (every ckpt_interval) and best.pth (best metric)
+    log/model/         latest.pth (every ckpt/val interval) and best.pth (best val abs_err)
+
+Resume: ``--resume auto`` (default) continues from log/model/latest.pth when it
+exists (model + optimizer + step + best metric), so a walltime-killed job can
+simply be resubmitted. Pass ``--resume off`` to start fresh.
+
+Validation: every ``val_interval`` steps the val split (cfg.paths.val_list_file)
+is evaluated on all ranks (metrics all-reduced); best.pth tracks the lowest
+validation abs_err. Val-scan priors must exist in the cache -- build them once
+with ``--build-priors only`` (single process) before the first DDP run.
 
 NOTE: real (non-smoke) training expects each dataset sample to carry the prior
 keys the network consumes -- ``depth_prior`` / ``conf_prior`` (from norm_fill),
@@ -85,13 +94,17 @@ def _use_ddp(args, world_size: int) -> bool:
     return world_size > 1  # auto
 
 
-def _lr_at(cfg, step: int) -> float:
-    """Linear warmup then cosine decay to 5% of the base LR."""
+def _lr_at(cfg, step: int, max_steps: int) -> float:
+    """Linear warmup then cosine decay to 5% of the base LR.
+
+    ``max_steps`` is the *effective* horizon (--steps override included), so the
+    schedule always anneals within the steps that will actually run.
+    """
     warm = cfg.train.warmup_steps
     if step < warm:
         return cfg.train.lr * (step + 1) / max(warm, 1)
-    prog = (step - warm) / max(cfg.train.max_steps - warm, 1)
-    return cfg.train.lr * max(0.05, 0.5 * (1.0 + math.cos(math.pi * prog)))
+    prog = (step - warm) / max(max_steps - warm, 1)
+    return cfg.train.lr * max(0.05, 0.5 * (1.0 + math.cos(math.pi * min(prog, 1.0))))
 
 
 # --------------------------------------------------------------------------- #
@@ -153,6 +166,13 @@ class TrainLogger:
         for name in ("stage1", "stage2", "stage3"):
             self.tb.add_scalar(self._tag(f"loss_{name}_ce"), logs[f"{name}/ce"], step)
             self.tb.add_scalar(self._tag(f"loss_{name}_reg"), logs[f"{name}/reg"], step)
+            # diag_*_in_range: fraction of valid pixels whose GT the stage's
+            #   hypothesis range covers (should climb to >0.95 and stay there);
+            # diag_*_p_max: prob-volume sharpness; diag_*_interval_mm: bin width.
+            for diag in ("in_range", "p_max", "interval_mm"):
+                key = f"{name}/{diag}"
+                if key in logs:
+                    self.tb.add_scalar(self._tag(f"diag_{name}_{diag}"), logs[key], step)
         self.tb.add_scalar(self._tag("learning_rate"), lr, step)
         # metric_abs_err_mm : single overall mean-|pred-gt| in mm (no per-scale
         #   variant -- one number over all valid pixels).
@@ -197,16 +217,32 @@ class TrainLogger:
         prob = outputs["stage3"]["prob"][0].detach().amax(dim=0)  # confidence
         self.tb.add_image(self._tag("05_stage3_confidence"), _norm_map(prob, 0.0, 1.0), step)
 
-    def save(self, model, optimizer, step: int, metric: float) -> None:
+    def log_val(self, metrics: dict[str, float], step: int) -> None:
+        if not self.enabled or self.tb is None:
+            return
+        for key, value in metrics.items():
+            self.tb.add_scalar(f"val/{key}", value, step)
+
+    def save(self, model, optimizer, step: int, val_metric: float | None = None) -> None:
+        """Write latest.pth; when a validation metric is supplied and improves
+        on the best seen so far, also write best.pth. best.pth therefore tracks
+        the *validation* abs_err, never the (noisy single-batch) train loss."""
         if not self.enabled:
             return
+        is_best = val_metric is not None and val_metric < self.best_metric
+        if is_best:
+            self.best_metric = float(val_metric)
         state = (model.module if isinstance(model, DDP) else model).state_dict()
-        ckpt = {"step": step, "model": state, "optimizer": optimizer.state_dict(), "metric": metric}
+        ckpt = {
+            "step": step,
+            "model": state,
+            "optimizer": optimizer.state_dict(),
+            "best_metric": self.best_metric,
+        }
         torch.save(ckpt, self.model_dir / "latest.pth")
-        if metric < self.best_metric:
-            self.best_metric = metric
+        if is_best:
             torch.save(ckpt, self.model_dir / "best.pth")
-            print(f"[ckpt] new best (metric={metric:.4f}) -> {self.model_dir/'best.pth'}")
+            print(f"[ckpt] new best (val abs_err={val_metric:.4f}) -> {self.model_dir/'best.pth'}")
 
     def close(self) -> None:
         if self.enabled and self.tb is not None:
@@ -314,6 +350,12 @@ def main_worker(
             _ensure_priors(cfg, device, overwrite=(args.build_priors == "force"))
         if is_ddp:
             dist.barrier()
+        if args.build_priors == "only":
+            if is_main:
+                print("[pre_prior] cache complete (--build-priors only); exiting before training")
+            if is_ddp:
+                dist.destroy_process_group()
+            return
 
     model = UprMVSNet(cfg).to(device)
     if is_ddp:
@@ -332,6 +374,23 @@ def main_worker(
     run_name = args.name + ("_smoke" if args.smoke else "")
     logger = TrainLogger(run_name, enabled=is_main)
 
+    # Resume from latest.pth so a walltime-killed job continues where it left
+    # off (model + optimizer + step + best val metric). Every rank loads the
+    # same file; the LR is recomputed from the step counter, so nothing else
+    # needs restoring.
+    start_step = 0
+    if not args.smoke and args.resume == "auto":
+        ckpt_path = ProjectPaths().project_path / "log" / "model" / "latest.pth"
+        if ckpt_path.exists():
+            ckpt = torch.load(ckpt_path, map_location=device)
+            (model.module if isinstance(model, DDP) else model).load_state_dict(ckpt["model"])
+            optimizer.load_state_dict(ckpt["optimizer"])
+            start_step = int(ckpt.get("step", -1)) + 1
+            logger.best_metric = float(ckpt.get("best_metric", float("inf")))
+            if is_main:
+                print(f"[resume] loaded {ckpt_path} -> continuing from step {start_step} "
+                      f"(best val abs_err so far: {logger.best_metric:.4f})")
+
     if is_main:
         n_params = sum(p.numel() for p in model.parameters()) / 1e6
         print(f"[rank {rank}] device={device} ddp={is_ddp} world_size={world_size} "
@@ -343,7 +402,7 @@ def main_worker(
     if args.smoke:
         _run_smoke(model, loss_fn, optimizer, scaler, cfg, device, args, logger, is_main)
     else:
-        _run_training(model, loss_fn, optimizer, scaler, cfg, device, args, world_size, rank, is_ddp, logger, is_main)
+        _run_training(model, loss_fn, optimizer, scaler, cfg, device, args, world_size, rank, is_ddp, logger, is_main, start_step)
 
     logger.close()
     if is_ddp:
@@ -376,13 +435,50 @@ def _run_smoke(model, loss_fn, optimizer, scaler, cfg, device, args, logger, is_
             metrics = depth_metrics(outputs["depth_full"], batch["depth_gt"], batch["mask"])
             logger.log_scalars(logs, cfg.train.lr, metrics, step)
             logger.log_images(batch, outputs, step)
-            logger.save(model, optimizer, step, logs["loss"])
+            logger.save(model, optimizer, step, val_metric=logs["loss"])
             print(f"[smoke step {step}] loss={logs['loss']:.4f} abs_err={metrics.get('abs_err', float('nan')):.2f}")
     if is_main:
         print("[smoke] OK - model + loss + backward + tensorboard + ckpt path verified")
 
 
-def _run_training(model, loss_fn, optimizer, scaler, cfg, device, args, world_size, rank, is_ddp, logger, is_main):
+@torch.no_grad()
+def _run_validation(model, loader, device, use_amp, is_ddp) -> dict[str, float]:
+    """Masked depth metrics over the val split.
+
+    All ranks run their DistributedSampler shard and the pixel-weighted sums are
+    all-reduced, so the result is identical on every rank (and SyncBN-safe,
+    should it ever be enabled)."""
+    model.eval()
+    # [abs_err_sum, pixel_count, hits<2mm, hits<4mm, hits<8mm]
+    stats = torch.zeros(5, device=device, dtype=torch.float64)
+    for batch in loader:
+        batch = {k: (v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v)
+                 for k, v in batch.items()}
+        with torch.autocast(device_type=device.type, enabled=use_amp):
+            outputs = model(batch)
+        pred = outputs["depth_full"].float()
+        gt = batch["depth_gt"].float()
+        m = batch["mask"].bool() & (gt > 0)
+        if m.any():
+            err = (pred[m] - gt[m]).abs()
+            stats[0] += err.sum()
+            stats[1] += m.sum()
+            stats[2] += (err < 2).sum()
+            stats[3] += (err < 4).sum()
+            stats[4] += (err < 8).sum()
+    if is_ddp:
+        dist.all_reduce(stats)
+    model.train()
+    n = stats[1].clamp(min=1)
+    return {
+        "abs_err": float(stats[0] / n),
+        "acc_2mm": float(stats[2] / n),
+        "acc_4mm": float(stats[3] / n),
+        "acc_8mm": float(stats[4] / n),
+    }
+
+
+def _run_training(model, loss_fn, optimizer, scaler, cfg, device, args, world_size, rank, is_ddp, logger, is_main, start_step=0):
     from torch.utils.data import DataLoader
     from torch.utils.data.distributed import DistributedSampler
 
@@ -406,10 +502,31 @@ def _run_training(model, loss_fn, optimizer, scaler, cfg, device, args, world_si
         drop_last=True,
     )
 
+    # Validation: deterministic split (center crop, one light condition); used
+    # to select best.pth. Never overlaps the training scans.
+    val_dataset = DTUMVSDataset(
+        datapath=cfg.paths.dtu_train_root,
+        listfile=cfg.paths.val_list_file,
+        nviews=cfg.train.num_views,
+        mode="val",
+    )
+    val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False, drop_last=False) if is_ddp else None
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=cfg.train.batch_size,
+        shuffle=False,
+        sampler=val_sampler,
+        num_workers=cfg.train.num_workers,
+        collate_fn=_collate,
+        pin_memory=True,
+        drop_last=False,
+    )
+
     max_steps = args.steps if args.steps else cfg.train.max_steps
     model.train()
     use_amp = cfg.train.amp and device.type == "cuda"
-    step, epoch = 0, 0
+    step = start_step
+    epoch = start_step // max(len(loader), 1)
     while step < max_steps:
         if sampler is not None:
             sampler.set_epoch(epoch)
@@ -417,7 +534,7 @@ def _run_training(model, loss_fn, optimizer, scaler, cfg, device, args, world_si
             if step >= max_steps:
                 break
             batch = {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
-            lr = _lr_at(cfg, step)
+            lr = _lr_at(cfg, step, max_steps)
             for g in optimizer.param_groups:
                 g["lr"] = lr
             logs, outputs = _train_step(model, loss_fn, optimizer, scaler, batch, cfg, device, step, use_amp)
@@ -432,12 +549,25 @@ def _run_training(model, loss_fn, optimizer, scaler, cfg, device, args, world_si
                 )
             if is_main and cfg.train.vis_interval > 0 and step % cfg.train.vis_interval == 0:
                 logger.log_images(batch, outputs, step)
-            if is_main and step > 0 and step % cfg.train.ckpt_interval == 0:
-                logger.save(model, optimizer, step, logs["loss"])
+            # Validation runs on ALL ranks (metrics are all-reduced); the
+            # elif keeps ckpt_interval multiples of val_interval from double-saving.
+            if step > 0 and cfg.train.val_interval > 0 and step % cfg.train.val_interval == 0:
+                val_metrics = _run_validation(model, val_loader, device, use_amp, is_ddp)
+                if is_main:
+                    logger.log_val(val_metrics, step)
+                    logger.save(model, optimizer, step, val_metric=val_metrics["abs_err"])
+                    print(f"[val step {step}] " + " ".join(f"{k}={v:.4f}" for k, v in val_metrics.items()))
+            elif is_main and step > 0 and step % cfg.train.ckpt_interval == 0:
+                logger.save(model, optimizer, step)
             step += 1
         epoch += 1
+
+    # Final validation so the last weights are also considered for best.pth.
+    val_metrics = _run_validation(model, val_loader, device, use_amp, is_ddp)
     if is_main:
-        logger.save(model, optimizer, step, logs["loss"])
+        logger.log_val(val_metrics, step)
+        logger.save(model, optimizer, step, val_metric=val_metrics["abs_err"])
+        print(f"[val final step {step}] " + " ".join(f"{k}={v:.4f}" for k, v in val_metrics.items()))
 
 
 def _collate(samples: list[dict]) -> dict:
@@ -472,8 +602,11 @@ def main() -> None:
     parser.add_argument("--warmup-steps", type=int, default=None, help="LR warmup steps override")
     parser.add_argument("--amp", choices=["on", "off"], default=None, help="AMP override")
     parser.add_argument("--master-port", type=str, default="29500")
-    parser.add_argument("--build-priors", choices=["auto", "force", "skip"], default="auto",
-                        help="auto: precompute missing priors; force: recompute all; skip: assume cached")
+    parser.add_argument("--resume", choices=["auto", "off"], default="auto",
+                        help="auto: continue from log/model/latest.pth if present; off: always start fresh")
+    parser.add_argument("--build-priors", choices=["auto", "force", "skip", "only"], default="auto",
+                        help="auto: precompute missing priors; force: recompute all; "
+                             "skip: assume cached; only: build missing priors then exit")
     parser.add_argument("--smoke", action="store_true", help="run synthetic steps to validate the pipeline")
     parser.add_argument("--smoke-steps", type=int, default=3)
     args = parser.parse_args()
