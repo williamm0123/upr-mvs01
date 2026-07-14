@@ -10,7 +10,7 @@ TRAIN_PROFILE=${TRAIN_PROFILE:-local}
 RUN_NAME=${RUN_NAME:-uprmvs_1gpu_${SLURM_JOB_ID:-manual}}
 
 # 核心训练参数（命令行会覆盖 TRAIN_PROFILE 中的同名参数）
-BATCH_SIZE=${BATCH_SIZE:-3}       # 单卡 batch size；显存不足时保持 1
+BATCH_SIZE=${BATCH_SIZE:-4}       # 单卡 batch size；显存不足时保持 1
 NUM_VIEWS=${NUM_VIEWS:-5}         # MVS 总视图数：1 个参考视图 + 4 个源视图
 NUM_WORKERS=${NUM_WORKERS:-16}    # DataLoader 进程数；32 CPU 下建议 8~16
 LEARNING_RATE=${LEARNING_RATE:-2e-4}
@@ -43,6 +43,7 @@ export PYTHONNOUSERSITE=1
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-16}
 export PYTHONUNBUFFERED=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
 
 echo "=== job=${SLURM_JOB_ID:-manual} host=$(hostname) profile=$TRAIN_PROFILE ==="
 nvidia-smi -L
