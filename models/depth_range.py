@@ -19,11 +19,11 @@ def _dynamic_hypothesis_steps(
 ) -> torch.Tensor:
     bins = torch.floor((1.0 - confidence) * 10.0).to(torch.long) + 1
     bins = bins.clamp(1, 10)
-    keep_counts = torch.div(num_depths * bins + 9, 10, rounding_mode="floor").clamp(1, num_depths)
-    keep_counts = torch.where(valid, keep_counts, torch.full_like(keep_counts, num_depths))
-
-    idx = torch.arange(num_depths, device=confidence.device, dtype=confidence.dtype).view(1, num_depths, 1, 1)
-    keep_counts_f = keep_counts.unsqueeze(1).to(confidence.dtype)
+    keep_counts = torch.div(num_depths * bins + 9, 10, rounding_mode="floor").clamp(1, num_depths)#
+    keep_counts = torch.where(valid, keep_counts, torch.full_like(keep_counts, num_depths))# shape: [B, H, W]
+    #将depth进行分组，后面
+    idx = torch.arange(num_depths, device=confidence.device, dtype=confidence.dtype).view(1, num_depths, 1, 1) #  [1, D, 1, 1]
+    keep_counts_f = keep_counts.unsqueeze(1).to(confidence.dtype) #  [B, 1, H, W]
     quantized = torch.floor(idx * keep_counts_f / float(num_depths))
     quantized = torch.minimum(quantized, keep_counts_f - 1.0)
 
@@ -143,23 +143,7 @@ def refine_range_from_prob(
     interval_ratio: float,
     adaptive: bool = True,
 ) -> torch.Tensor:
-    """Next-stage hypotheses centered on the previous stage's prediction.
 
-    The half-width is continuous in the previous stage's soft-argmin sigma:
-
-        half = clamp(k_sigma * sigma, min=0.5 * span_prev * interval_ratio,
-                     max=0.5 * span_prev)
-
-    A sharp prob volume (small sigma) narrows the range down to the fixed
-    ``interval_ratio`` floor; a flat one keeps up to the full previous span.
-    Monotonic and threshold-free, so neighbouring pixels / consecutive steps
-    never see a discontinuous range jump (the previous hard
-    ``p_max < uncertain_threshold`` branch re-expanded the range 5x at a
-    flip of one probability bit, which destabilised early training).
-
-    ``adaptive=False`` (range warmup, see DepthRangeConfig.adaptive_warmup_steps)
-    always uses the fixed floor.
-    """
     d_min = depth_hypos_prev.min(dim=1).values
     d_max = depth_hypos_prev.max(dim=1).values
     span_prev = d_max - d_min

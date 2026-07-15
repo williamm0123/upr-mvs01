@@ -154,10 +154,13 @@ class UprMVSNet(nn.Module):
                 "logits": logits1, "depth_hypos": depth_hypos1,
             },
         }
-        # The sigma-adaptive width needs a minimally trained prob volume; during
-        # warmup (and always at inference, where step is None -> adaptive) the
-        # schedule is decided by adaptive_warmup_steps.
-        adaptive = step is None or step >= self.range_cfg.adaptive_warmup_steps
+        # Stage-2/3 width strategy: fixed interval_ratio unless use_adaptive is
+        # set, so training and inference (step is None) see the same hypothesis
+        # geometry. With use_adaptive, the sigma width still waits out
+        # adaptive_warmup_steps (early prob volumes are near-uniform).
+        adaptive = self.range_cfg.use_adaptive and (
+            step is None or step >= self.range_cfg.adaptive_warmup_steps
+        )
         prev_hypos, prev_depth, prev_sigma = depth_hypos1, depth1, sigma1
         for k in (1, 2):
             feat_k = feats[strides[k]]

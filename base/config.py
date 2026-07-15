@@ -90,9 +90,9 @@ class FPNConfig:
 class DepthRangeConfig:
     sigma_max_ratio: float = 0.15
     k_sigma: float = 3.0
-    # refine_range_from_prob: steps before the sigma-adaptive width takes over.
-    # Early prob volumes are near-uniform, so their soft-argmin sigma carries no
-    # signal; until then the fixed interval_ratio schedule applies.
+
+    use_adaptive: bool = False
+
     adaptive_warmup_steps: int = 2000
 
 
