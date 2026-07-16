@@ -128,6 +128,99 @@ def _norm_map(x: torch.Tensor, vmin: float, vmax: float) -> torch.Tensor:
     return x.clamp(0, 1).unsqueeze(0)  # [1, H, W]
 
 
+class WindowedMeter:
+    """Cross-rank, window-aggregated training metrics.
+
+    A single batch of 3 samples on rank 0 is far too noisy to read training
+    health from (the old curves' "oscillation" was mostly this). Every rank
+    accumulates pixel-weighted sums each step; at flush they are all-reduced,
+    so the logged point reflects the whole window across the whole world size.
+    Also tracks the prior's own error (the baseline the network must beat) and
+    the corrupted/clean split (the guard-rescue signal), plus rank-local
+    median/P90 of per-batch mean error for spike visibility.
+    """
+
+    # sums layout: [err, n, hit2, hit4, hit8, prior_err, prior_n,
+    #               corrupt_err, corrupt_n, clean_err, clean_n]
+    N_SLOTS = 11
+
+    def __init__(self, device: torch.device, is_ddp: bool) -> None:
+        self.device = device
+        self.is_ddp = is_ddp
+        self.reset()
+
+    def reset(self) -> None:
+        self.sums = torch.zeros(self.N_SLOTS, dtype=torch.float64, device=self.device)
+        self.log_sums: dict[str, float] = {}
+        self.log_n = 0
+        self.batch_means: list[float] = []
+
+    @torch.no_grad()
+    def update(
+        self,
+        pred: torch.Tensor,
+        gt: torch.Tensor,
+        mask: torch.Tensor,
+        prior: torch.Tensor | None = None,
+        corrupt_mask: torch.Tensor | None = None,
+        logs: dict | None = None,
+    ) -> None:
+        m = mask.bool() & (gt > 0)
+        if m.any():
+            err = (pred.float() - gt.float()).abs()
+            self.sums[0] += err[m].sum()
+            self.sums[1] += m.sum()
+            self.sums[2] += (err[m] < 2).sum()
+            self.sums[3] += (err[m] < 4).sum()
+            self.sums[4] += (err[m] < 8).sum()
+            self.batch_means.append(float(err[m].mean()))
+            if prior is not None:
+                pm = m & (prior > 0)
+                if pm.any():
+                    self.sums[5] += (prior.float() - gt.float()).abs()[pm].sum()
+                    self.sums[6] += pm.sum()
+            if corrupt_mask is not None:
+                cm = corrupt_mask.bool()
+                mc, mk = m & cm, m & ~cm
+                if mc.any():
+                    self.sums[7] += err[mc].sum()
+                    self.sums[8] += mc.sum()
+                if mk.any():
+                    self.sums[9] += err[mk].sum()
+                    self.sums[10] += mk.sum()
+        if logs:
+            for k, v in logs.items():
+                self.log_sums[k] = self.log_sums.get(k, 0.0) + float(v)
+            self.log_n += 1
+
+    def flush(self) -> tuple[dict[str, float], dict[str, float]]:
+        """All-reduce (collective — every rank must call this at the same step)
+        and return (metrics, window-averaged loss logs)."""
+        s = self.sums.clone()
+        if self.is_ddp:
+            dist.all_reduce(s)
+        n = s[1].clamp(min=1)
+        metrics = {
+            "abs_err": float(s[0] / n),
+            "acc_2mm": float(s[2] / n),
+            "acc_4mm": float(s[3] / n),
+            "acc_8mm": float(s[4] / n),
+        }
+        if s[6] > 0:
+            metrics["prior_abs_err"] = float(s[5] / s[6])
+        if s[8] > 0:
+            metrics["abs_err_prior_corrupted"] = float(s[7] / s[8])
+        if s[10] > 0:
+            metrics["abs_err_prior_clean"] = float(s[9] / s[10])
+        if self.batch_means:
+            bm = np.asarray(self.batch_means)
+            metrics["abs_err_batch_median"] = float(np.median(bm))
+            metrics["abs_err_batch_p90"] = float(np.percentile(bm, 90))
+        avg_logs = {k: v / max(self.log_n, 1) for k, v in self.log_sums.items()}
+        self.reset()
+        return metrics, avg_logs
+
+
 class TrainLogger:
     """TensorBoard scalars/images (MVSFormer++-style) + latest/best checkpoints.
 
@@ -162,30 +255,20 @@ class TrainLogger:
     def log_scalars(self, logs: dict, lr: float, metrics: dict, step: int) -> None:
         if not self.enabled or self.tb is None:
             return
-        self.tb.add_scalar(self._tag("loss_total"), logs["loss"], step)
-        for name in ("stage1", "stage2", "stage3"):
-            self.tb.add_scalar(self._tag(f"loss_{name}_ce"), logs[f"{name}/ce"], step)
-            self.tb.add_scalar(self._tag(f"loss_{name}_reg"), logs[f"{name}/reg"], step)
-            # diag_*_in_range: fraction of valid pixels whose GT the stage's
-            #   hypothesis range covers (should climb to >0.95 and stay there);
-            # diag_*_p_max: prob-volume sharpness; diag_*_interval_mm: bin width.
-            for diag in ("in_range", "p_max", "interval_mm"):
-                key = f"{name}/{diag}"
-                if key in logs:
-                    self.tb.add_scalar(self._tag(f"diag_{name}_{diag}"), logs[key], step)
+        # Loss terms land under train/loss_*, everything else the loss reports
+        # (in_range / p_max / guard_win_rate / prior_abs_err / ...) under
+        # train/diag_*, and the window-aggregated pixel metrics under
+        # train/metric_*. Generic so new diagnostics show up without edits here.
+        self.tb.add_scalar(self._tag("loss_total"), logs.get("loss", 0.0), step)
+        for key, value in logs.items():
+            if key == "loss":
+                continue
+            stage, _, field = key.partition("/")
+            prefix = "loss" if field.startswith(("ce", "reg")) else "diag"
+            self.tb.add_scalar(self._tag(f"{prefix}_{stage}_{field}"), value, step)
         self.tb.add_scalar(self._tag("learning_rate"), lr, step)
-        # metric_abs_err_mm : single overall mean-|pred-gt| in mm (no per-scale
-        #   variant -- one number over all valid pixels).
-        # metric_acc_{2,4,8}mm : the *scale* metrics -- fraction of pixels whose
-        #   error is below 2 / 4 / 8 mm. Logged as plain scalars (one chart each,
-        #   in this run) so there is no ambiguity about which scale is which and
-        #   no add_scalars sub-run folders.
-        if "abs_err" in metrics:
-            self.tb.add_scalar(self._tag("metric_abs_err"), metrics["abs_err"], step)
-        for thr in ("2mm", "4mm", "8mm"):
-            key = f"acc_{thr}"
-            if key in metrics:
-                self.tb.add_scalar(self._tag(f"metric_acc_{thr}"), metrics[key], step)
+        for key, value in metrics.items():
+            self.tb.add_scalar(self._tag(f"metric_{key}"), value, step)
 
     def log_images(self, batch: dict, outputs: dict, step: int) -> None:
         if not self.enabled or self.tb is None:
@@ -214,8 +297,6 @@ class TrainLogger:
             step,
         )
         self.tb.add_image(self._tag("04_depth_pred"), _norm_map(depth_pred, vmin, vmax), step)
-        prob = outputs["stage3"]["prob"][0].detach().amax(dim=0)  # confidence
-        self.tb.add_image(self._tag("05_stage3_confidence"), _norm_map(prob, 0.0, 1.0), step)
 
     def log_val(self, metrics: dict[str, float], step: int) -> None:
         if not self.enabled or self.tb is None:
@@ -459,6 +540,9 @@ def _run_validation(model, loader, device, use_amp, is_ddp) -> dict[str, float]:
         pred = outputs["depth_full"].float()
         gt = batch["depth_gt"].float()
         m = batch["mask"].bool() & (gt > 0)
+        if "depth_values" in batch:
+            dv = batch["depth_values"].float()
+            m &= (gt >= dv.amin(dim=1).view(-1, 1, 1)) & (gt <= dv.amax(dim=1).view(-1, 1, 1))
         if m.any():
             err = (pred[m] - gt[m]).abs()
             stats[0] += err.sum()
@@ -469,7 +553,12 @@ def _run_validation(model, loader, device, use_amp, is_ddp) -> dict[str, float]:
     if is_ddp:
         dist.all_reduce(stats)
     model.train()
-    n = stats[1].clamp(min=1)
+    if stats[1].item() == 0:
+        raise RuntimeError(
+            "validation produced no valid depth pixels — the val split is "
+            "misconfigured (empty list, missing GT, or all-zero masks)"
+        )
+    n = stats[1]
     return {
         "abs_err": float(stats[0] / n),
         "acc_2mm": float(stats[2] / n),
@@ -489,7 +578,10 @@ def _run_training(model, loss_fn, optimizer, scaler, cfg, device, args, world_si
         listfile=cfg.paths.train_list_file,
         nviews=cfg.train.num_views,
         mode="train",
+        prior_corruption_prob=cfg.train.prior_corruption_prob,
     )
+    if len(dataset) == 0:
+        raise RuntimeError(f"training dataset is empty — check {cfg.paths.train_list_file}")
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True, drop_last=True) if is_ddp else None
     loader = DataLoader(
         dataset,
@@ -510,6 +602,10 @@ def _run_training(model, loss_fn, optimizer, scaler, cfg, device, args, world_si
         nviews=cfg.train.num_views,
         mode="val",
     )
+    # A silently-empty val split poisons best.pth (val abs_err computes to 0.0
+    # at the first validation and can never be beaten). Fail loudly instead.
+    if len(val_dataset) == 0:
+        raise RuntimeError(f"validation dataset is empty — check {cfg.paths.val_list_file}")
     val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False, drop_last=False) if is_ddp else None
     val_loader = DataLoader(
         val_dataset,
@@ -525,6 +621,7 @@ def _run_training(model, loss_fn, optimizer, scaler, cfg, device, args, world_si
     max_steps = args.steps if args.steps else cfg.train.max_steps
     model.train()
     use_amp = cfg.train.amp and device.type == "cuda"
+    meter = WindowedMeter(device, is_ddp)
     step = start_step
     epoch = start_step // max(len(loader), 1)
     while step < max_steps:
@@ -539,14 +636,33 @@ def _run_training(model, loss_fn, optimizer, scaler, cfg, device, args, world_si
                 g["lr"] = lr
             logs, outputs = _train_step(model, loss_fn, optimizer, scaler, batch, cfg, device, step, use_amp)
 
-            if is_main and step % cfg.train.log_interval == 0:
-                metrics = depth_metrics(outputs["depth_full"], batch["depth_gt"], batch["mask"])
-                logger.log_scalars(logs, lr, metrics, step)
-                print(
-                    f"[step {step}] loss={logs['loss']:.4f} "
-                    f"abs_err={metrics.get('abs_err', float('nan')):.2f} "
-
-                )
+            # every rank feeds the window; flush is a collective at log steps.
+            # GT beyond the scene's physical depth range is unreachable by any
+            # in-range hypothesis — excluded from metrics (loss excludes it too).
+            gt_b = batch["depth_gt"].float()
+            metric_mask = batch["mask"].float()
+            if "depth_values" in batch:
+                dv_b = batch["depth_values"].float()
+                in_scene = (gt_b >= dv_b.amin(dim=1).view(-1, 1, 1)) & (gt_b <= dv_b.amax(dim=1).view(-1, 1, 1))
+                metric_mask = metric_mask * in_scene.float()
+            meter.update(
+                outputs["depth_full"].detach(),
+                gt_b,
+                metric_mask,
+                prior=batch.get("depth_prior"),
+                corrupt_mask=batch.get("prior_corrupt_mask"),
+                logs=logs,
+            )
+            if step % cfg.train.log_interval == 0:
+                win_metrics, win_logs = meter.flush()
+                if is_main:
+                    logger.log_scalars(win_logs, lr, win_metrics, step)
+                    print(
+                        f"[step {step}] loss={win_logs.get('loss', float('nan')):.4f} "
+                        f"abs_err={win_metrics.get('abs_err', float('nan')):.2f} "
+                        f"prior_err={win_metrics.get('prior_abs_err', float('nan')):.2f} "
+                        f"rescue_err={win_metrics.get('abs_err_prior_corrupted', float('nan')):.2f}"
+                    )
             if is_main and cfg.train.vis_interval > 0 and step % cfg.train.vis_interval == 0:
                 logger.log_images(batch, outputs, step)
             # Validation runs on ALL ranks (metrics are all-reduced); the

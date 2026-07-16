@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from utils.geometry import soft_argmin
+from models.depth_range import mode_centered_regression
 
 
 class ConvGN3d(nn.Module):
@@ -63,19 +63,23 @@ class CostVolumeUNet(nn.Module):
 
 
 class DepthDecoder(nn.Module):
-    def __init__(self, in_channels: int = 8, base: int = 16, depth: int = 3) -> None:
+    def __init__(self, in_channels: int = 8, base: int = 16, depth: int = 3, mode_window: int = 2) -> None:
         super().__init__()
         self.unet = CostVolumeUNet(in_channels=in_channels, base=base, depth=depth)
+        self.mode_window = mode_window
 
     def forward(
         self,
         cost_volume: torch.Tensor,
         depth_hypos: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         logits = self.unet(cost_volume)
         # max-shift keeps softmax finite under AMP; log_softmax downstream is
         # shift-invariant so the loss sees the same distribution.
         logits = logits - logits.amax(dim=1, keepdim=True).detach()
         prob = F.softmax(logits.float(), dim=1)
-        depth, sigma = soft_argmin(prob, depth_hypos.float())
-        return depth, sigma, prob, logits
+        # Mode-centered regression instead of a global soft-argmin: over a
+        # bimodal posterior (wrong local peak + correct global peak) the global
+        # expectation lands between the peaks, on no real surface.
+        depth, sigma, mode_idx = mode_centered_regression(prob, depth_hypos.float(), self.mode_window)
+        return depth, sigma, prob, logits, mode_idx

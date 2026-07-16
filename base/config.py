@@ -88,22 +88,72 @@ class FPNConfig:
 
 @dataclass(frozen=True)
 class DepthRangeConfig:
+    # ---- stage-1 dual-branch hypotheses: global guard + local prior refinement ----
+    # The global branch must stay independent of prior confidence: it is the
+    # safety net that catches confidently-wrong priors, so nothing the prior
+    # reports about itself may shrink it.
+    num_global: int = 48
+    num_local: int = 16
+    # Per-image global bounds: robust quantiles of the valid prior depths with a
+    # margin, clamped to the physical [depth_min, depth_max] and never narrower
+    # than global_min_span_frac of the physical span (guards against a globally
+    # shifted prior making its own quantiles lie).
+    # Gate-tuned 2026-07-16: the cached priors under-cover far backgrounds near
+    # edges (edge-bucket coverage 0.981 at q0.5%/5% margin, still 0.987 at
+    # q0.2%/12%), so the guard cannot trust prior quantiles on DTU at all:
+    # min_span_frac=1.0 forces the full physical [depth_min, depth_max] range,
+    # making coverage exact by construction. Quantile tightening stays in the
+    # code for datasets whose physical bounds are loose (tune there, re-gate).
+    global_quantile_lo: float = 0.002
+    global_quantile_hi: float = 0.998
+    global_margin_ratio: float = 0.12
+    global_min_span_frac: float = 1.0
+    # Sample the global branch uniformly in inverse depth (≈ uniform pixel
+    # displacement); False = uniform in depth.
+    inverse_depth_global: bool = True
+    # Local-branch spike rejection: |prior - median_3x3| > spike_k * MAD flags a
+    # fly-point; its center falls back to the neighborhood robust median.
+    spike_k: float = 4.0
+    spike_min_mad_rel: float = 0.002  # MAD floor as a fraction of local depth
+    # Local half-width in units of the per-image mean global bin interval:
+    # floor keeps a confidently-wrong prior from locking the search; ceiling
+    # keeps the dense branch dense (the guard covers the rest).
+    local_half_min_gi: float = 0.75
+    local_half_max_gi: float = 2.0
+    # ---- stage-1 posterior -> depth / next-stage range ----
+    # Mode-centered regression window (bins to each side of the argmax); a
+    # global soft-argmin over a bimodal posterior lands between the modes.
+    mode_window: int = 2
+    # Next-stage half-range = range_k * (winning bin's interval)
+    #                         * (1 + range_entropy_a*H_norm + range_edge_b*E),
+    # clipped to [range_min_gi, range_max_gi] global intervals. A local winner
+    # shrinks the search; a global winner keeps a correction-sized range.
+    range_k: float = 3.0
+    range_entropy_a: float = 1.0
+    range_edge_b: float = 1.0
+    range_min_gi: float = 1.0
+    range_max_gi: float = 8.0
+    # Rule-based edge/unreliable map from the (possibly corrupted) prior:
+    # relative depth-gradient threshold at which E saturates to 1.
+    edge_grad_rel: float = 0.03
+    # legacy sigma-based width params (still used by the local branch scaling)
     sigma_max_ratio: float = 0.15
     k_sigma: float = 3.0
-
-    use_adaptive: bool = False
-
-    adaptive_warmup_steps: int = 2000
 
 
 @dataclass(frozen=True)
 class CostVolumeConfig:
     num_groups: int = 8
-    num_depths_stage1: int = 48
-    num_depths_stage2: int = 16
+    # stage1 = depth_range.num_global + num_local (asserted at model build)
+    num_depths_stage1: int = 64
+    # stage2 must span >= ~2 global intervals after a global-branch win, so it
+    # needs enough bins to keep sub-interval resolution at that width.
+    num_depths_stage2: int = 24
     num_depths_stage3: int = 16
-    interval_ratio_stage2: float = 0.4
-    interval_ratio_stage3: float = 0.125
+    # number of hypothesis metadata channels appended to the stage-1 cost
+    # volume (normalized depth/interval/is_local/dist-to-prior/conf/edge) so
+    # the 3D regularizer can see the irregular depth axis and branch identity.
+    stage1_meta_channels: int = 6
     # warp-channel width per cascade stage (must be divisible by num_groups).
     # Shrinks as resolution grows so the full-res stage does not OOM: the warp
     # intermediate is [B, warp_channels, D, H, W].
@@ -136,13 +186,17 @@ class DecoderConfig:
 
 @dataclass(frozen=True)
 class LossConfig:
-    w_ce: float = 1.0         # weight of the per-stage cross-entropy (classification) term
-    w_reg: float = 1.0        # weight of the per-stage interval-normalized smooth-L1 term
-    # Regression error is measured in units of the per-pixel hypothesis interval
-    # and clamped here: pixels further off than this many bins contribute no reg
-    # gradient (CE alone drives them back), which keeps hard batches from
-    # spiking the loss.
-    reg_err_clamp: float = 3.0
+    w_ce: float = 1.0         # unified 64-candidate soft-label CE (stage1) / per-stage CE (2,3)
+    w_reg: float = 1.0        # interval-normalized Huber on the regressed depth, ALL valid pixels
+    # Stage-1 auxiliary heads: the global branch is supervised on every valid
+    # pixel it covers so it never loses the ability to localize GT on its own,
+    # even in the (frequent) regime where the local branch wins the 64-way
+    # softmax; the local branch is supervised only where GT falls inside it.
+    w_global_aux: float = 0.5
+    w_local_aux: float = 0.25
+    # Regression weight multiplier inside the edge band (E ~ 1): edge pixels
+    # are ~5-10% of the image and get drowned out at uniform weighting.
+    edge_reg_boost: float = 2.0
     use_cross_entropy: bool = True
 
 
@@ -167,7 +221,7 @@ class TrainConfig:
     amp: bool = True
     seed: int = 20260526
     log_interval: int = 50
-    vis_interval: int = 500
+    vis_interval: int = 100
     vis_max_views: int = 5
     val_interval: int = 2000
     ckpt_interval: int = 5000
@@ -176,6 +230,11 @@ class TrainConfig:
     use_anchor_pe: bool = True
     use_geo_fusion: bool = True
     use_points_alignment: bool = True
+    # Fraction of training samples whose prior gets synthetic failure modes
+    # (edge ramps, fly-points, drift, wrong-high-confidence, ...). Without this
+    # the prior is right most of the time, the network learns the local-branch
+    # shortcut, and the global branch's rescue path is never trained.
+    prior_corruption_prob: float = 0.4
 
 
 def _train_local() -> TrainConfig:
@@ -218,7 +277,7 @@ def _train_umhpc() -> TrainConfig:
         amp=True,
         seed=20260526,
         log_interval=50,
-        vis_interval=500,
+        vis_interval=100,
         vis_max_views=5,
         val_interval=2000,
         ckpt_interval=5000,

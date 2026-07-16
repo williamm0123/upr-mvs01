@@ -11,6 +11,7 @@ from .io import read_pfm
 import models.sfm as sfm
 from models import pre_prior
 from base.config import ProjectPaths
+from .prior_corruption import corrupt_prior
 
 class DTUMVSDataset(Dataset):
     def __init__(
@@ -32,6 +33,10 @@ class DTUMVSDataset(Dataset):
         self.prior_cache_dir = Path(ProjectPaths().project_path) / "log" / "prior_cache"
         # 训练默认随机裁剪做增广, 其余模式居中裁剪保证可复现; 可用 kwarg 覆盖
         self.random_crop = kwargs.get('random_crop', mode == 'train')
+        # prior 失败模式增强 (仅训练): 见 data/prior_corruption.py。默认关闭,
+        # train.py 从 cfg.train.prior_corruption_prob 传入。
+        self.prior_corruption_prob = float(kwargs.get('prior_corruption_prob', 0.0)) \
+            if mode == 'train' else 0.0
         self.kwargs = kwargs
         # self.center_crop_size = kwargs.get('center_crop_size', None)
         # if mode != 'train':
@@ -252,6 +257,18 @@ class DTUMVSDataset(Dataset):
             projection_matrices.append(projection_matrix)
 
         imgs = torch.from_numpy(np.stack(images, axis=0)).permute(0, 3, 1, 2).float()  # [V, C, H, W]
+
+        depth_prior_crop = depth_prior_full[crop_y:y1, crop_x:x1]
+        conf_prior_crop = conf_prior_full[crop_y:y1, crop_x:x1]
+        # 先验失败模式增强: GT 不变, 只腐蚀 prior/conf; corrupt_mask 用于训练日志
+        # 分别统计 corrupted / clean 像素误差 (global 分支救回率的直接度量)。
+        if self.prior_corruption_prob > 0.0:
+            depth_prior_crop, conf_prior_crop, corrupt_mask = corrupt_prior(
+                depth_prior_crop, conf_prior_crop, self.prior_corruption_prob
+            )
+        else:
+            corrupt_mask = np.zeros(depth_prior_crop.shape, dtype=bool)
+
         sample = {
             "images": imgs,
             "intrinsics": np.stack(intrinsics, axis=0),       # [V, 3, 3]
@@ -262,8 +279,9 @@ class DTUMVSDataset(Dataset):
             "projection_matrices": np.stack(projection_matrices, axis=0),
             # "sfm_depth": sfm_depth_crop,
             # priors consumed by the network / loss (cropped to the same window)
-            "depth_prior": depth_prior_full[crop_y:y1, crop_x:x1],
-            "conf_prior": conf_prior_full[crop_y:y1, crop_x:x1],
+            "depth_prior": depth_prior_crop,
+            "conf_prior": conf_prior_crop,
+            "prior_corrupt_mask": corrupt_mask,
             "norm_depth_fill": norm_full[crop_y:y1, crop_x:x1],
             "src_weights": src_weights,
         }
