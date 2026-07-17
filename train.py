@@ -406,6 +406,20 @@ def main_worker(
     is_ddp = world_size > 1
     is_main = rank == 0
 
+    # Prior generation loads the large VGGT and DA3 models and can take much
+    # longer than a distributed collective's timeout.  Letting rank 0 build
+    # while the other ranks wait also hides the useful rank-0 exception:
+    # waiting ranks usually surface only a secondary "connection reset by
+    # peer" from NCCL.  Precompute in a single-process invocation, then launch
+    # DDP with --build-priors skip (the UMHPC script does this automatically).
+    if is_ddp and not args.smoke and args.build_priors != "skip":
+        raise RuntimeError(
+            "prior precomputation is not supported inside a DDP launch; run "
+            "`python train.py --profile <profile> --gpus 1 --ddp off "
+            "--num-views <views> --build-priors only` first, then relaunch "
+            "DDP with `--build-priors skip`"
+        )
+
     if is_ddp:
         backend = "nccl" if torch.cuda.is_available() else "gloo"
         if local_rank is not None:
@@ -425,17 +439,13 @@ def main_worker(
     torch.manual_seed(cfg.train.seed + rank)
 
     # Build the prior cache once (rank 0), before the training model is on GPU so
-    # VGGT/DA3 are freed first. Other ranks wait at the barrier.
+    # VGGT/DA3 are freed first. DDP jobs are required to use the prebuilt cache.
     if not args.smoke and args.build_priors != "skip":
         if is_main:
             _ensure_priors(cfg, device, overwrite=(args.build_priors == "force"))
-        if is_ddp:
-            dist.barrier()
         if args.build_priors == "only":
             if is_main:
                 print("[pre_prior] cache complete (--build-priors only); exiting before training")
-            if is_ddp:
-                dist.destroy_process_group()
             return
 
     model = UprMVSNet(cfg).to(device)
@@ -722,7 +732,8 @@ def main() -> None:
                         help="auto: continue from log/model/latest.pth if present; off: always start fresh")
     parser.add_argument("--build-priors", choices=["auto", "force", "skip", "only"], default="auto",
                         help="auto: precompute missing priors; force: recompute all; "
-                             "skip: assume cached; only: build missing priors then exit")
+                             "skip: assume cached; only: build missing priors then exit; "
+                             "DDP launches must use skip")
     parser.add_argument("--smoke", action="store_true", help="run synthetic steps to validate the pipeline")
     parser.add_argument("--smoke-steps", type=int, default=3)
     args = parser.parse_args()
