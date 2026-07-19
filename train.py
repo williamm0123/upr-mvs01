@@ -589,6 +589,7 @@ def _run_training(model, loss_fn, optimizer, scaler, cfg, device, args, world_si
         nviews=cfg.train.num_views,
         mode="train",
         prior_corruption_prob=cfg.train.prior_corruption_prob,
+        use_src_weights=cfg.cost_volume.use_src_weights,
     )
     if len(dataset) == 0:
         raise RuntimeError(f"training dataset is empty — check {cfg.paths.train_list_file}")
@@ -611,6 +612,7 @@ def _run_training(model, loss_fn, optimizer, scaler, cfg, device, args, world_si
         listfile=cfg.paths.val_list_file,
         nviews=cfg.train.num_views,
         mode="val",
+        use_src_weights=cfg.cost_volume.use_src_weights,
     )
     # A silently-empty val split poisons best.pth (val abs_err computes to 0.0
     # at the first validation and can never be beaten). Fail loudly instead.

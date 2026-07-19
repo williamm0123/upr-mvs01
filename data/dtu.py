@@ -37,6 +37,10 @@ class DTUMVSDataset(Dataset):
         # train.py 从 cfg.train.prior_corruption_prob 传入。
         self.prior_corruption_prob = float(kwargs.get('prior_corruption_prob', 0.0)) \
             if mode == 'train' else 0.0
+        # src_weights 是离线 SfM 按 src 视角数算出的变长向量; 当离线缓存与训练
+        # nviews 不一致时长度对不上, collate 会报错。默认忽略 (网络 use_src_weights
+        # 也默认 False), 需要时显式打开并保证缓存 view 数一致。
+        self.use_src_weights = bool(kwargs.get('use_src_weights', False))
         self.kwargs = kwargs
         # self.center_crop_size = kwargs.get('center_crop_size', None)
         # if mode != 'train':
@@ -232,7 +236,9 @@ class DTUMVSDataset(Dataset):
         depth_prior_full = self._match_hw(prior["depth_prior"], (h0, w0), is_depth=True)
         conf_prior_full = self._match_hw(prior["conf_prior"], (h0, w0), is_depth=False)
         norm_full = self._match_hw(prior["norm_depth_fill"], (h0, w0), is_depth=False)
-        src_weights = prior["src_weights"]
+        # 离线 src_weights 长度 = 缓存时的 src 视角数, 可能 != 当前 nviews;
+        # 默认忽略, 避免变长向量在 collate 时 stack 失败。
+        src_weights = prior["src_weights"] if self.use_src_weights else None
 
         # --- 裁剪到 (640x512): 所有视角/深度/prior 共用同一窗口 ---
         crop_x, crop_y = self.pick_crop_origin(h0, w0)
@@ -283,6 +289,7 @@ class DTUMVSDataset(Dataset):
             "conf_prior": conf_prior_crop,
             "prior_corrupt_mask": corrupt_mask,
             "norm_depth_fill": norm_full[crop_y:y1, crop_x:x1],
-            "src_weights": src_weights,
         }
+        if src_weights is not None:
+            sample["src_weights"] = src_weights
         return sample
