@@ -178,8 +178,8 @@ class DTUMVSDataset(Dataset):
         depth_values = []
         for i, view_id in enumerate(view_ids):
             if self.is_test:
-                # dtu_testing/<scan>/images/000000xx.png, cams/000000xx_cam.txt (无 GT)
-                img_filename = os.path.join(self.datapath, '{}/images/{:0>8}.png'.format(scan, view_id))
+                # dtu_testing/<scan>/images/000000xx.jpg, cams/000000xx_cam.txt (无 GT)
+                img_filename = os.path.join(self.datapath, '{}/images/{:0>8}.jpg'.format(scan, view_id))
                 proj_mat_filename = os.path.join(self.datapath, '{}/cams/{:0>8}_cam.txt'.format(scan, view_id))
             else:
                 img_filename = os.path.join(self.datapath, 'Rectified_raw/{}/rect_{:0>3}_{}_r5000.png'.format(scan, view_id + 1, light_idx))
