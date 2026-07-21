@@ -64,6 +64,9 @@ class DTUMVSDataset(Dataset):
         with open(self.listfile) as f:
             scans = f.readlines()
             scans = [line.rstrip() for line in scans]
+        # 跳过空行 (lists/dtu/test.txt 首行为空); 否则 test 布局会把 pair 路径
+        # 拼成 "<scan>/pair.txt" = "/pair.txt", 前导斜杠会丢弃 datapath。
+        scans = [s for s in scans if s]
 
         # scans
         for scan in scans:
