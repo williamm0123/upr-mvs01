@@ -48,11 +48,18 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser("UprMVSNet test / DTU evaluation")
     p.add_argument("--profile", choices=["local", "umhpc"], default=None)
     p.add_argument("--device", default=None)
-    p.add_argument("--ckpt", default=None, help="checkpoint path (default log/model/best.pth, falls back to latest.pth)")
+    p.add_argument("--ckpt", default=None, help="explicit checkpoint file; overrides --ckpt-dir")
+    p.add_argument("--ckpt-dir", default="log/model_eval",
+                   help="dir to load best.pth (else latest.pth) from; default log/model_eval — copy a "
+                        "snapshot here so eval never reads the live-updating log/model during training. "
+                        "Falls back to log/model if this dir is absent. Relative paths resolve under the project root.")
     p.add_argument("--split", choices=["val", "test"], default="val")
     p.add_argument("--list", default=None, help="override the split's scan list file")
     p.add_argument("--num-views", type=int, default=None, help="views fed to the network (default cfg.train.num_views)")
     p.add_argument("--resize-scale", type=float, default=0.5)
+    p.add_argument("--full-image", action="store_true",
+                   help="reconstruct the whole image (no center crop). Sets the crop window to the "
+                        "full resized DTU frame (1200x1600 * resize_scale) so no pixels are dropped.")
     p.add_argument("--max-scans", type=int, default=0)
     p.add_argument("--max-refs", type=int, default=0, help="limit ref views per scan (0 = all 49)")
     p.add_argument("--num-workers", type=int, default=2)
@@ -102,10 +109,20 @@ def build_dataset(cfg, args) -> DTUMVSDataset:
     # self.resize_scale from **kwargs, so a keyword arg is silently ignored —
     # set the attribute directly until that is fixed.
     ds.resize_scale = args.resize_scale
-    # non-train modes emit one meta per ref view at light 3 — group and trim
+    # No-crop mode: set the crop window equal to the full resized DTU frame
+    # (all DTU raw frames are 1200x1600). pick_crop_origin then returns (0, 0)
+    # and crop_at keeps the whole image with K only scaled, never shifted — so
+    # the plane-sweep stays geometrically aligned (see crop_at / homography_warp).
+    if args.full_image:
+        ds.height = int(round(1200 * args.resize_scale))
+        ds.width = int(round(1600 * args.resize_scale))
+    # non-train modes emit one meta per ref view at light 3 — group and trim.
+    # Skip empty scan names (lists/dtu/test.txt has a blank first line, which
+    # otherwise yields phantom metas that crash on a missing image path).
     per_scan: dict[str, list] = defaultdict(list)
     for meta in ds.metas:
-        per_scan[meta[0]].append(meta)
+        if meta[0]:
+            per_scan[meta[0]].append(meta)
     scans = list(per_scan)
     if args.max_scans > 0:
         scans = scans[: args.max_scans]
@@ -119,13 +136,35 @@ def build_dataset(cfg, args) -> DTUMVSDataset:
     return ds
 
 
+def _resolve_ckpt(args) -> Path:
+    """Explicit --ckpt wins. Otherwise prefer best.pth then latest.pth inside
+    --ckpt-dir (default log/model_eval, a stable snapshot copied aside so eval
+    never reads the checkpoint the running trainer is mid-writing); if that dir
+    is absent, fall back to the live log/model."""
+    if args.ckpt:
+        p = Path(args.ckpt)
+        if not p.exists():
+            raise FileNotFoundError(f"--ckpt {p} not found")
+        return p
+    root = ProjectPaths().project_path
+    ckpt_dir = Path(args.ckpt_dir)
+    if not ckpt_dir.is_absolute():
+        ckpt_dir = root / ckpt_dir
+    if not ckpt_dir.exists():
+        fallback = root / "log" / "model"
+        print(f"[test] --ckpt-dir {ckpt_dir} absent; falling back to {fallback}")
+        ckpt_dir = fallback
+    for name in ("best.pth", "latest.pth"):
+        if (ckpt_dir / name).exists():
+            return ckpt_dir / name
+    raise FileNotFoundError(
+        f"no best.pth/latest.pth in {ckpt_dir} — copy a snapshot there "
+        f"(e.g. `cp log/model/latest.pth {ckpt_dir}/`) or pass --ckpt"
+    )
+
+
 def load_model(cfg, args, device: torch.device) -> tuple[UprMVSNet, Path]:
-    model_dir = ProjectPaths().project_path / "log" / "model"
-    ckpt_path = Path(args.ckpt) if args.ckpt else model_dir / "best.pth"
-    if not ckpt_path.exists() and args.ckpt is None:
-        ckpt_path = model_dir / "latest.pth"
-    if not ckpt_path.exists():
-        raise FileNotFoundError(f"no checkpoint at {ckpt_path} (train first, or pass --ckpt)")
+    ckpt_path = _resolve_ckpt(args)
     ckpt = torch.load(ckpt_path, map_location=device)
     model = UprMVSNet(cfg).to(device)
     model.load_state_dict(ckpt["model"])
