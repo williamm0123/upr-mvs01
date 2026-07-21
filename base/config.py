@@ -74,6 +74,28 @@ class DataConfig:
 
 
 @dataclass(frozen=True)
+class PriorConfig:
+    """VGGT/DA3 depth-prior generation.
+
+    ``target_w`` / ``target_h`` is the resolution VGGT + DA3 actually run at, and
+    therefore the prior's *true* resolution before ``inverse_transform_map``
+    resamples it up to the working image size. Raising it makes the depth prior
+    genuinely sharper (instead of an upsampled 518x420) at the cost of VGGT/DA3
+    compute+memory (attention is ~O(tokens^2), tokens = (w/14)*(h/14)).
+
+    Both dims MUST be multiples of the backbone patch size (14); the DPT head
+    reassembles on ``H//14`` patches and a non-multiple truncates / misaligns.
+    Defaults 518=37*14, 420=30*14.
+    """
+    target_w: int = 518
+    target_h: int = 420
+
+    @property
+    def target_wh(self) -> tuple[int, int]:
+        return (self.target_w, self.target_h)
+
+
+@dataclass(frozen=True)
 class FPNConfig:
     out_channels: int = 128
     base_channel: int = 32
@@ -240,6 +262,7 @@ def get_train_config(profile: str | None = None) -> TrainConfig:
 class MVSConfig:
     paths: ProjectPaths = field(default_factory=ProjectPaths)
     data: DataConfig = field(default_factory=DataConfig)
+    prior: PriorConfig = field(default_factory=PriorConfig)
     fpn: FPNConfig = field(default_factory=FPNConfig)
     depth_range: DepthRangeConfig = field(default_factory=DepthRangeConfig)
     cost_volume: CostVolumeConfig = field(default_factory=CostVolumeConfig)

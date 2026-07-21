@@ -373,7 +373,7 @@ def _ensure_priors(cfg, device, overwrite: bool = False) -> None:
             mode=mode,
         )
         print(f"[pre_prior] ensuring priors for {split} split ({len(ds)} samples)")
-        build_prior_cache(ds, device, overwrite=overwrite)
+        build_prior_cache(ds, device, overwrite=overwrite, image_target_wh=cfg.prior.target_wh)
 
 
 # --------------------------------------------------------------------------- #
@@ -402,6 +402,14 @@ def main_worker(
         train_overrides["amp"] = args.amp == "on"
     if train_overrides:
         cfg = replace(cfg, train=replace(cfg.train, **train_overrides))
+
+    prior_overrides = {}
+    if args.prior_target_w is not None:
+        prior_overrides["target_w"] = args.prior_target_w
+    if args.prior_target_h is not None:
+        prior_overrides["target_h"] = args.prior_target_h
+    if prior_overrides:
+        cfg = replace(cfg, prior=replace(cfg.prior, **prior_overrides))
 
     is_ddp = world_size > 1
     is_main = rank == 0
@@ -729,6 +737,12 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=None, help="learning-rate override")
     parser.add_argument("--warmup-steps", type=int, default=None, help="LR warmup steps override")
     parser.add_argument("--amp", choices=["on", "off"], default=None, help="AMP override")
+    parser.add_argument("--prior-target-w", type=int, default=None,
+                        help="VGGT/DA3 prior width override (default 518; must be a multiple of 14). "
+                             "Raises true depth-prior resolution at VGGT compute/memory cost. "
+                             "Changing it needs --build-priors force to rebuild the cache.")
+    parser.add_argument("--prior-target-h", type=int, default=None,
+                        help="VGGT/DA3 prior height override (default 420; must be a multiple of 14)")
     parser.add_argument("--master-port", type=str, default="29500")
     parser.add_argument("--resume", choices=["auto", "off"], default="auto",
                         help="auto: continue from log/model/latest.pth if present; off: always start fresh")

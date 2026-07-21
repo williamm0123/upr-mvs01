@@ -115,12 +115,34 @@ def load_or_compute(path: str | Path, precrop_sample: dict, precomputer: PriorPr
     return prior
 
 
-def build_prior_cache(dataset, device, overwrite: bool = False, verbose: bool = True) -> int:
+def _check_target_wh(image_target_wh: tuple[int, int]) -> None:
+    """VGGT/DA3 use a 14px patch; both dims must be multiples of 14 or the DPT
+    head reassembly (H//14 patches -> *14) truncates/misaligns the depth map."""
+    w, h = image_target_wh
+    bad = [d for d in (w, h) if d % 14 != 0]
+    if bad:
+        raise ValueError(
+            f"prior image_target_wh={image_target_wh} must have both dims divisible "
+            f"by the backbone patch size 14 (offending: {bad}). Nearest multiples: "
+            f"w={round(w / 14) * 14}, h={round(h / 14) * 14}."
+        )
+
+
+def build_prior_cache(
+    dataset,
+    device,
+    overwrite: bool = False,
+    verbose: bool = True,
+    image_target_wh: tuple[int, int] = (518, 420),
+) -> int:
     """Populate the prior cache for every meta in ``dataset`` (run once, main process).
 
     ``dataset`` must expose ``precrop_inputs(idx)`` (pre-crop multi-view sample)
-    and ``prior_cache_path_for(idx)``.
+    and ``prior_cache_path_for(idx)``. ``image_target_wh`` is the resolution VGGT
+    + DA3 run at (the prior's true resolution before it is resampled up to the
+    working image size); both dims must be multiples of 14.
     """
+    _check_target_wh(image_target_wh)
     n = len(dataset)
     # skip loading the heavy models entirely if everything is already cached
     pending = [i for i in range(n) if overwrite or not Path(dataset.prior_cache_path_for(i)).exists()]
@@ -130,8 +152,9 @@ def build_prior_cache(dataset, device, overwrite: bool = False, verbose: bool = 
         return 0
 
     if verbose:
-        print(f"[pre_prior] building {len(pending)}/{n} priors (loading VGGT + DA3 once) ...")
-    precomputer = PriorPrecomputer(device)
+        print(f"[pre_prior] building {len(pending)}/{n} priors at target_wh={image_target_wh} "
+              f"(loading VGGT + DA3 once) ...")
+    precomputer = PriorPrecomputer(device, image_target_wh=image_target_wh)
     built = 0
     for idx in pending:
         pc = dataset.precrop_inputs(idx)

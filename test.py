@@ -60,6 +60,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--full-image", action="store_true",
                    help="reconstruct the whole image (no center crop). Sets the crop window to the "
                         "full resized DTU frame (1200x1600 * resize_scale) so no pixels are dropped.")
+    p.add_argument("--prior-target-w", type=int, default=None,
+                   help="VGGT/DA3 prior width (default cfg 518; must be a multiple of 14). Raises the "
+                        "true depth-prior resolution. Needs --build-priors force to take effect (else "
+                        "the existing cache is reused). VGGT cost/memory grows ~O((w*h/196)^2).")
+    p.add_argument("--prior-target-h", type=int, default=None,
+                   help="VGGT/DA3 prior height (default cfg 420; must be a multiple of 14)")
     p.add_argument("--max-scans", type=int, default=0)
     p.add_argument("--max-refs", type=int, default=0, help="limit ref views per scan (0 = all 49)")
     p.add_argument("--num-workers", type=int, default=2)
@@ -174,12 +180,13 @@ def load_model(cfg, args, device: torch.device) -> tuple[UprMVSNet, Path]:
     return model, ckpt_path
 
 
-def ensure_priors(ds: DTUMVSDataset, device: torch.device, mode: str) -> None:
+def ensure_priors(ds: DTUMVSDataset, device: torch.device, mode: str,
+                  image_target_wh: tuple[int, int]) -> None:
     if mode == "skip":
         return
     from models.pre_prior import build_prior_cache
 
-    build_prior_cache(ds, device, overwrite=(mode == "force"))
+    build_prior_cache(ds, device, overwrite=(mode == "force"), image_target_wh=image_target_wh)
     torch.cuda.empty_cache() if device.type == "cuda" else None
 
 
@@ -439,9 +446,11 @@ def main() -> None:
 
     ds = build_dataset(cfg, args)
     scans = sorted({m[0] for m in ds.metas}, key=lambda s: int(s.replace("scan", "")))
-    print(f"[test] split={args.split} scans={len(scans)} samples={len(ds)} out={out_root}")
+    prior_wh = (args.prior_target_w or cfg.prior.target_w, args.prior_target_h or cfg.prior.target_h)
+    print(f"[test] split={args.split} scans={len(scans)} samples={len(ds)} out={out_root} "
+          f"resize={args.resize_scale} full_image={args.full_image} prior_target_wh={prior_wh}")
 
-    ensure_priors(ds, device, args.build_priors)
+    ensure_priors(ds, device, args.build_priors, prior_wh)
     model, ckpt_path = load_model(cfg, args, device)
 
     result = run_inference(model, ds, cfg, args, device, out_root)
