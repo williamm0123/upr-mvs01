@@ -106,8 +106,10 @@ def _collate(samples: list[dict]) -> dict:
 
 def build_dataset(cfg, args) -> DTUMVSDataset:
     listfile = args.list or (cfg.paths.val_list_file if args.split == "val" else cfg.paths.test_list_file)
+    # val 复用 dtu_training (含 GT); test 走 dtu_testing 布局 (images/cams/pair.txt, 无 GT)。
+    datapath = cfg.paths.dtu_test_root if args.split == "test" else cfg.paths.dtu_train_root
     ds = DTUMVSDataset(
-        datapath=cfg.paths.dtu_train_root,
+        datapath=datapath,
         listfile=listfile,
         nviews=args.num_views or cfg.train.num_views,
         mode=args.split,
@@ -226,6 +228,10 @@ class ScanMeter:
         }
 
     def overall(self) -> dict[str, float]:
+        if not self.sums:  # 测试集无 GT: 没有任何指标累积
+            return {"abs_err": 0.0, "median": 0.0, "p90": 0.0,
+                    "acc_1mm": 0.0, "acc_2mm": 0.0, "acc_4mm": 0.0, "acc_8mm": 0.0,
+                    "pixels": 0}
         tot = np.sum([self.sums[s] for s in self.sums], axis=0)
         n = max(tot[1], 1.0)
         pool = np.concatenate([v for vs in self.pool.values() for v in vs]) if self.pool else np.zeros(1)
@@ -280,12 +286,15 @@ def run_inference(model, ds, cfg, args, device, out_root: Path) -> dict:
             conf = F.interpolate(conf.unsqueeze(1), size=pred.shape[-2:], mode="bilinear",
                                  align_corners=False).squeeze(1)
 
-        gt = batch["depth_gt"].float()
-        m = batch["mask"].bool() & (gt > 0)
-        dv = batch["depth_values"].float()
-        m &= (gt >= dv.amin(dim=1).view(-1, 1, 1)) & (gt <= dv.amax(dim=1).view(-1, 1, 1))
-        if m.any():
-            meter.update(scan, (pred[m] - gt[m]).abs())
+        # 测试集无 GT: depth_gt/mask 为 None (collate 成 [None]), 跳过深度指标, 只做融合。
+        gt = batch.get("depth_gt")
+        if isinstance(gt, torch.Tensor):
+            gt = gt.float()
+            m = batch["mask"].bool() & (gt > 0)
+            dv = batch["depth_values"].float()
+            m &= (gt >= dv.amin(dim=1).view(-1, 1, 1)) & (gt <= dv.amax(dim=1).view(-1, 1, 1))
+            if m.any():
+                meter.update(scan, (pred[m] - gt[m]).abs())
 
         if args.fuse:
             d = out_root / "depth" / scan
@@ -462,14 +471,17 @@ def main() -> None:
 
     result = run_inference(model, ds, cfg, args, device, out_root)
     o = result["overall"]
-    print(f"\n[depth metrics] overall: abs_err={o['abs_err']:.3f}mm median={o['median']:.3f} "
-          f"p90={o['p90']:.3f} acc@1/2/4/8mm={o['acc_1mm']:.3f}/{o['acc_2mm']:.3f}/"
-          f"{o['acc_4mm']:.3f}/{o['acc_8mm']:.3f}")
-    for scan in scans:
-        if scan in result["per_scan"]:
-            s = result["per_scan"][scan]
-            print(f"  {scan:>8s}: abs_err={s['abs_err']:.3f} median={s['median']:.3f} "
-                  f"p90={s['p90']:.3f} acc_2mm={s['acc_2mm']:.3f}")
+    if o["pixels"] > 0:
+        print(f"\n[depth metrics] overall: abs_err={o['abs_err']:.3f}mm median={o['median']:.3f} "
+              f"p90={o['p90']:.3f} acc@1/2/4/8mm={o['acc_1mm']:.3f}/{o['acc_2mm']:.3f}/"
+              f"{o['acc_4mm']:.3f}/{o['acc_8mm']:.3f}")
+        for scan in scans:
+            if scan in result["per_scan"]:
+                s = result["per_scan"][scan]
+                print(f"  {scan:>8s}: abs_err={s['abs_err']:.3f} median={s['median']:.3f} "
+                      f"p90={s['p90']:.3f} acc_2mm={s['acc_2mm']:.3f}")
+    else:
+        print("\n[depth metrics] test split has no GT depth — skipping metrics (fusion only).")
 
     summary = {"ckpt": str(ckpt_path), "split": args.split, "num_views": args.num_views or cfg.train.num_views,
                "resize_scale": args.resize_scale, **result}

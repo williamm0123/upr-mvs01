@@ -24,6 +24,9 @@ class DTUMVSDataset(Dataset):
         self.ndepths = ndepths
         self.nviews = nviews
         self.mode = mode
+        # dtu_testing 采用 MVSNet 测试布局: 每个 scan 下有 images/、cams/、pair.txt,
+        # 无 GT 深度/mask; train/val 用 dtu_training 布局 (Rectified_raw/Depths_raw/Cameras)。
+        self.is_test = (mode == "test")
 
         self.metas = self.build_list()
         self.resize_scale = kwargs.get('resize_scale', 0.5)
@@ -64,7 +67,8 @@ class DTUMVSDataset(Dataset):
 
         # scans
         for scan in scans:
-            pair_file = "Cameras/pair.txt"
+            # 测试布局 pair.txt 在各 scan 目录下; 训练布局共用 Cameras/pair.txt。
+            pair_file = f"{scan}/pair.txt" if self.is_test else "Cameras/pair.txt"
             # read the pair file
             with open(os.path.join(self.datapath, pair_file)) as f:
                 num_viewpoint = int(f.readline())
@@ -170,17 +174,24 @@ class DTUMVSDataset(Dataset):
         depth_hr = mask_hr = None
         depth_values = []
         for i, view_id in enumerate(view_ids):
-            img_filename = os.path.join(self.datapath, 'Rectified_raw/{}/rect_{:0>3}_{}_r5000.png'.format(scan, view_id + 1, light_idx))
-            mask_filename_hr = os.path.join(self.datapath, 'Depths_raw/{}/depth_visual_{:0>4}.png'.format(scan, view_id))
-            depth_filename_hr = os.path.join(self.datapath, 'Depths_raw/{}/depth_map_{:0>4}.pfm'.format(scan, view_id))
-            proj_mat_filename = os.path.join(self.datapath, 'Cameras/{:0>8}_cam.txt').format(view_id)
+            if self.is_test:
+                # dtu_testing/<scan>/images/000000xx.png, cams/000000xx_cam.txt (无 GT)
+                img_filename = os.path.join(self.datapath, '{}/images/{:0>8}.png'.format(scan, view_id))
+                proj_mat_filename = os.path.join(self.datapath, '{}/cams/{:0>8}_cam.txt'.format(scan, view_id))
+            else:
+                img_filename = os.path.join(self.datapath, 'Rectified_raw/{}/rect_{:0>3}_{}_r5000.png'.format(scan, view_id + 1, light_idx))
+                mask_filename_hr = os.path.join(self.datapath, 'Depths_raw/{}/depth_visual_{:0>4}.png'.format(scan, view_id))
+                depth_filename_hr = os.path.join(self.datapath, 'Depths_raw/{}/depth_map_{:0>4}.pfm'.format(scan, view_id))
+                proj_mat_filename = os.path.join(self.datapath, 'Cameras/{:0>8}_cam.txt').format(view_id)
 
             img = np.asarray(self.read_img(img_filename))
             intrinsic, extrinsic, depth_min, depth_interval = self.read_camera_file(proj_mat_filename)
 
             if i == 0:
-                depth_hr = np.asarray(read_pfm(depth_filename_hr), dtype=np.float32)
-                mask_hr = self.read_mask(mask_filename_hr)
+                # 测试集无 GT 深度/mask; depth_values 仍从相机参数的 depth_min/interval 生成。
+                if not self.is_test:
+                    depth_hr = np.asarray(read_pfm(depth_filename_hr), dtype=np.float32)
+                    mask_hr = self.read_mask(mask_filename_hr)
                 depth_max = depth_min + depth_interval * self.ndepths
                 depth_values = np.arange(depth_min, depth_max, depth_interval, dtype=np.float32)
                 if resize_scale != 1.0:
