@@ -28,7 +28,6 @@ SMOKE_STEPS=${SMOKE_STEPS:-2}
 
 cd "$PROJECT_DIR"
 
-export UPRMVS_MACHINE=ubuntu
 export UPRMVS_PROFILE=local
 export PYTHONPATH="$PROJECT_DIR:$PROJECT_DIR/models:$PROJECT_DIR/models/Depth-Anything-3/src:${PYTHONPATH:-}"
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-4}

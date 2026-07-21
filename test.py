@@ -80,8 +80,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--geo-rel", type=float, default=0.01, help="max relative depth difference")
     # Fast-DTU-Evaluation
     p.add_argument("--run-eval", action="store_true", help="run Fast-DTU-Evaluation on the fused clouds")
-    p.add_argument("--eval-tool", default="/home/william/Downloads/Fast-DTU-Evaluation")
-    p.add_argument("--eval-gt", default="/home/william/project/dataset/DTU/SampleSet/MVS Data")
+    p.add_argument("--eval-tool", default=None,
+                   help="Fast-DTU-Evaluation dir (default: profile's cfg.paths.eval_tool)")
+    p.add_argument("--eval-gt", default=None,
+                   help="DTU GT points dir (default: profile's cfg.paths.eval_gt)")
     p.add_argument("--eval-workers", type=int, default=1)
     return p.parse_args()
 
@@ -439,6 +441,11 @@ def run_fast_eval(ply_dir: Path, scan_ids: list[int], args) -> None:
 def main() -> None:
     args = parse_args()
     cfg = build_mvs_config(profile=args.profile)
+    # Fall back to the active profile's paths when eval dirs are not overridden.
+    if args.eval_tool is None:
+        args.eval_tool = str(cfg.paths.eval_tool)
+    if args.eval_gt is None:
+        args.eval_gt = str(cfg.paths.eval_gt)
     device = torch.device(args.device) if args.device else \
         torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     out_root = Path(args.out) if args.out else Path("outputs") / f"test_{args.split}"

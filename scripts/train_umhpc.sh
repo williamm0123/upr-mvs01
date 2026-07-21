@@ -17,7 +17,6 @@ cd /scr/user/qinglong/projects/upr-mvs01
 source ~/.bashrc
 conda activate mvs
 
-export UPRMVS_MACHINE=umhpc
 export UPRMVS_PROFILE=umhpc
 export PYTHONPATH=/scr/user/qinglong/projects/upr-mvs01:/scr/user/qinglong/projects/upr-mvs01/models:/scr/user/qinglong/projects/upr-mvs01/models/Depth-Anything-3/src
 export PYTHONNOUSERSITE=1

@@ -6,7 +6,7 @@ set -euo pipefail
 PROJECT_DIR=${PROJECT_DIR:-/scr/user/qinglong/projects/upr-mvs01}
 # 直接指定 mvs 环境的解释器，不依赖当前 shell 的 conda activate/PATH。
 PYTHON_BIN=${PYTHON_BIN:-/home/user/qinglong/.conda/envs/mvs/bin/python}
-TRAIN_PROFILE=${TRAIN_PROFILE:-local}
+TRAIN_PROFILE=${TRAIN_PROFILE:-umhpc}
 RUN_NAME=${RUN_NAME:-uprmvs_1gpu_${SLURM_JOB_ID:-manual}}
 
 # 核心训练参数（命令行会覆盖 TRAIN_PROFILE 中的同名参数）
@@ -34,7 +34,6 @@ fi
 
 cd "$PROJECT_DIR"
 
-export UPRMVS_MACHINE=umhpc
 export UPRMVS_PROFILE="$TRAIN_PROFILE"
 # vggt 是 PROJECT_DIR/models 下的顶层 namespace package；不继承外部
 # PYTHONPATH，避免误导入 /scr/user/qinglong/projects/vggt。
