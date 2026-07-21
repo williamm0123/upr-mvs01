@@ -24,9 +24,13 @@ class DTUMVSDataset(Dataset):
         self.ndepths = ndepths
         self.nviews = nviews
         self.mode = mode
-        # dtu_testing 采用 MVSNet 测试布局: 每个 scan 下有 images/、cams/、pair.txt,
-        # 无 GT 深度/mask; train/val 用 dtu_training 布局 (Rectified_raw/Depths_raw/Cameras)。
+        # dtu_testing 采用 MVSNet 测试布局: 每个 scan 下有 images/、cams/、pair.txt。
+        # 测试的 GT 深度/mask 仍取自 dtu_training/Depths_raw (由 gt_datapath 指定);
+        # train/val 用 dtu_training 布局 (Rectified_raw/Depths_raw/Cameras)。
         self.is_test = (mode == "test")
+        # GT 深度/mask 的根目录: test 指向 dtu_training, 其余与 datapath 相同。
+        gt_datapath = kwargs.get('gt_datapath', None)
+        self.gt_datapath = Path(gt_datapath) if gt_datapath is not None else self.datapath
 
         self.metas = self.build_list()
         self.resize_scale = kwargs.get('resize_scale', 0.5)
@@ -178,9 +182,11 @@ class DTUMVSDataset(Dataset):
         depth_values = []
         for i, view_id in enumerate(view_ids):
             if self.is_test:
-                # dtu_testing/<scan>/images/000000xx.jpg, cams/000000xx_cam.txt (无 GT)
+                # 图像/相机来自 dtu_testing; GT 深度/mask 来自 dtu_training/Depths_raw。
                 img_filename = os.path.join(self.datapath, '{}/images/{:0>8}.jpg'.format(scan, view_id))
                 proj_mat_filename = os.path.join(self.datapath, '{}/cams/{:0>8}_cam.txt'.format(scan, view_id))
+                mask_filename_hr = os.path.join(self.gt_datapath, 'Depths_raw/{}/depth_visual_{:0>4}.png'.format(scan, view_id))
+                depth_filename_hr = os.path.join(self.gt_datapath, 'Depths_raw/{}/depth_map_{:0>4}.pfm'.format(scan, view_id))
             else:
                 img_filename = os.path.join(self.datapath, 'Rectified_raw/{}/rect_{:0>3}_{}_r5000.png'.format(scan, view_id + 1, light_idx))
                 mask_filename_hr = os.path.join(self.datapath, 'Depths_raw/{}/depth_visual_{:0>4}.png'.format(scan, view_id))
@@ -191,10 +197,14 @@ class DTUMVSDataset(Dataset):
             intrinsic, extrinsic, depth_min, depth_interval = self.read_camera_file(proj_mat_filename)
 
             if i == 0:
-                # 测试集无 GT 深度/mask; depth_values 仍从相机参数的 depth_min/interval 生成。
-                if not self.is_test:
-                    depth_hr = np.asarray(read_pfm(depth_filename_hr), dtype=np.float32)
-                    mask_hr = self.read_mask(mask_filename_hr)
+                depth_hr = np.asarray(read_pfm(depth_filename_hr), dtype=np.float32)
+                mask_hr = self.read_mask(mask_filename_hr)
+                # test 的 GT 取自 dtu_training/Depths_raw, 分辨率可能与 dtu_testing 图像
+                # 不一致; 先对齐到图像尺寸 (NEAREST 保深度值), 再走后续 resize/crop。
+                if depth_hr.shape[:2] != img.shape[:2]:
+                    h_img, w_img = img.shape[:2]
+                    depth_hr = cv2.resize(depth_hr, (w_img, h_img), interpolation=cv2.INTER_NEAREST)
+                    mask_hr = cv2.resize(mask_hr, (w_img, h_img), interpolation=cv2.INTER_NEAREST)
                 depth_max = depth_min + depth_interval * self.ndepths
                 depth_values = np.arange(depth_min, depth_max, depth_interval, dtype=np.float32)
                 if resize_scale != 1.0:
