@@ -311,7 +311,7 @@ def run_inference(model, ds, cfg, args, device, out_root: Path) -> dict:
         if args.vis and vis_count[scan] < args.vis:
             d = out_root / "vis" / scan
             d.mkdir(parents=True, exist_ok=True)
-            cv2.imwrite(str(d / f"{ref_view:08d}.png"), depth_vis(pred[0].cpu().numpy()))
+            cv2.imwrite(str(d / f"{ref_view:08d}.jpg"), depth_vis(pred[0].cpu().numpy()))
             vis_count[scan] += 1
         if (i + 1) % 20 == 0 or i + 1 == len(ds):
             print(f"[test] {i + 1}/{len(ds)} ({scan} ref {ref_view})", flush=True)
