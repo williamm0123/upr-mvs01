@@ -4,8 +4,8 @@ set -euo pipefail
 
 
 PROJECT_DIR=${PROJECT_DIR:-/scr/user/qinglong/projects/upr-mvs01}
-# 直接指定 uprmvs 环境的解释器，不依赖当前 shell 的 conda activate/PATH。
-PYTHON_BIN=${PYTHON_BIN:-/home/user/qinglong/.conda/envs/uprmvs/bin/python}
+# 直接指定 mvs 环境的解释器，不依赖当前 shell 的 conda activate/PATH。
+PYTHON_BIN=${PYTHON_BIN:-/home/user/qinglong/.conda/envs/mvs/bin/python}
 TRAIN_PROFILE=${TRAIN_PROFILE:-local}
 RUN_NAME=${RUN_NAME:-uprmvs_1gpu_${SLURM_JOB_ID:-manual}}
 

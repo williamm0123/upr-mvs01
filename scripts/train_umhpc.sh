@@ -15,7 +15,7 @@ set -euo pipefail
 
 cd /scr/user/qinglong/projects/upr-mvs01
 source ~/.bashrc
-conda activate uprmvs
+conda activate mvs
 
 export UPRMVS_MACHINE=umhpc
 export UPRMVS_PROFILE=umhpc
