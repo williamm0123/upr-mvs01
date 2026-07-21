@@ -1,304 +1,432 @@
+"""Test / evaluation driver for UprMVSNet.
+
+Three levels, fastest first:
+
+1. Depth metrics (default): run the checkpoint over a DTU split and report
+   masked depth-map errors (same masking as train.py validation) with a
+   per-scan breakdown plus median/p90. The quick "did it get better" signal.
+2. ``--fuse``: additionally cache per-view depth/conf and fuse each scan into
+   a point cloud (photometric + geometric consistency filtering), written as
+   ``<out>/ply/mvsnet{scan:03d}_l3.ply`` — the naming Fast-DTU-Evaluation
+   expects.
+3. ``--run-eval``: invoke the GPU Fast-DTU-Evaluation (accuracy /
+   completeness / overall against the official STL points) on the fused
+   clouds.
+
+Priors: the network consumes cached depth/conf priors; missing entries for
+the requested split are built automatically (VGGT + DA3 loaded once) unless
+``--build-priors skip``.
+
+Examples
+--------
+python test.py --split val                        # depth metrics on val scans
+python test.py --split test --max-refs 5          # quick test-split check
+python test.py --split test --fuse --run-eval     # full point-cloud benchmark
+"""
 from __future__ import annotations
 
 import argparse
 import json
-from dataclasses import asdict
+import subprocess
+import sys
+from collections import defaultdict
 from pathlib import Path
 
 import cv2
 import numpy as np
 import torch
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
 
-from base.config import build_mvs_config
+from base.config import ProjectPaths, build_mvs_config
 from data.dtu import DTUMVSDataset
-import models.normal_fill as NF
-import models.norm_fill as P
-
-
-KINDS = (
-    "input_images",
-    "vggt_depth",
-    "pointcloud",
-    "denoised_pointcloud",
-    "denoised_depth",
-    "da3_depth",
-    "normals",
-    "filled_depth",
-    "filled_pointcloud",
-    "comparison",
-)
-
-COMPARE_PANELS = (
-    ("input views", "input_images"),
-    ("vggt depth", "vggt_depth"),
-    ("denoised depth", "denoised_depth"),
-    ("da3 depth", "da3_depth"),
-    ("da3 normals", "normals"),
-    ("filled depth", "filled_depth"),
-)
+from models.network import UprMVSNet
+from utils.geometry import unproject_depth
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser("Test compact VGGT + DA3 depth completion.")
-    parser.add_argument("--profile", choices=["local", "umhpc"], default=None)
-    parser.add_argument("--device", default=None)
-    parser.add_argument("--output-root", default="outputs/vggt_test")
-    parser.add_argument("--max-scans", type=int, default=0)
-    parser.add_argument("--num-views", type=int, default=5)
-    parser.add_argument("--image-mode", choices=["crop", "pad"], default="crop")
-    parser.add_argument("--conf-percentile", type=float, default=10.0)
-    parser.add_argument("--min-conf", type=float, default=0.0)
-    parser.add_argument("--splat-radius", type=int, default=1)
-    parser.add_argument("--vggt-weights", default=None)
-    parser.add_argument("--da3-weights", default=None)
-    return parser.parse_args()
+    p = argparse.ArgumentParser("UprMVSNet test / DTU evaluation")
+    p.add_argument("--profile", choices=["local", "umhpc"], default=None)
+    p.add_argument("--device", default=None)
+    p.add_argument("--ckpt", default=None, help="checkpoint path (default log/model/best.pth, falls back to latest.pth)")
+    p.add_argument("--split", choices=["val", "test"], default="val")
+    p.add_argument("--list", default=None, help="override the split's scan list file")
+    p.add_argument("--num-views", type=int, default=None, help="views fed to the network (default cfg.train.num_views)")
+    p.add_argument("--resize-scale", type=float, default=0.5)
+    p.add_argument("--max-scans", type=int, default=0)
+    p.add_argument("--max-refs", type=int, default=0, help="limit ref views per scan (0 = all 49)")
+    p.add_argument("--num-workers", type=int, default=2)
+    p.add_argument("--out", default=None, help="output root (default outputs/test_<split>)")
+    p.add_argument("--vis", type=int, default=0, help="save the first N depth visualizations per scan")
+    p.add_argument("--build-priors", choices=["auto", "skip", "force"], default="auto")
+    # fusion
+    p.add_argument("--fuse", action="store_true", help="save per-view outputs and fuse point clouds")
+    p.add_argument("--photo-thresh", type=float, default=0.3, help="stage-3 mode-probability threshold")
+    p.add_argument("--geo-views", type=int, default=3, help="min consistent source views")
+    p.add_argument("--geo-pix", type=float, default=1.0, help="max reprojection error (px)")
+    p.add_argument("--geo-rel", type=float, default=0.01, help="max relative depth difference")
+    # Fast-DTU-Evaluation
+    p.add_argument("--run-eval", action="store_true", help="run Fast-DTU-Evaluation on the fused clouds")
+    p.add_argument("--eval-tool", default="/home/william/Downloads/Fast-DTU-Evaluation")
+    p.add_argument("--eval-gt", default="/home/william/project/dataset/DTU/SampleSet/MVS Data")
+    p.add_argument("--eval-workers", type=int, default=1)
+    return p.parse_args()
 
 
-def first_ref_dataset(cfg, nviews: int) -> DTUMVSDataset:
-    dataset = DTUMVSDataset(
+# --------------------------------------------------------------------------- #
+# Data / model setup
+# --------------------------------------------------------------------------- #
+def _collate(samples: list[dict]) -> dict:
+    out: dict = {}
+    for k in samples[0]:
+        v = samples[0][k]
+        if isinstance(v, torch.Tensor):
+            out[k] = torch.stack([s[k] for s in samples], dim=0)
+        elif isinstance(v, np.ndarray):
+            out[k] = torch.stack([torch.from_numpy(s[k]) for s in samples], dim=0)
+        else:
+            out[k] = [s[k] for s in samples]
+    return out
+
+
+def build_dataset(cfg, args) -> DTUMVSDataset:
+    listfile = args.list or (cfg.paths.val_list_file if args.split == "val" else cfg.paths.test_list_file)
+    ds = DTUMVSDataset(
         datapath=cfg.paths.dtu_train_root,
-        listfile=cfg.paths.test_list_file,
-        nviews=nviews,
-        ndepths=192,
-        mode="test",
-        resize_scale=1.0,
+        listfile=listfile,
+        nviews=args.num_views or cfg.train.num_views,
+        mode=args.split,
+        use_src_weights=cfg.cost_volume.use_src_weights,
     )
-    selected = []
-    seen = set()
-    for scan, light_idx, ref_view, src_views in dataset.metas:
-        if scan in seen:
-            continue
-        seen.add(scan)
-        selected.append((scan, light_idx, ref_view, src_views))
-    dataset.metas = selected
-    return dataset
+    # DTUMVSDataset declares resize_scale as a named __init__ arg but reads
+    # self.resize_scale from **kwargs, so a keyword arg is silently ignored —
+    # set the attribute directly until that is fixed.
+    ds.resize_scale = args.resize_scale
+    # non-train modes emit one meta per ref view at light 3 — group and trim
+    per_scan: dict[str, list] = defaultdict(list)
+    for meta in ds.metas:
+        per_scan[meta[0]].append(meta)
+    scans = list(per_scan)
+    if args.max_scans > 0:
+        scans = scans[: args.max_scans]
+    metas = []
+    for scan in scans:
+        refs = per_scan[scan]
+        if args.max_refs > 0:
+            refs = refs[: args.max_refs]
+        metas.extend(refs)
+    ds.metas = metas
+    return ds
 
 
-def make_dirs(root: Path) -> None:
-    for kind in KINDS:
-        (root / kind).mkdir(parents=True, exist_ok=True)
+def load_model(cfg, args, device: torch.device) -> tuple[UprMVSNet, Path]:
+    model_dir = ProjectPaths().project_path / "log" / "model"
+    ckpt_path = Path(args.ckpt) if args.ckpt else model_dir / "best.pth"
+    if not ckpt_path.exists() and args.ckpt is None:
+        ckpt_path = model_dir / "latest.pth"
+    if not ckpt_path.exists():
+        raise FileNotFoundError(f"no checkpoint at {ckpt_path} (train first, or pass --ckpt)")
+    ckpt = torch.load(ckpt_path, map_location=device)
+    model = UprMVSNet(cfg).to(device)
+    model.load_state_dict(ckpt["model"])
+    model.eval()
+    step = ckpt.get("step", "?")
+    print(f"[test] loaded {ckpt_path} (step {step}, best_metric {ckpt.get('best_metric', float('nan')):.4f})")
+    return model, ckpt_path
 
 
-def save_depth(root: Path, kind: str, key: str, depth: np.ndarray) -> None:
-    out_dir = root / kind
-    depth = depth.astype(np.float32)
-    np.save(out_dir / f"{key}.npy", depth)
-    cv2.imwrite(str(out_dir / f"{key}.png"), depth_vis_image(depth))
+def ensure_priors(ds: DTUMVSDataset, device: torch.device, mode: str) -> None:
+    if mode == "skip":
+        return
+    from models.pre_prior import build_prior_cache
+
+    build_prior_cache(ds, device, overwrite=(mode == "force"))
+    torch.cuda.empty_cache() if device.type == "cuda" else None
 
 
-def depth_vis_image(depth: np.ndarray) -> np.ndarray:
-    depth = depth.astype(np.float32)
+# --------------------------------------------------------------------------- #
+# Depth metrics
+# --------------------------------------------------------------------------- #
+class ScanMeter:
+    """Pixel-weighted sums per scan + a subsampled error pool for quantiles."""
+
+    def __init__(self) -> None:
+        self.sums = defaultdict(lambda: np.zeros(6, dtype=np.float64))  # err, n, <1, <2, <4, <8
+        self.pool: dict[str, list[np.ndarray]] = defaultdict(list)
+
+    def update(self, scan: str, err: torch.Tensor) -> None:
+        e = err.detach().float()
+        s = self.sums[scan]
+        s[0] += e.sum().item()
+        s[1] += e.numel()
+        for i, t in enumerate((1.0, 2.0, 4.0, 8.0)):
+            s[2 + i] += (e < t).sum().item()
+        if e.numel():
+            self.pool[scan].append(e[:: max(e.numel() // 4096, 1)].cpu().numpy())
+
+    def scan_metrics(self, scan: str) -> dict[str, float]:
+        s = self.sums[scan]
+        n = max(s[1], 1.0)
+        pool = np.concatenate(self.pool[scan]) if self.pool[scan] else np.zeros(1)
+        return {
+            "abs_err": s[0] / n,
+            "median": float(np.median(pool)),
+            "p90": float(np.percentile(pool, 90)),
+            "acc_1mm": s[2] / n, "acc_2mm": s[3] / n,
+            "acc_4mm": s[4] / n, "acc_8mm": s[5] / n,
+            "pixels": int(s[1]),
+        }
+
+    def overall(self) -> dict[str, float]:
+        tot = np.sum([self.sums[s] for s in self.sums], axis=0)
+        n = max(tot[1], 1.0)
+        pool = np.concatenate([v for vs in self.pool.values() for v in vs]) if self.pool else np.zeros(1)
+        return {
+            "abs_err": tot[0] / n,
+            "median": float(np.median(pool)),
+            "p90": float(np.percentile(pool, 90)),
+            "acc_1mm": tot[2] / n, "acc_2mm": tot[3] / n,
+            "acc_4mm": tot[4] / n, "acc_8mm": tot[5] / n,
+            "pixels": int(tot[1]),
+        }
+
+
+def photometric_confidence(prob: torch.Tensor, mode_idx: torch.Tensor, window: int) -> torch.Tensor:
+    """Probability mass in +-window bins around the argmax mode ([B, H, W])."""
+    D = prob.shape[1]
+    offs = torch.arange(-window, window + 1, device=prob.device).view(1, -1, 1, 1)
+    nbr = (mode_idx + offs).clamp(0, D - 1)
+    return prob.gather(1, nbr).sum(dim=1)
+
+
+def depth_vis(depth: np.ndarray) -> np.ndarray:
     valid = np.isfinite(depth) & (depth > 0)
-    image = np.zeros(depth.shape + (3,), dtype=np.uint8)
+    img = np.zeros(depth.shape + (3,), dtype=np.uint8)
     if valid.any():
         lo, hi = np.percentile(depth[valid], (1.0, 99.0))
-        hi = hi if hi > lo else lo + 1e-6
-        gray = np.clip((depth - lo) / (hi - lo), 0.0, 1.0)
-        image = cv2.applyColorMap((gray * 255).astype(np.uint8), cv2.COLORMAP_TURBO)
-        image[~valid] = 0
-    return image
+        gray = np.clip((depth - lo) / max(hi - lo, 1e-6), 0.0, 1.0)
+        img = cv2.applyColorMap((gray * 255).astype(np.uint8), cv2.COLORMAP_TURBO)
+        img[~valid] = 0
+    return img
 
 
-def save_image_grid(root: Path, key: str, images: np.ndarray, max_cols: int = 5) -> None:
-    out_dir = root / "input_images"
-    images = images.astype(np.uint8)
-    n, h, w, c = images.shape
-    cols = min(max_cols, n)
-    rows = int(np.ceil(n / cols))
-    grid = np.full((rows * h, cols * w, c), 255, dtype=np.uint8)
-    for i, image in enumerate(images):
-        y = (i // cols) * h
-        x = (i % cols) * w
-        grid[y : y + h, x : x + w] = image
-    cv2.imwrite(str(out_dir / f"{key}.png"), cv2.cvtColor(grid, cv2.COLOR_RGB2BGR))
-    np.save(out_dir / f"{key}.npy", images)
+@torch.no_grad()
+def run_inference(model, ds, cfg, args, device, out_root: Path) -> dict:
+    loader = DataLoader(ds, batch_size=1, shuffle=False,
+                        num_workers=args.num_workers, collate_fn=_collate, pin_memory=True)
+    use_amp = cfg.train.amp and device.type == "cuda"
+    meter = ScanMeter()
+    vis_count: dict[str, int] = defaultdict(int)
+    mw = cfg.depth_range.mode_window
+
+    for i, batch in enumerate(loader):
+        scan, light_idx, ref_view, src_views = ds.metas[i]
+        batch = {k: (v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v)
+                 for k, v in batch.items()}
+        with torch.autocast(device_type=device.type, enabled=use_amp):
+            outputs = model(batch)
+        pred = outputs["depth_full"].float()
+        conf = photometric_confidence(outputs["stage3"]["prob"].float(),
+                                      outputs["stage3"]["mode_idx"], mw)
+        if conf.shape[-2:] != pred.shape[-2:]:
+            conf = F.interpolate(conf.unsqueeze(1), size=pred.shape[-2:], mode="bilinear",
+                                 align_corners=False).squeeze(1)
+
+        gt = batch["depth_gt"].float()
+        m = batch["mask"].bool() & (gt > 0)
+        dv = batch["depth_values"].float()
+        m &= (gt >= dv.amin(dim=1).view(-1, 1, 1)) & (gt <= dv.amax(dim=1).view(-1, 1, 1))
+        if m.any():
+            meter.update(scan, (pred[m] - gt[m]).abs())
+
+        if args.fuse:
+            d = out_root / "depth" / scan
+            d.mkdir(parents=True, exist_ok=True)
+            np.savez_compressed(
+                d / f"{ref_view:08d}.npz",
+                depth=pred[0].cpu().numpy().astype(np.float32),
+                conf=conf[0].cpu().numpy().astype(np.float16),
+                K=batch["intrinsics"][0, 0].float().cpu().numpy(),
+                E=batch["extrinsics"][0, 0].float().cpu().numpy(),
+                image=batch["images"][0, 0].permute(1, 2, 0).to(torch.uint8).cpu().numpy(),
+                src_views=np.asarray(src_views, dtype=np.int64),
+            )
+        if args.vis and vis_count[scan] < args.vis:
+            d = out_root / "vis" / scan
+            d.mkdir(parents=True, exist_ok=True)
+            cv2.imwrite(str(d / f"{ref_view:08d}.png"), depth_vis(pred[0].cpu().numpy()))
+            vis_count[scan] += 1
+        if (i + 1) % 20 == 0 or i + 1 == len(ds):
+            print(f"[test] {i + 1}/{len(ds)} ({scan} ref {ref_view})", flush=True)
+
+    per_scan = {scan: meter.scan_metrics(scan) for scan in meter.sums}
+    return {"overall": meter.overall(), "per_scan": per_scan}
 
 
-def save_normals(root: Path, key: str, normals: np.ndarray) -> None:
-    out_dir = root / "normals"
-    normals = normals.astype(np.float32)
-    np.save(out_dir / f"{key}.npy", normals)
-    image = np.clip((normals * 0.5 + 0.5) * 255.0, 0, 255).astype(np.uint8)
-    cv2.imwrite(str(out_dir / f"{key}.png"), cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
-
-
-def labeled_panel(image: np.ndarray, label: str, size: tuple[int, int] = (360, 300)) -> np.ndarray:
-    width, height = size
-    label_h = 30
-    canvas = np.full((height, width, 3), 255, dtype=np.uint8)
-    cv2.putText(canvas, label, (10, 21), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (20, 20, 20), 1, cv2.LINE_AA)
-
-    content_h = height - label_h
-    h, w = image.shape[:2]
-    scale = min(width / max(w, 1), content_h / max(h, 1))
-    new_w = max(1, int(round(w * scale)))
-    new_h = max(1, int(round(h * scale)))
-    interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC
-    resized = cv2.resize(image, (new_w, new_h), interpolation=interp)
-    x = (width - new_w) // 2
-    y = label_h + (content_h - new_h) // 2
-    canvas[y : y + new_h, x : x + new_w] = resized
-    return canvas
-
-
-def save_comparison_grid(root: Path, key: str) -> None:
-    panels = []
-    for label, kind in COMPARE_PANELS:
-        image = cv2.imread(str(root / kind / f"{key}.png"), cv2.IMREAD_COLOR)
-        if image is not None:
-            panels.append(labeled_panel(image, label))
-    if not panels:
-        return
-
-    cols = 3
-    rows = int(np.ceil(len(panels) / cols))
-    blank = np.full_like(panels[0], 255)
-    while len(panels) < rows * cols:
-        panels.append(blank.copy())
-    grid_rows = [cv2.hconcat(panels[i * cols : (i + 1) * cols]) for i in range(rows)]
-    cv2.imwrite(str(root / "comparison" / f"{key}.png"), cv2.vconcat(grid_rows))
-
-
+# --------------------------------------------------------------------------- #
+# Point-cloud fusion
+# --------------------------------------------------------------------------- #
 def save_ply(path: Path, points: np.ndarray, colors: np.ndarray) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    points = points.astype(np.float32)
-    colors = colors.astype(np.uint8)
-    dtype = np.dtype([
-        ("x", "<f4"), ("y", "<f4"), ("z", "<f4"),
-        ("red", "u1"), ("green", "u1"), ("blue", "u1"),
-    ])
-    vertices = np.empty(len(points), dtype=dtype)
-    vertices["x"], vertices["y"], vertices["z"] = points[:, 0], points[:, 1], points[:, 2]
-    vertices["red"], vertices["green"], vertices["blue"] = colors[:, 0], colors[:, 1], colors[:, 2]
-    header = (
-        "ply\nformat binary_little_endian 1.0\n"
-        f"element vertex {len(points)}\n"
-        "property float x\nproperty float y\nproperty float z\n"
-        "property uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n"
-    )
+    dtype = np.dtype([("x", "<f4"), ("y", "<f4"), ("z", "<f4"),
+                      ("red", "u1"), ("green", "u1"), ("blue", "u1")])
+    v = np.empty(len(points), dtype=dtype)
+    v["x"], v["y"], v["z"] = points[:, 0], points[:, 1], points[:, 2]
+    v["red"], v["green"], v["blue"] = colors[:, 0], colors[:, 1], colors[:, 2]
+    header = ("ply\nformat binary_little_endian 1.0\n"
+              f"element vertex {len(points)}\n"
+              "property float x\nproperty float y\nproperty float z\n"
+              "property uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n")
     with path.open("wb") as f:
         f.write(header.encode("ascii"))
-        vertices.tofile(f)
+        v.tofile(f)
 
 
-def save_cloud(root: Path, kind: str, key: str, points: np.ndarray, colors: np.ndarray) -> None:
-    out_dir = root / kind
-    np.save(out_dir / f"{key}.npy", points.astype(np.float32))
-    save_ply(out_dir / f"{key}.ply", points, colors)
+@torch.no_grad()
+def fuse_scan(scan_dir: Path, args, device: torch.device) -> tuple[np.ndarray, np.ndarray]:
+    views = {}
+    for f in sorted(scan_dir.glob("*.npz")):
+        z = np.load(f)
+        views[int(f.stem)] = {
+            "depth": torch.from_numpy(z["depth"]).to(device),
+            "conf": torch.from_numpy(z["conf"].astype(np.float32)).to(device),
+            "K": torch.from_numpy(z["K"]).to(device),
+            "E": torch.from_numpy(z["E"]).to(device),
+            "image": z["image"],
+            "src_views": [int(s) for s in z["src_views"]],
+        }
+    all_pts, all_cols = [], []
+    for ref_id, ref in views.items():
+        srcs = [views[s] for s in ref["src_views"] if s in views]
+        if not srcs:
+            continue
+        H, W = ref["depth"].shape
+        S = len(srcs)
+        d_ref = ref["depth"].view(1, H, W)
+        K_ref, E_ref = ref["K"].unsqueeze(0), ref["E"].unsqueeze(0)
+        K_src = torch.stack([s["K"] for s in srcs])
+        E_src = torch.stack([s["E"] for s in srcs])
+        d_src = torch.stack([s["depth"] for s in srcs]).unsqueeze(1)  # [S,1,H,W]
+
+        # ref pixels -> world -> each src image plane
+        world = unproject_depth(d_ref, torch.inverse(K_ref), torch.inverse(E_ref))  # [1,3,H,W]
+        wf = world.view(1, 3, -1).expand(S, -1, -1)
+        cam = torch.bmm(E_src[:, :3, :3], wf) + E_src[:, :3, 3:]
+        uv_h = torch.bmm(K_src, cam)
+        uv = uv_h[:, :2] / uv_h[:, 2:3].clamp_min(1e-6)                            # [S,2,N]
+
+        # sample each src depth at the projected pixel
+        gx = uv[:, 0] / (W - 1) * 2.0 - 1.0
+        gy = uv[:, 1] / (H - 1) * 2.0 - 1.0
+        grid = torch.stack([gx, gy], dim=-1).view(S, H, W, 2)
+        d_samp = F.grid_sample(d_src, grid, mode="nearest", padding_mode="zeros",
+                               align_corners=True).view(S, -1)                     # [S,N]
+
+        # lift the sampled src depth and project back into the ref view
+        uv1 = torch.cat([uv, torch.ones_like(uv[:, :1])], dim=1)
+        cam_s = torch.bmm(torch.inverse(K_src), uv1) * d_samp.unsqueeze(1)
+        world_s = torch.bmm(torch.inverse(E_src)[:, :3, :3], cam_s) + torch.inverse(E_src)[:, :3, 3:]
+        cam_b = torch.bmm(E_ref[:, :3, :3].expand(S, -1, -1), world_s) + E_ref[:, :3, 3:]
+        z_back = cam_b[:, 2]
+        uv_b = torch.bmm(K_ref.expand(S, -1, -1), cam_b)
+        uv_b = uv_b[:, :2] / uv_b[:, 2:3].clamp_min(1e-6)
+
+        gridpix = torch.stack(torch.meshgrid(
+            torch.arange(W, device=device, dtype=torch.float32),
+            torch.arange(H, device=device, dtype=torch.float32), indexing="xy"), dim=0)
+        err_px = (uv_b - gridpix.view(1, 2, -1)).norm(dim=1)                       # [S,N]
+        dr = d_ref.view(1, -1)
+        consistent = (d_samp > 0) & (err_px < args.geo_pix) & ((z_back - dr).abs() / dr.clamp_min(1e-6) < args.geo_rel)
+
+        n_geo = consistent.sum(dim=0)
+        d_avg = (dr.squeeze(0) + (z_back * consistent).sum(dim=0)) / (n_geo + 1).float()
+        keep = ((ref["conf"].view(-1) > args.photo_thresh) & (n_geo >= args.geo_views)
+                & (dr.squeeze(0) > 0)).view(H, W)
+        if not keep.any():
+            continue
+        pts = unproject_depth(d_avg.view(1, H, W), torch.inverse(K_ref), torch.inverse(E_ref))
+        pts = pts[0].permute(1, 2, 0)[keep]
+        all_pts.append(pts.cpu().numpy())
+        all_cols.append(ref["image"][keep.cpu().numpy()])
+    if not all_pts:
+        return np.zeros((0, 3), np.float32), np.zeros((0, 3), np.uint8)
+    return np.concatenate(all_pts), np.concatenate(all_cols)
 
 
-def save_filled_pointcloud(root: Path, key: str, depth: np.ndarray, image: np.ndarray, intrinsic: np.ndarray) -> int:
-    out_dir = root / "filled_pointcloud"
-    valid = np.isfinite(depth) & (depth > 0)
-    points = (NF.camera_rays(depth.shape, intrinsic) * depth[..., None].astype(np.float32))[valid]
-    colors = image[valid]
-    save_ply(out_dir / f"{key}.ply", points, colors)
-    cv2.imwrite(str(out_dir / f"{key}.png"), depth_vis_image(depth))
-    return int(len(points))
+def run_fusion(out_root: Path, args, device: torch.device) -> Path:
+    ply_dir = out_root / "ply"
+    ply_dir.mkdir(parents=True, exist_ok=True)
+    scan_dirs = sorted((out_root / "depth").iterdir())
+    for sd in scan_dirs:
+        scan_id = int(sd.name.replace("scan", ""))
+        pts, cols = fuse_scan(sd, args, device)
+        out = ply_dir / f"mvsnet{scan_id:03d}_l3.ply"
+        save_ply(out, pts, cols)
+        print(f"[fuse] {sd.name}: {len(pts):,} points -> {out}")
+    return ply_dir
 
 
-def run_one(sample: dict, key: str, vggt_model, da3_model, device: torch.device, args, root: Path) -> dict:
-    inputs = P._preprocess_vggt_inputs(sample["images"], sample["intrinsics"], mode=args.image_mode)
-    save_image_grid(root, key, inputs.images_uint8)
-    pred = P._run_vggt(vggt_model, inputs.images_chw, device)
-    pred["images_uint8"] = inputs.images_uint8
-    raw_points, raw_colors, point_info = P.vggt_prediction_to_pointcloud(
-        pred,
-        conf_percentile=args.conf_percentile,
-        min_conf=args.min_conf,
-    )
-    denoised_points, denoised_colors, point_denoise_info = P.denoise_pointcloud_points(raw_points, raw_colors)
-
-    vggt_depth = pred["depth"][0]
-    image = inputs.images_uint8[0]
-    intrinsic = pred["intrinsic"][0]
-
-    sparse_depth, valid, projection_info = P.project_denoised_pointcloud_to_depth(
-        denoised_points,
-        pred,
-        view_idx=0,
-        splat_radius=args.splat_radius,
-    )
-    da3_depth = P._da3_depth(image, da3_model, target_hw=vggt_depth.shape)
-
-    fill_cfg = NF.DepthFillConfig()
-    aligned_da3, align_info = NF.robust_affine_align_depth(
-        da3_depth,
-        sparse_depth,
-        valid,
-        trim_mad=fill_cfg.align_trim_mad,
-        min_points=fill_cfg.align_min_points,
-    )
-    normals = NF.depth_to_camera_normals(aligned_da3, intrinsic)
-    filled_depth, fill_info = NF.fill_depth_with_normal_constraints(
-        sparse_depth,
-        aligned_da3,
-        normals,
-        intrinsic,
-        valid,
-        fill_cfg,
-    )
-
-    save_depth(root, "vggt_depth", key, vggt_depth)
-    save_cloud(root, "pointcloud", key, raw_points, raw_colors)
-    save_cloud(root, "denoised_pointcloud", key, denoised_points, denoised_colors)
-    save_depth(root, "denoised_depth", key, sparse_depth)
-    save_depth(root, "da3_depth", key, da3_depth)
-    save_normals(root, key, normals)
-    save_depth(root, "filled_depth", key, filled_depth)
-    filled_pointcloud_points = save_filled_pointcloud(root, key, filled_depth, image, intrinsic)
-    save_comparison_grid(root, key)
-
-    return {
-        "key": key,
-        "raw_points": int(len(raw_points)),
-        "denoised_points": int(len(denoised_points)),
-        "denoised_depth_pixels": int(valid.sum()),
-        "filled_depth_pixels": int(NF.valid_depth_mask(filled_depth).sum()),
-        "filled_pointcloud_points": filled_pointcloud_points,
-        "point_selection": point_info,
-        "pointcloud_denoise": point_denoise_info,
-        "projection": projection_info,
-        "da3_align": align_info,
-        "normal_fill": fill_info,
-    }
+# --------------------------------------------------------------------------- #
+# Fast-DTU-Evaluation
+# --------------------------------------------------------------------------- #
+def run_fast_eval(ply_dir: Path, scan_ids: list[int], args) -> None:
+    tool = Path(args.eval_tool)
+    if not (tool / "eval_dtu.py").exists():
+        print(f"[eval] Fast-DTU-Evaluation not found at {tool}; skipping")
+        return
+    cmd = [sys.executable, "eval_dtu.py",
+           "--scans", *[str(s) for s in scan_ids],
+           "--method", "mvsnet",
+           "--pred_dir", str(ply_dir.resolve()),
+           "--gt_dir", args.eval_gt,
+           "--num_workers", str(args.eval_workers),
+           "--save"]
+    print("[eval] running:", " ".join(cmd))
+    r = subprocess.run(cmd, cwd=tool)
+    if r.returncode != 0:
+        print("[eval] FAILED — if this is the first run, build its CUDA extension and deps:\n"
+              f"  cd {tool}/chamfer3D && {sys.executable} setup.py install --user\n"
+              f"  {sys.executable} -m pip install open3d plyfile scikit-learn scipy tqdm")
 
 
+# --------------------------------------------------------------------------- #
 def main() -> None:
     args = parse_args()
     cfg = build_mvs_config(profile=args.profile)
-    root = Path(args.output_root)
-    make_dirs(root)
+    device = torch.device(args.device) if args.device else \
+        torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    out_root = Path(args.out) if args.out else Path("outputs") / f"test_{args.split}"
+    out_root.mkdir(parents=True, exist_ok=True)
 
-    device = torch.device(args.device) if args.device else torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    vggt_weights = Path(args.vggt_weights) if args.vggt_weights else Path(cfg.paths.vggt_weights_path)
-    da3_weights = Path(args.da3_weights) if args.da3_weights else Path(cfg.paths.da3_weights_file)
+    ds = build_dataset(cfg, args)
+    scans = sorted({m[0] for m in ds.metas}, key=lambda s: int(s.replace("scan", "")))
+    print(f"[test] split={args.split} scans={len(scans)} samples={len(ds)} out={out_root}")
 
-    dataset = first_ref_dataset(cfg, args.num_views)
-    if args.max_scans > 0:
-        dataset.metas = dataset.metas[: args.max_scans]
+    ensure_priors(ds, device, args.build_priors)
+    model, ckpt_path = load_model(cfg, args, device)
 
-    print(f"[test] scans={len(dataset.metas)} output={root} device={device}")
-    vggt_model = P.load_vggt_model(vggt_weights, device)
-    da3_model = P.load_da3_model(da3_weights, device)
+    result = run_inference(model, ds, cfg, args, device, out_root)
+    o = result["overall"]
+    print(f"\n[depth metrics] overall: abs_err={o['abs_err']:.3f}mm median={o['median']:.3f} "
+          f"p90={o['p90']:.3f} acc@1/2/4/8mm={o['acc_1mm']:.3f}/{o['acc_2mm']:.3f}/"
+          f"{o['acc_4mm']:.3f}/{o['acc_8mm']:.3f}")
+    for scan in scans:
+        if scan in result["per_scan"]:
+            s = result["per_scan"][scan]
+            print(f"  {scan:>8s}: abs_err={s['abs_err']:.3f} median={s['median']:.3f} "
+                  f"p90={s['p90']:.3f} acc_2mm={s['acc_2mm']:.3f}")
 
-    records = []
-    for idx, sample in enumerate(dataset):
-        scan, light_idx, ref_view, _src_views = dataset.metas[idx]
-        key = f"{scan}_light{light_idx}_ref{ref_view:03d}"
-        print(f"[test] {idx + 1}/{len(dataset)} {key}", flush=True)
-        records.append(run_one(sample, key, vggt_model, da3_model, device, args, root))
+    summary = {"ckpt": str(ckpt_path), "split": args.split, "num_views": args.num_views or cfg.train.num_views,
+               "resize_scale": args.resize_scale, **result}
+    (out_root / "metrics.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    print(f"[test] wrote {out_root / 'metrics.json'}")
 
-    summary = {
-        "output_root": str(root),
-        "num_views": args.num_views,
-        "image_mode": args.image_mode,
-        "splat_radius": args.splat_radius,
-        "fill_config": asdict(NF.DepthFillConfig()),
-        "records": records,
-    }
-    (root / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
-    print(f"[test] wrote {root / 'summary.json'}")
+    if args.fuse:
+        del model
+        torch.cuda.empty_cache() if device.type == "cuda" else None
+        ply_dir = run_fusion(out_root, args, device)
+        if args.run_eval:
+            run_fast_eval(ply_dir, [int(s.replace("scan", "")) for s in scans], args)
 
 
 if __name__ == "__main__":
