@@ -106,16 +106,14 @@ def _collate(samples: list[dict]) -> dict:
 
 def build_dataset(cfg, args) -> DTUMVSDataset:
     listfile = args.list or (cfg.paths.val_list_file if args.split == "val" else cfg.paths.test_list_file)
-    # val 复用 dtu_training (含 GT); test 图像/相机走 dtu_testing, GT 深度/mask 仍取
-    # 自 dtu_training/Depths_raw (gt_datapath)。
+    # val 复用 dtu_training (含 depth GT); test 走 dtu_testing (images/cams/pair.txt),
+    # 无 depth GT — 按官方协议以融合点云 vs STL 评测。
     datapath = cfg.paths.dtu_test_root if args.split == "test" else cfg.paths.dtu_train_root
-    gt_datapath = cfg.paths.dtu_train_root if args.split == "test" else None
     ds = DTUMVSDataset(
         datapath=datapath,
         listfile=listfile,
         nviews=args.num_views or cfg.train.num_views,
         mode=args.split,
-        gt_datapath=gt_datapath,
         use_src_weights=cfg.cost_volume.use_src_weights,
     )
     # DTUMVSDataset declares resize_scale as a named __init__ arg but reads
@@ -289,27 +287,15 @@ def run_inference(model, ds, cfg, args, device, out_root: Path) -> dict:
             conf = F.interpolate(conf.unsqueeze(1), size=pred.shape[-2:], mode="bilinear",
                                  align_corners=False).squeeze(1)
 
-        # 测试集无 GT: depth_gt/mask 为 None (collate 成 [None]), 跳过深度指标, 只做融合。
+        # test 无 depth GT (官方按 STL 评测); val 才有 depth GT 报深度指标。
         gt = batch.get("depth_gt")
         if isinstance(gt, torch.Tensor):
             gt = gt.float()
-            mask_valid = batch["mask"].bool()
+            m = batch["mask"].bool() & (gt > 0)
             dv = batch["depth_values"].float()
-            lo = dv.amin(dim=1).view(-1, 1, 1)
-            hi = dv.amax(dim=1).view(-1, 1, 1)
-            m = mask_valid & (gt > 0) & (gt >= lo) & (gt <= hi)
-            if i == 0:
-                # 一次性诊断: 逐级看哪一步把有效像素过滤空了 (GT 对齐/尺度问题)。
-                pos = gt[gt > 0]
-                gstat = (float(pos.min()), float(pos.median()), float(pos.max())) if pos.numel() else (0.0, 0.0, 0.0)
-                print(f"[diag] gt{tuple(gt.shape)} pred{tuple(pred.shape)} "
-                      f"mask>0={int(mask_valid.sum())} gt>0={int((gt > 0).sum())} "
-                      f"in_range={int(m.sum())} dv=[{float(lo.min()):.1f},{float(hi.max()):.1f}] "
-                      f"gt[min,med,max]=[{gstat[0]:.1f},{gstat[1]:.1f},{gstat[2]:.1f}]", flush=True)
+            m &= (gt >= dv.amin(dim=1).view(-1, 1, 1)) & (gt <= dv.amax(dim=1).view(-1, 1, 1))
             if m.any():
                 meter.update(scan, (pred[m] - gt[m]).abs())
-        elif i == 0:
-            print(f"[diag] depth_gt is not a tensor: {type(gt).__name__}", flush=True)
 
         if args.fuse:
             d = out_root / "depth" / scan
@@ -496,7 +482,8 @@ def main() -> None:
                 print(f"  {scan:>8s}: abs_err={s['abs_err']:.3f} median={s['median']:.3f} "
                       f"p90={s['p90']:.3f} acc_2mm={s['acc_2mm']:.3f}")
     else:
-        print("\n[depth metrics] test split has no GT depth — skipping metrics (fusion only).")
+        print("\n[depth metrics] test split has no depth GT — evaluated by point-cloud vs STL "
+              "(Fast-DTU-Evaluation), not depth metrics.")
 
     summary = {"ckpt": str(ckpt_path), "split": args.split, "num_views": args.num_views or cfg.train.num_views,
                "resize_scale": args.resize_scale, **result}
