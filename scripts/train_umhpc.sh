@@ -38,10 +38,10 @@ python train.py \
   --profile umhpc \
   --gpus 2 \
   --ddp on \
-  --batch-size 2 \
+  --batch-size 4 \
   --num-views 5 \
   --num-workers 16 \
-  --lr 2e-4 \
+  --lr 3.0e-4 \
   --warmup-steps 1000 \
   --amp on \
   --spre on \
