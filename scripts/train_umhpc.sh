@@ -14,8 +14,13 @@
 set -euo pipefail
 
 cd /scr/user/qinglong/projects/upr-mvs01
+# conda 的 activate.d 脚本 (zzz_cusparselt.sh 等) 会读取 LD_LIBRARY_PATH 这类
+# 未必存在的变量; 在 set -u 下会直接 "unbound variable" 退出。仅在激活期间
+# 关闭 nounset, 激活完成后立刻恢复严格模式。
+set +u
 source ~/.bashrc
 conda activate uprmvs
+set -u
 
 export UPRMVS_MACHINE=umhpc
 export UPRMVS_PROFILE=umhpc
