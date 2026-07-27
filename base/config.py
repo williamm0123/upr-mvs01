@@ -243,7 +243,7 @@ class TrainConfig:
 def _train_local() -> TrainConfig:
     return TrainConfig(
         profile="local",
-        batch_size=4,
+        batch_size=2,
         num_workers=8,
         num_views=5,
         lr=2.0e-4,
@@ -266,10 +266,10 @@ def _train_local() -> TrainConfig:
 def _train_umhpc() -> TrainConfig:
     return TrainConfig(
         profile="umhpc",
-        batch_size=3,
+        batch_size=2,
         num_workers=8,
         num_views=5,
-        lr=2.0e-4,
+        lr=3.0e-4,
         weight_decay=1.0e-4,
         max_steps=30000,
         warmup_steps=1000,
