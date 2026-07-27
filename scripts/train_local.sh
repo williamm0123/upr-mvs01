@@ -25,7 +25,7 @@ PRECOMPUTE_PRIORS=${PRECOMPUTE_PRIORS:-1}
 # 快速验证模型、loss、反向传播和 checkpoint；不会读取真实数据或 prior。
 # 用法：SMOKE=1 bash scripts/train_local.sh
 SMOKE=${SMOKE:-0}
-SMOKE_STEPS=${SMOKE_STEPS:-2}
+SMOKE_STEPS=${SMOKE_STEPS:-100}
 
 cd "$PROJECT_DIR"
 
