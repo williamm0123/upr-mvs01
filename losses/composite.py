@@ -197,5 +197,58 @@ class MVSLoss:
             logs[f"{name}/p_max"] = float(stage["prob"].detach().amax(dim=1).mean())
             logs[f"{name}/interval_mm"] = float(interval[valid].mean()) if valid.any() else 0.0
 
+        # ------------------------- SPRE reliability head ------------------------- #
+        if "spre" in outputs:
+            total = total + self._spre_loss(outputs, batch, depth_gt_full, mask_full, device, logs)
+
         logs["loss"] = float(total.detach())
         return total, logs
+
+    def _spre_loss(self, outputs, batch, depth_gt_full, mask_full, device, logs):
+        """Supervise the learned prior reliability r (see models/spre.py).
+
+        (1) corruption BCE: corrupted prior pixels -> 0, clean valid prior -> 1
+            (labels are free, from data/prior_corruption.py's corrupt mask).
+        (2) prior-error soft target on GT-valid pixels: r -> exp(-(|prior-gt|/tau)^2)
+            so r is calibrated to the prior's *true* local accuracy, not just to
+            synthetic corruption.
+        """
+        spre = outputs["spre"]
+        logits = spre["logits"]                       # [B, h, w]
+        hw = tuple(logits.shape[-2:])
+        r = torch.sigmoid(logits)
+
+        prior = self._to_stage_res(batch["depth_prior"].to(device).float(), hw)
+        gt = self._to_stage_res(depth_gt_full, hw)
+        gt_valid = self._to_stage_res(mask_full, hw) > 0.5
+        prior_valid = prior > 0
+
+        # (1) corruption BCE (autocast-safe with logits)
+        if "prior_corrupt_mask" in batch:
+            cm = self._to_stage_res(batch["prior_corrupt_mask"].to(device).float(), hw).clamp(0.0, 1.0)
+        else:
+            cm = torch.zeros_like(r)
+        target = 1.0 - cm
+        m_bce = prior_valid.float()
+        bce = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
+        l_bce = (bce * m_bce).sum() / m_bce.sum().clamp_min(1.0)
+
+        # (2) prior-error soft target
+        tau = float(self.cfg.spre_soft_tau_mm)
+        t = torch.exp(-(((prior - gt).abs() / tau) ** 2))
+        m_soft = (gt_valid & prior_valid).float()
+        l_soft = ((r - t) ** 2 * m_soft).sum() / m_soft.sum().clamp_min(1.0)
+
+        with torch.no_grad():
+            logs["spre/bce"] = float(l_bce.detach())
+            logs["spre/soft"] = float(l_soft.detach())
+            corrupt = (cm > 0.5) & prior_valid
+            clean = (cm <= 0.5) & prior_valid
+            # r_clean should sit well above r_corrupt — the separation is the
+            # falsifiable signal (a poor-man's AUROC).
+            if corrupt.any():
+                logs["spre/r_corrupt"] = float(r[corrupt].mean())
+            if clean.any():
+                logs["spre/r_clean"] = float(r[clean].mean())
+
+        return self.cfg.w_spre * l_bce + self.cfg.w_spre_soft * l_soft

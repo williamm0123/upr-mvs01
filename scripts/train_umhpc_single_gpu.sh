@@ -17,6 +17,7 @@ LEARNING_RATE=${LEARNING_RATE:-2e-4}
 WARMUP_STEPS=${WARMUP_STEPS:-1000}
 AMP=${AMP:-on}                    # on/off；A100 建议 on
 STEPS=${STEPS:-0}                 # 0=使用 profile 默认值；测试可设 2
+SPRE=${SPRE:-on}                  # on/off：DINOv3 先验可靠度头（SPRE）
 
 # 先验与跑通测试
 BUILD_PRIORS=${BUILD_PRIORS:-auto}
@@ -60,6 +61,7 @@ train_args=(
     --lr "$LEARNING_RATE"
     --warmup-steps "$WARMUP_STEPS"
     --amp "$AMP"
+    --spre "$SPRE"
     --name "$RUN_NAME"
 )
 

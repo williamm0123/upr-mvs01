@@ -33,7 +33,7 @@ python train.py \
   --num-views 5 \
   --build-priors only
 
-# 缓存完整后才启动 DDP；训练进程绝不加载 VGGT/DA3。
+# 缓存完整后才启动 DDP；训练进程只额外加载冻结的 DINOv3（SPRE），绝不加载 VGGT/DA3。
 python train.py \
   --profile umhpc \
   --gpus 2 \
@@ -44,6 +44,7 @@ python train.py \
   --lr 2e-4 \
   --warmup-steps 1000 \
   --amp on \
+  --spre on \
   --steps 0 \
   --build-priors skip \
   --resume auto \

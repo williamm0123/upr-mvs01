@@ -348,6 +348,8 @@ def _synthetic_batch(cfg, device: torch.device, batch_size: int) -> dict:
         "depth_values": dv.unsqueeze(0).repeat(B, 1),
         "depth_gt": torch.rand(B, H, W) * 400 + dmin,
         "mask": (torch.rand(B, H, W) > 0.2).float(),
+        # exercise the SPRE supervision path under --smoke as well
+        "prior_corrupt_mask": (torch.rand(B, H, W) > 0.7),
     }
     batch["extrinsics"][:, 1:, 0, 3] = 5.0
     return {k: v.to(device) for k, v in batch.items()}
@@ -410,6 +412,9 @@ def main_worker(
         prior_overrides["target_h"] = args.prior_target_h
     if prior_overrides:
         cfg = replace(cfg, prior=replace(cfg.prior, **prior_overrides))
+
+    if args.spre is not None:
+        cfg = replace(cfg, spre=replace(cfg.spre, enabled=(args.spre == "on")))
 
     is_ddp = world_size > 1
     is_main = rank == 0
@@ -750,6 +755,8 @@ def main() -> None:
                         help="auto: precompute missing priors; force: recompute all; "
                              "skip: assume cached; only: build missing priors then exit; "
                              "DDP launches must use skip")
+    parser.add_argument("--spre", choices=["on", "off"], default=None,
+                        help="enable/disable the SPRE DINOv3 prior-reliability head (default: config value)")
     parser.add_argument("--smoke", action="store_true", help="run synthetic steps to validate the pipeline")
     parser.add_argument("--smoke-steps", type=int, default=3)
     args = parser.parse_args()

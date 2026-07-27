@@ -97,6 +97,14 @@ class UprMVSNet(nn.Module):
 
         self.num_depths = (cv_cfg.num_depths_stage1, cv_cfg.num_depths_stage2, cv_cfg.num_depths_stage3)
 
+        # Optional SPRE head: a frozen-DINOv3-witnessed learned prior reliability
+        # that replaces the (degenerate) cached conf. Off by default; when off the
+        # network is byte-for-byte the previous model and DINOv3 is never loaded.
+        self.spre_enabled = bool(self.cfg.spre.enabled)
+        if self.spre_enabled:
+            from models.spre import SPRE
+            self.spre = SPRE(self.cfg.spre, self.cfg.dino, self.cfg.paths.dinov3_weights_file)
+
     def _resolve_depth_bounds(self, batch: dict) -> tuple[torch.Tensor, torch.Tensor]:
         if "depth_min" in batch and "depth_max" in batch:
             return batch["depth_min"].float(), batch["depth_max"].float()
@@ -189,9 +197,18 @@ class UprMVSNet(nn.Module):
 
         # ---------- Stage 1 (coarsest, 1/4): dual-branch hypotheses ----------
         feat1 = feats[s1_stride]
+        # SPRE: learned reliability from DINOv3 + online prior stats replaces the
+        # cached conf (which is degenerate). Computed at the stage-1 resolution so
+        # the hypothesis builder's internal resize is a no-op.
+        if self.spre_enabled:
+            spre_logits = self.spre(images[:, 0], depth_prior, target_hw=feat1.shape[-2:])
+            conf_used = torch.sigmoid(spre_logits)
+        else:
+            spre_logits = None
+            conf_used = conf_prior
         s1 = build_stage1_hypotheses(
             depth_prior,
-            conf_prior,
+            conf_used,
             depth_min,
             depth_max,
             self.range_cfg,
@@ -262,5 +279,10 @@ class UprMVSNet(nn.Module):
         depth_full = F.interpolate(
             depth3.unsqueeze(1), size=images.shape[-2:], mode="bilinear", align_corners=False
         ).squeeze(1)
+
+        if self.spre_enabled:
+            stage_out["spre"] = {
+                "logits": spre_logits, "r": conf_used, "hw": tuple(feat1.shape[-2:]),
+            }
 
         return {"depth_full": depth_full, **stage_out}

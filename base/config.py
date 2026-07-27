@@ -161,6 +161,39 @@ class DecoderConfig:
 
 
 @dataclass(frozen=True)
+class DINOConfig:
+    """Frozen DINOv3 ViT-B/16 backbone used as the SPRE 'independent witness'.
+
+    ``layers`` picks the intermediate blocks whose patch tokens SPRE consumes
+    (shallow=more spatial, deep=more semantic — the DPT recipe). ``max_side``
+    is the patch-aligned resize for the ref image before the ViT.
+    """
+    mean: tuple[float, float, float] = (0.485, 0.456, 0.406)
+    std: tuple[float, float, float] = (0.229, 0.224, 0.225)
+    patch_size: int = 16
+    layers: tuple[int, ...] = (4, 7, 11)
+    max_side: int = 512
+
+
+@dataclass(frozen=True)
+class SPREConfig:
+    """Semantic Prior Reliability Estimator (learned, DINOv3-witnessed conf).
+
+    When ``enabled`` the network predicts a per-pixel prior reliability r in
+    [0, 1] from frozen DINOv3 semantic features + online statistics of the
+    (possibly corrupted) depth prior, and r REPLACES the cached ``conf_prior``
+    fed to ``build_stage1_hypotheses``. Supervised by the corruption mask and
+    the prior's true error (see ``losses/composite.py``). ``enabled=False``
+    restores the exact previous behaviour (cached conf, no DINOv3 loaded).
+    """
+    enabled: bool = False
+    proj_dim: int = 64            # DINOv3 (768*len(layers)) -> proj_dim via 1x1 conv
+    hidden: int = 64
+    use_attention: bool = False   # v1 off; v2 self-attention over tokens
+    num_heads: int = 4
+
+
+@dataclass(frozen=True)
 class LossConfig:
     w_ce: float = 1.0         # unified 64-candidate soft-label CE (stage1) / per-stage CE (2,3)
     w_reg: float = 1.0        # interval-normalized Huber on the regressed depth, ALL valid pixels
@@ -168,6 +201,10 @@ class LossConfig:
     w_local_aux: float = 0.25
     edge_reg_boost: float = 2.0
     use_cross_entropy: bool = True
+    # SPRE supervision (only active when the network emits a 'spre' output)
+    w_spre: float = 0.5           # corruption-BCE weight (corrupted prior -> 0, clean -> 1)
+    w_spre_soft: float = 0.5      # prior-error soft-target weight
+    spre_soft_tau_mm: float = 2.0 # exp(-(|prior-gt|/tau)^2) scale, in the depth unit (mm)
 
 
 @dataclass(frozen=True)
@@ -268,6 +305,8 @@ class MVSConfig:
     cost_volume: CostVolumeConfig = field(default_factory=CostVolumeConfig)
     points_alignment: PointsAlignmentConfig = field(default_factory=PointsAlignmentConfig)
     decoder: DecoderConfig = field(default_factory=DecoderConfig)
+    dino: DINOConfig = field(default_factory=DINOConfig)
+    spre: SPREConfig = field(default_factory=SPREConfig)
     loss: LossConfig = field(default_factory=LossConfig)
     stage_weights: StageWeights = field(default_factory=StageWeights)
     train: TrainConfig = field(default_factory=lambda: get_train_config(None))

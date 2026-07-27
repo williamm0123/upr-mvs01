@@ -16,6 +16,7 @@ WARMUP_STEPS=${WARMUP_STEPS:-1000}
 AMP=${AMP:-on}
 STEPS=${STEPS:-0}                       # 0 = 使用 local profile 的 max_steps
 RESUME=${RESUME:-auto}
+SPRE=${SPRE:-on}                        # on/off：DINOv3 先验可靠度头（SPRE）
 
 # 正式训练前在独立 Python 进程中补齐 prior，避免 VGGT/DA3 占用的显存残留
 # 到训练模型初始化阶段。已有完整缓存时检查会很快结束。
@@ -46,6 +47,7 @@ common_args=(
     --lr "$LEARNING_RATE"
     --warmup-steps "$WARMUP_STEPS"
     --amp "$AMP"
+    --spre "$SPRE"
     --name "$RUN_NAME"
 )
 
