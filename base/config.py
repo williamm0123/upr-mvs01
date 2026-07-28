@@ -237,6 +237,48 @@ class StageWeights:
 
 
 @dataclass(frozen=True)
+class AugmentConfig:
+    """Training-time augmentation (train split only; val/test stay deterministic).
+
+    Ported from MVSFormer++ (``config/mvsformer++.json``), which had both and
+    this project had neither — ``data/dtu.py`` shipped with the augment branch
+    commented out.
+
+    Photometric values are their DTU ``aug_args`` verbatim. ``scales`` is a
+    *subset* of their 25-entry list (``data.augment.MVSFORMERPP_SCALES``): their
+    largest is 1024x1280, but their finest cost volume is at stride 8 while
+    stage 3 here runs at stride 1, so the same pixel count costs far more.
+
+    Measured (one fwd+bwd, fp16, RTX 5060 Ti), 448x576: B=1/V=3 9.50 GiB,
+    B=1/V=5 12.48, and 12.98 with SPRE on — i.e. ~1.5 GiB per extra view, ~11.4
+    GiB of activations per sample, and only ~0.5 GiB for SPRE. **Peak memory is
+    set by the LARGEST scale in this list**, and an OOM lands hours into a run,
+    so the ceiling here (640x896, ~52 GiB extrapolated at B=2/V=5 on an 80 GiB
+    A100) deliberately keeps ~35% headroom. The same model puts the previously
+    working B=4/V=5 512x640 run at ~60 GiB, which matches reality. Widen toward
+    ``MVSFORMERPP_SCALES`` only after measuring on the actual card.
+
+    ``resize_range`` is the random over-resize before cropping — at 1.0 the crop
+    fills the frame and cannot move, above it the crop has somewhere to land.
+    """
+
+    photometric: bool = True
+    brightness: float = 0.2
+    contrast: float = 0.1
+    saturation: float = 0.1
+    hue: float = 0.05
+    min_gamma: float = 0.9
+    max_gamma: float = 1.1
+
+    multi_scale: bool = True
+    scales: tuple[tuple[int, int], ...] = (
+        (448, 576), (448, 640), (512, 640), (512, 704), (512, 768),
+        (576, 704), (576, 768), (576, 832), (640, 832), (640, 896),
+    )
+    resize_range: tuple[float, float] = (1.0, 1.2)
+
+
+@dataclass(frozen=True)
 class TrainConfig:
     profile: str = TRAIN_PROFILE
     batch_size: int = 1
@@ -244,7 +286,7 @@ class TrainConfig:
     num_views: int = 3
     lr: float = 1.0e-4
     weight_decay: float = 1.0e-4
-    max_steps: int = 200000
+    max_steps: int = 30000
     warmup_steps: int = 1000
     grad_clip: float = 1.0
     amp: bool = True
@@ -291,7 +333,7 @@ def _train_umhpc() -> TrainConfig:
         batch_size=2,
         num_workers=8,
         num_views=5,
-        lr=3.0e-4,
+        lr=2.0e-4,
         weight_decay=1.0e-4,
         max_steps=30000,
         warmup_steps=1000,
@@ -333,6 +375,7 @@ class MVSConfig:
     spre: SPREConfig = field(default_factory=SPREConfig)
     loss: LossConfig = field(default_factory=LossConfig)
     stage_weights: StageWeights = field(default_factory=StageWeights)
+    augment: AugmentConfig = field(default_factory=AugmentConfig)
     train: TrainConfig = field(default_factory=lambda: get_train_config(None))
 
 

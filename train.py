@@ -625,10 +625,30 @@ def _run_validation(model, loader, device, use_amp, is_ddp) -> dict[str, float]:
     }
 
 
+class _EpochShuffleSampler(torch.utils.data.Sampler):
+    """Non-DDP counterpart of DistributedSampler: a per-epoch permutation that is
+    fixed once ``set_epoch`` is called, so ``list(sampler)`` is exactly what the
+    loader will draw (``shuffle=True`` re-draws and cannot be inspected)."""
+
+    def __init__(self, n: int, seed: int) -> None:
+        self.n, self.seed = int(n), int(seed)
+        self.order = list(range(self.n))
+
+    def set_epoch(self, epoch: int) -> None:
+        self.order = np.random.default_rng(self.seed + int(epoch)).permutation(self.n).tolist()
+
+    def __iter__(self):
+        return iter(self.order)
+
+    def __len__(self) -> int:
+        return len(self.order)
+
+
 def _run_training(model, loss_fn, optimizer, scaler, cfg, device, args, world_size, rank, is_ddp, logger, is_main, start_step=0):
     from torch.utils.data import DataLoader
     from torch.utils.data.distributed import DistributedSampler
 
+    from data.augment import PhotometricAug
     from data.dtu import DTUMVSDataset
 
     dataset = DTUMVSDataset(
@@ -638,14 +658,29 @@ def _run_training(model, loss_fn, optimizer, scaler, cfg, device, args, world_si
         mode="train",
         prior_corruption_prob=cfg.train.prior_corruption_prob,
         use_src_weights=cfg.cost_volume.use_src_weights,
+        # Augmentation is train-only: val must stay deterministic or best.pth
+        # gets selected on a moving target.
+        aug=PhotometricAug(
+            brightness=cfg.augment.brightness, contrast=cfg.augment.contrast,
+            saturation=cfg.augment.saturation, hue=cfg.augment.hue,
+            min_gamma=cfg.augment.min_gamma, max_gamma=cfg.augment.max_gamma,
+        ) if cfg.augment.photometric else None,
+        scales=cfg.augment.scales if cfg.augment.multi_scale else (),
+        resize_range=cfg.augment.resize_range,
     )
     if len(dataset) == 0:
         raise RuntimeError(f"training dataset is empty — check {cfg.paths.train_list_file}")
-    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True, drop_last=True) if is_ddp else None
+    # A sampler on both paths (not shuffle=True) so the epoch's draw order can be
+    # read before the loader consumes it — multi-scale needs to bucket that exact
+    # order into per-batch resolutions.
+    sampler = (
+        DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True, drop_last=True)
+        if is_ddp else _EpochShuffleSampler(len(dataset), cfg.train.seed)
+    )
     loader = DataLoader(
         dataset,
         batch_size=cfg.train.batch_size,
-        shuffle=(sampler is None),
+        shuffle=False,
         sampler=sampler,
         num_workers=cfg.train.num_workers,
         collate_fn=_collate,
@@ -687,8 +722,12 @@ def _run_training(model, loss_fn, optimizer, scaler, cfg, device, args, world_si
     step = start_step
     epoch = start_step // max(len(loader), 1)
     while step < max_steps:
-        if sampler is not None:
-            sampler.set_epoch(epoch)
+        sampler.set_epoch(epoch)
+        # Multi-scale: bucket this epoch's sampling order so every batch shares
+        # one resolution (collate cannot stack mixed H x W). Must run AFTER
+        # set_epoch — the order it buckets is the order the loader will draw —
+        # and before iterating, so forked workers inherit the plan.
+        dataset.reset_scale_plan(list(sampler), cfg.train.batch_size)
         for batch in loader:
             if step >= max_steps:
                 break

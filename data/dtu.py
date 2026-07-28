@@ -11,6 +11,7 @@ from .io import read_pfm
 import models.sfm as sfm
 from models import pre_prior
 from base.config import ProjectPaths
+from .augment import PhotometricAug, resize_scale_for_crop
 from .prior_corruption import corrupt_prior
 
 class DTUMVSDataset(Dataset):
@@ -41,6 +42,16 @@ class DTUMVSDataset(Dataset):
         # nviews 不一致时长度对不上, collate 会报错。默认忽略 (网络 use_src_weights
         # 也默认 False), 需要时显式打开并保证缓存 view 数一致。
         self.use_src_weights = bool(kwargs.get('use_src_weights', False))
+
+        # --- 训练增强 (仅 train; val/test 必须确定性, 否则 best.pth 不可比) ---
+        # aug: data.augment.PhotometricAug 或 None
+        # scales / resize_range: 多尺度; 空 scales = 关闭, 固定 height x width
+        self.aug = kwargs.get('aug') if mode == 'train' else None
+        self.scales = tuple(kwargs.get('scales') or ()) if mode == 'train' else ()
+        self.resize_range = tuple(kwargs.get('resize_range', (1.0, 1.0)))
+        # idx -> barrel id; 同一个 batch 的样本共用一个 barrel, 因而共用一个尺度
+        # (collate 要求 batch 内 H x W 一致)。由 reset_scale_plan 每个 epoch 重建。
+        self._barrel: dict[int, int] = {}
         self.kwargs = kwargs
         # self.center_crop_size = kwargs.get('center_crop_size', None)
         # if mode != 'train':
@@ -129,19 +140,46 @@ class DTUMVSDataset(Dataset):
 
         return img, depth, output_intrinsics, mask
 
-    def pick_crop_origin(self, h, w):
+    def reset_scale_plan(self, order, batch_size: int) -> None:
+        """按 sampler 这一 epoch 的取样顺序把样本分桶, 每 batch_size 个一桶。
+
+        DataLoader 把 sampler 连续吐出的 batch_size 个索引组成一个 batch, 所以
+        同桶 = 同 batch, 桶号决定尺度就保证了 batch 内分辨率一致 (collate 的硬
+        要求)。这是 MVSFormer++ ``reset_dataset`` 的做法。DDP 下每个 rank 各自
+        用自己那份索引建表, 但桶号是 rank 内的序号, 因此同一步各 rank 拿到同一
+        个尺度, 不会出现负载倾斜。
+        """
+        if not self.scales:
+            return
+        self._barrel = {int(sid): i // max(batch_size, 1) for i, sid in enumerate(order)}
+
+    def sample_geometry(self, idx):
+        """该样本的 (crop_h, crop_w, resize_scale)。
+
+        无多尺度时退化为固定的 self.height/width/resize_scale。
+        """
+        if not self.scales:
+            return self.height, self.width, self.resize_scale
+        crop_h, crop_w = self.scales[self._barrel.get(int(idx), int(idx)) % len(self.scales)]
+        lo, hi = self.resize_range
+        enlarge = lo + float(np.random.rand()) * (hi - lo)
+        # DTU Rectified_raw 恒为 1200x1600
+        return crop_h, crop_w, resize_scale_for_crop(crop_h, crop_w, 1200, 1600, enlarge)
+
+    def pick_crop_origin(self, h, w, crop_h=None, crop_w=None):
         """选裁剪左上角 (x0, y0): 训练随机, 其余居中。同一 sample 内只调用一次,
         让 ref/src/depth/sfm_depth/mask 共用同一窗口。"""
-        # assert h >= self.height and w >= self.width, \
-        #     f"裁剪 {self.height}x{self.width} 超出图像 {h}x{w}，请调大 resize_scale"
-        max_y, max_x = h - self.height, w - self.width
+        crop_h = self.height if crop_h is None else crop_h
+        crop_w = self.width if crop_w is None else crop_w
+        max_y, max_x = max(h - crop_h, 0), max(w - crop_w, 0)
         if self.random_crop:
             return int(np.random.randint(0, max_x + 1)), int(np.random.randint(0, max_y + 1))
         return max_x // 2, max_y // 2
 
-    def crop_at(self, img, intrinsic, x0, y0, depth=None, mask=None):
-        """在给定左上角 (x0, y0) 处裁剪到 (self.width, self.height), 并平移主点。"""
-        height, width = self.height, self.width
+    def crop_at(self, img, intrinsic, x0, y0, depth=None, mask=None, crop_h=None, crop_w=None):
+        """在给定左上角 (x0, y0) 处裁剪到 (crop_w, crop_h), 并平移主点。"""
+        height = self.height if crop_h is None else crop_h
+        width = self.width if crop_w is None else crop_w
         img = img[y0:y0 + height, x0:x0 + width]
         K = intrinsic.copy().astype(np.float32)
         K[0, 2] -= x0   # cx：裁剪只平移主点
@@ -159,12 +197,17 @@ class DTUMVSDataset(Dataset):
         scan, light_idx, ref_view, _ = self.metas[idx]
         return self.prior_cache_dir / scan / f"prior_{ref_view:0>4}_{light_idx}.npz"
 
-    def precrop_inputs(self, idx):
+    def precrop_inputs(self, idx, resize_scale=None, aug_params=None):
         """Pre-crop multi-view inputs (before random crop), shared by both
-        __getitem__ and the offline prior precompute so the two stay aligned."""
+        __getitem__ and the offline prior precompute so the two stay aligned.
+
+        ``resize_scale`` / ``aug_params`` default to off so the prior builder
+        keeps producing one deterministic cache entry per (scan, view) — only
+        __getitem__ varies them per sample.
+        """
         scan, light_idx, ref_view, src_views = self.metas[idx]
         view_ids = [ref_view] + src_views[:(self.nviews - 1)]
-        resize_scale = self.resize_scale
+        resize_scale = self.resize_scale if resize_scale is None else resize_scale
 
         resized_imgs, resized_intrinsics, extrinsics = [], [], []
         depth_hr = mask_hr = None
@@ -176,6 +219,10 @@ class DTUMVSDataset(Dataset):
             proj_mat_filename = os.path.join(self.datapath, 'Cameras/{:0>8}_cam.txt').format(view_id)
 
             img = np.asarray(self.read_img(img_filename))
+            # 光度增强在 resize 之前、每个视角用同一组参数: plane sweep 依赖视角
+            # 间的光度一致性, 逐视角独立抖动会直接破坏 cost volume 要测的信号。
+            if aug_params is not None:
+                img = PhotometricAug.apply(img, aug_params)
             intrinsic, extrinsic, depth_min, depth_interval = self.read_camera_file(proj_mat_filename)
 
             if i == 0:
@@ -212,7 +259,9 @@ class DTUMVSDataset(Dataset):
         return cv2.resize(arr, (w, h), interpolation=interp)
 
     def __getitem__(self, idx):
-        pc = self.precrop_inputs(idx)
+        crop_h, crop_w, resize_scale = self.sample_geometry(idx)
+        aug_params = self.aug.draw(np.random.default_rng()) if self.aug is not None else None
+        pc = self.precrop_inputs(idx, resize_scale=resize_scale, aug_params=aug_params)
         resized_imgs = pc["views_np"]
         resized_intrinsics = pc["intrinsics"]
         extrinsics = pc["extrinsics"]
@@ -240,9 +289,9 @@ class DTUMVSDataset(Dataset):
         # 默认忽略, 避免变长向量在 collate 时 stack 失败。
         src_weights = prior["src_weights"] if self.use_src_weights else None
 
-        # --- 裁剪到 (640x512): 所有视角/深度/prior 共用同一窗口 ---
-        crop_x, crop_y = self.pick_crop_origin(h0, w0)
-        y1, x1 = crop_y + self.height, crop_x + self.width
+        # --- 裁剪到 (crop_w x crop_h): 所有视角/深度/prior 共用同一窗口 ---
+        crop_x, crop_y = self.pick_crop_origin(h0, w0, crop_h, crop_w)
+        y1, x1 = crop_y + crop_h, crop_x + crop_w
 
         images, intrinsics, projection_matrices = [], [], []
         # depth_gt = mask_gt = sfm_depth_crop = None
@@ -250,7 +299,8 @@ class DTUMVSDataset(Dataset):
         for i in range(num_v):
             img, K, depth, mask = self.crop_at(
                 resized_imgs[i], resized_intrinsics[i], crop_x, crop_y,
-                depth_hr if i == 0 else None, mask_hr if i == 0 else None)
+                depth_hr if i == 0 else None, mask_hr if i == 0 else None,
+                crop_h=crop_h, crop_w=crop_w)
             if i == 0:
                 depth_gt, mask_gt = depth, mask
                 # _, _, sfm_depth_crop, _ = self.crop_at(
