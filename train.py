@@ -141,8 +141,15 @@ class WindowedMeter:
     """
 
     # sums layout: [err, n, hit2, hit4, hit8, prior_err, prior_n,
-    #               corrupt_err, corrupt_n, clean_err, clean_n]
-    N_SLOTS = 11
+    #               corrupt_err, corrupt_n, clean_err, clean_n,
+    #               body2_err, body4_err, body8_err]
+    # body{n}_err sums the error of pixels already within n mm; divided by the
+    # matching hit{n} count it gives the *precision on matched pixels*, which the
+    # plain mean cannot show (a few percent of far-off pixels dominate it). This
+    # is MVSFormer++'s abs_depth_thres0-{n}mm_error — their DTU-test value is
+    # 0.4920 mm at 2 mm — and it is the only way to tell a refinement gain from
+    # an outlier-count gain.
+    N_SLOTS = 14
 
     def __init__(self, device: torch.device, is_ddp: bool) -> None:
         self.device = device
@@ -168,12 +175,14 @@ class WindowedMeter:
         m = mask.bool() & (gt > 0)
         if m.any():
             err = (pred.float() - gt.float()).abs()
-            self.sums[0] += err[m].sum()
+            e = err[m]
+            self.sums[0] += e.sum()
             self.sums[1] += m.sum()
-            self.sums[2] += (err[m] < 2).sum()
-            self.sums[3] += (err[m] < 4).sum()
-            self.sums[4] += (err[m] < 8).sum()
-            self.batch_means.append(float(err[m].mean()))
+            for i, t in enumerate((2.0, 4.0, 8.0)):
+                hit = e < t
+                self.sums[2 + i] += hit.sum()
+                self.sums[11 + i] += e[hit].sum()
+            self.batch_means.append(float(e.mean()))
             if prior is not None:
                 pm = m & (prior > 0)
                 if pm.any():
@@ -205,6 +214,12 @@ class WindowedMeter:
             "acc_2mm": float(s[2] / n),
             "acc_4mm": float(s[3] / n),
             "acc_8mm": float(s[4] / n),
+            # precision on already-matched pixels (vs MVSFormer++ 0.4920 at 2mm)
+            "abs_err_body_2mm": float(s[11] / s[2].clamp(min=1)),
+            "abs_err_body_4mm": float(s[12] / s[3].clamp(min=1)),
+            # the >8mm tail, measured directly instead of back-solved from the mean
+            "abs_err_tail_8mm": float((s[0] - s[13]) / (n - s[4]).clamp(min=1)),
+            "tail_frac_8mm": float((n - s[4]) / n),
         }
         if s[6] > 0:
             metrics["prior_abs_err"] = float(s[5] / s[6])
@@ -400,6 +415,8 @@ def main_worker(
         train_overrides["lr"] = args.lr
     if args.warmup_steps is not None:
         train_overrides["warmup_steps"] = args.warmup_steps
+    if args.val_interval is not None:
+        train_overrides["val_interval"] = args.val_interval
     if args.amp is not None:
         train_overrides["amp"] = args.amp == "on"
     if train_overrides:
@@ -553,8 +570,9 @@ def _run_validation(model, loader, device, use_amp, is_ddp) -> dict[str, float]:
     all-reduced, so the result is identical on every rank (and SyncBN-safe,
     should it ever be enabled)."""
     model.eval()
-    # [abs_err_sum, pixel_count, hits<2mm, hits<4mm, hits<8mm]
-    stats = torch.zeros(5, device=device, dtype=torch.float64)
+    # [abs_err_sum, pixel_count, hits<2mm, hits<4mm, hits<8mm,
+    #  body2_err_sum, body4_err_sum, body8_err_sum]  (see WindowedMeter for why)
+    stats = torch.zeros(8, device=device, dtype=torch.float64)
     for batch in loader:
         batch = {k: (v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v)
                  for k, v in batch.items()}
@@ -570,9 +588,10 @@ def _run_validation(model, loader, device, use_amp, is_ddp) -> dict[str, float]:
             err = (pred[m] - gt[m]).abs()
             stats[0] += err.sum()
             stats[1] += m.sum()
-            stats[2] += (err < 2).sum()
-            stats[3] += (err < 4).sum()
-            stats[4] += (err < 8).sum()
+            for i, t in enumerate((2.0, 4.0, 8.0)):
+                hit = err < t
+                stats[2 + i] += hit.sum()
+                stats[5 + i] += err[hit].sum()
     if is_ddp:
         dist.all_reduce(stats)
     model.train()
@@ -587,6 +606,10 @@ def _run_validation(model, loader, device, use_amp, is_ddp) -> dict[str, float]:
         "acc_2mm": float(stats[2] / n),
         "acc_4mm": float(stats[3] / n),
         "acc_8mm": float(stats[4] / n),
+        "abs_err_body_2mm": float(stats[5] / stats[2].clamp(min=1)),
+        "abs_err_body_4mm": float(stats[6] / stats[3].clamp(min=1)),
+        "abs_err_tail_8mm": float((stats[0] - stats[7]) / (n - stats[4]).clamp(min=1)),
+        "tail_frac_8mm": float((n - stats[4]) / n),
     }
 
 
@@ -758,6 +781,7 @@ def main() -> None:
     parser.add_argument("--num-views", type=int, default=None, help="number of MVS input views override")
     parser.add_argument("--lr", type=float, default=None, help="learning-rate override")
     parser.add_argument("--warmup-steps", type=int, default=None, help="LR warmup steps override")
+    parser.add_argument("--val-interval", type=int, default=None, help="steps between validation runs")
     parser.add_argument("--amp", choices=["on", "off"], default=None, help="AMP override")
     parser.add_argument("--prior-target-w", type=int, default=None,
                         help="VGGT/DA3 prior width override (default 518; must be a multiple of 14). "

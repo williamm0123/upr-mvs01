@@ -20,7 +20,7 @@ STEPS=${STEPS:-0}                 # 0=使用 profile 默认值；测试可设 2
 SPRE=${SPRE:-on}                  # on/off：DINOv3 先验可靠度头（SPRE）
 
 # 先验与跑通测试
-BUILD_PRIORS=${BUILD_PRIORS:-auto}
+BUILD_PRIORS=${BUILD_PRIORS:-auto}git
 # BUILD_PRIORS: auto=补齐缺失先验，force=全部重算，skip=要求缓存已存在，
 #               only=只构建先验然后退出（换 val 列表后先跑一次这个）
 SMOKE=${SMOKE:-0}                 # 1=合成数据跑通测试；0=真实数据训练

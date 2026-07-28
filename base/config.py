@@ -279,7 +279,9 @@ def _train_umhpc() -> TrainConfig:
         log_interval=50,
         vis_interval=100,
         vis_max_views=5,
-        val_interval=2000,
+        # 500 not 2000: at 2000 a 3k-step probe yields a single val point, which
+        # cannot show a trend. Overridable with --val-interval.
+        val_interval=500,
         ckpt_interval=2000,
         devices=(0, 1, 2, 3),
         distributed=True,
