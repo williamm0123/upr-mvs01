@@ -8,7 +8,21 @@ from typing import Literal
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-MACHINE: Literal["ubuntu", "umhpc"] = os.environ.get("UPRMVS_MACHINE", "ubuntu")  # type: ignore[assignment]
+def _detect_machine() -> str:
+    """UPRMVS_MACHINE wins; otherwise infer from where this checkout lives.
+
+    Only scripts/train_*.sh export the variable, so anything run bare (test.py,
+    eval_ablation.py) used to fall back to "ubuntu" and resolve the laptop's
+    paths while sitting on the cluster — a confusing FileNotFoundError on
+    lists/dtu/*.txt rather than an obvious misconfiguration.
+    """
+    env = os.environ.get("UPRMVS_MACHINE")
+    if env:
+        return env
+    return "umhpc" if str(REPO_ROOT).startswith("/scr/") else "ubuntu"
+
+
+MACHINE: Literal["ubuntu", "umhpc"] = _detect_machine()  # type: ignore[assignment]
 
 TRAIN_PROFILE: Literal["local", "umhpc"] = os.environ.get(  # type: ignore[assignment]
     "UPRMVS_PROFILE", "umhpc" if MACHINE == "umhpc" else "local"
@@ -16,11 +30,13 @@ TRAIN_PROFILE: Literal["local", "umhpc"] = os.environ.get(  # type: ignore[assig
 
 
 def _default_paths() -> dict[str, Path]:
+    # project_path is always this checkout: lists/, log/, caches and outputs are
+    # inside the repo, so deriving it from REPO_ROOT keeps them correct even when
+    # MACHINE is wrong. (Same value as the old hard-coded paths on both boxes.)
+    project_path = REPO_ROOT
     if MACHINE == "umhpc":
-        project_path = Path("/scr/user/qinglong/projects/upr-mvs01")
         data_path = Path("/scr/user/qinglong/dataset")
     else:
-        project_path = Path("/home/william/project/uprmvs01")
         data_path = Path("/home/william/project/dataset")
 
     return {
