@@ -117,33 +117,8 @@ def homography_warp_features(
     return warped.view(B, D, C, H, W).permute(0, 2, 1, 3, 4).contiguous()
 
 
-def soft_argmin(prob_volume: torch.Tensor, depth_hypos: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    if depth_hypos.dim() == 2:
-        B, D = depth_hypos.shape
-        depth_hypos = depth_hypos.view(B, D, 1, 1)
-    depth = (prob_volume * depth_hypos).sum(dim=1)
-    var = (prob_volume * (depth_hypos - depth.unsqueeze(1)) ** 2).sum(dim=1)
-    sigma = torch.sqrt(var.clamp(min=1e-12))
-    return depth, sigma
 
 
-def depth_to_normal(depth: torch.Tensor, K: torch.Tensor) -> torch.Tensor:
-    B, H, W = depth.shape
-    K_inv = torch.inverse(K)
-    pad = F.pad(depth.unsqueeze(1), (1, 1, 1, 1), mode="replicate").squeeze(1)
-    dx = (pad[:, 1:-1, 2:] - pad[:, 1:-1, :-2]) * 0.5
-    dy = (pad[:, 2:, 1:-1] - pad[:, :-2, 1:-1]) * 0.5
-    grid = make_pixel_grid(H, W, depth.device, depth.dtype).view(3, -1).unsqueeze(0).expand(B, -1, -1)
-    rays = torch.bmm(K_inv, grid).view(B, 3, H, W)
-    pts = rays * depth.unsqueeze(1)
-    px = torch.zeros_like(pts)
-    py = torch.zeros_like(pts)
-    px[:, :, :, 1:-1] = (pts[:, :, :, 2:] - pts[:, :, :, :-2]) * 0.5
-    py[:, :, 1:-1] = (pts[:, :, 2:] - pts[:, :, :-2]) * 0.5
-    n = torch.cross(px, py, dim=1)
-    n = F.normalize(n, dim=1, eps=1e-6)
-    _ = dx + dy
-    return n
 
 
 def reproject_with_depth(
@@ -161,38 +136,8 @@ def reproject_with_depth(
     return uv.view(B, 2, H, W)
 
 
-def warp_image_by_depth(
-    src_image: torch.Tensor,
-    depth_ref: torch.Tensor,
-    K_ref: torch.Tensor,
-    E_ref: torch.Tensor,
-    K_src: torch.Tensor,
-    E_src: torch.Tensor,
-) -> torch.Tensor:
-    B, _, H, W = src_image.shape
-    uv = reproject_with_depth(depth_ref, K_ref, E_ref, K_src, E_src)
-    uv_x = uv[:, 0] / (W - 1) * 2.0 - 1.0
-    uv_y = uv[:, 1] / (H - 1) * 2.0 - 1.0
-    grid = torch.stack([uv_x, uv_y], dim=-1)
-    return F.grid_sample(
-        src_image,
-        grid,
-        mode="bilinear",
-        padding_mode="zeros",
-        align_corners=True,
-    )
 
 
-def make_depth_hypotheses(
-    depth_center: torch.Tensor,
-    half_range: torch.Tensor,
-    num_depths: int,
-) -> torch.Tensor:
-    B, H, W = depth_center.shape
-    device = depth_center.device
-    dtype = depth_center.dtype
-    steps = torch.linspace(-1.0, 1.0, num_depths, device=device, dtype=dtype)
-    return depth_center.unsqueeze(1) + half_range.unsqueeze(1) * steps.view(1, num_depths, 1, 1)
 
 
 def make_depth_hypotheses_global(

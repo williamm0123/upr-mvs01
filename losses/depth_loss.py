@@ -4,16 +4,6 @@ import torch
 import torch.nn.functional as F
 
 
-def depth_l1_loss(
-    depth_pred: torch.Tensor,
-    depth_gt: torch.Tensor,
-    mask: torch.Tensor,
-) -> torch.Tensor:
-    m = mask.bool() & (depth_gt > 0)
-    if not m.any():
-        return depth_pred.new_zeros(())
-    diff = (depth_pred - depth_gt).abs()
-    return diff[m].mean()
 
 
 def normalized_huber_loss(
@@ -89,9 +79,5 @@ def soft_label_cross_entropy(
 
 
 # Backwards-compatible aliases (older scripts import these names).
-def depth_smooth_l1_loss(depth_pred, depth_gt, mask, interval, err_clamp: float = 0.0):
-    return normalized_huber_loss(depth_pred, depth_gt, mask, interval)
 
 
-def depth_cross_entropy_loss(logits, depth_hypos, depth_gt, mask):
-    return soft_label_cross_entropy(logits, depth_hypos, depth_gt, mask)

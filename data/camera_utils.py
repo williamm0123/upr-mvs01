@@ -9,109 +9,17 @@ import matplotlib.pyplot as plt
 
 
 
-def scale_intrinsics(K: np.ndarray, scale_x: float, scale_y: float) -> np.ndarray:
-    out = np.asarray(K, dtype=np.float64).copy()
-    out[0, 0] *= scale_x
-    out[0, 2] = (out[0, 2] + 0.5) * scale_x - 0.5
-    out[1, 1] *= scale_y
-    out[1, 2] = (out[1, 2] + 0.5) * scale_y - 0.5
-    out[0, 1] *= scale_x
-    out[1, 0] *= scale_y
-    return out
-
-def image_resize(img, depth, intrinsic, mask, resize_scale):
-    ori_h, ori_w, _ = img.shape
-    img = cv2.resize(img, (int(ori_w * resize_scale), int(ori_h * resize_scale)), interpolation=cv2.INTER_AREA)
-    h, w, _ = img.shape
-
-    output_intrinsics = intrinsic.copy()
-    output_intrinsics[0, :] *= resize_scale
-    output_intrinsics[1, :] *= resize_scale
-
-    if depth is not None:
-        depth = cv2.resize(depth, (int(ori_w * resize_scale), int(ori_h * resize_scale)), interpolation=cv2.INTER_NEAREST)
-
-    if mask is not None:
-        mask = cv2.resize(mask, (int(ori_w * resize_scale), int(ori_h * resize_scale)), interpolation=cv2.INTER_NEAREST)
-
-    return img, depth, output_intrinsics, mask
-
-def image_crop(img, depth,intrinsic, mask, target_width, target_height):
-
-    h, w = img.shape[:2]
-    y0 = (h - target_height) // 2
-    x0 = (w - target_width) // 2
-
-    cropped_img = img[y0:y0 + target_height, x0:x0 + target_width]
-    cropped_depth = depth[y0:y0 + target_height, x0:x0 + target_width] if depth is not None else None
-    cropped_mask = mask[y0:y0 + target_height, x0:x0 + target_width] if mask is not None else None
-    # 裁剪只平移主点,焦距不变
-    new_intrinsic = intrinsic.copy().astype(np.float32)
-    new_intrinsic[0, 2] -= x0   # cx
-    new_intrinsic[1, 2] -= y0   # cy
-
-    return cropped_img, cropped_depth, new_intrinsic, cropped_mask
-
-def crop_intrinsics(K: np.ndarray, crop_x: int, crop_y: int) -> np.ndarray:
-    out = np.asarray(K, dtype=np.float64).copy()
-    out[0, 2] -= crop_x
-    out[1, 2] -= crop_y
-    return out
 
 
-def resize_and_crop_image(
-    image: np.ndarray,
-    K: np.ndarray,
-    target_h: int,
-    target_w: int,
-    interp: int = cv2.INTER_AREA,
-) -> tuple[np.ndarray, np.ndarray, dict]:
-    src_h, src_w = image.shape[:2]
-    scale = max(target_h / src_h, target_w / src_w)
-    new_w = int(round(src_w * scale))
-    new_h = int(round(src_h * scale))
-    resized = cv2.resize(image, (new_w, new_h), interpolation=interp)
-
-    crop_x = (new_w - target_w) // 2
-    crop_y = (new_h - target_h) // 2
-    out = resized[crop_y : crop_y + target_h, crop_x : crop_x + target_w]
-
-    K_out = scale_intrinsics(K, scale, scale)
-    K_out = crop_intrinsics(K_out, crop_x, crop_y)
-    info = {"scale": scale, "crop_x": crop_x, "crop_y": crop_y, "resized_hw": (new_h, new_w)}
-    return out, K_out.astype(np.float32), info
 
 
-def resize_and_crop_depth(
-    depth: np.ndarray,
-    target_h: int,
-    target_w: int,
-    info: dict,
-) -> np.ndarray:
-    new_h, new_w = info["resized_hw"]
-    resized = cv2.resize(depth.astype(np.float32), (new_w, new_h), interpolation=cv2.INTER_NEAREST)
-    crop_x = info["crop_x"]
-    crop_y = info["crop_y"]
-    return resized[crop_y : crop_y + target_h, crop_x : crop_x + target_w]
 
 
-def resize_and_crop_mask(
-    mask: np.ndarray,
-    target_h: int,
-    target_w: int,
-    info: dict,
-) -> np.ndarray:
-    new_h, new_w = info["resized_hw"]
-    resized = cv2.resize(mask.astype(np.float32), (new_w, new_h), interpolation=cv2.INTER_NEAREST)
-    crop_x = info["crop_x"]
-    crop_y = info["crop_y"]
-    return resized[crop_y : crop_y + target_h, crop_x : crop_x + target_w]
 
 
-def build_projection_matrix(K: np.ndarray, extrinsic: np.ndarray) -> np.ndarray:
-    proj = np.eye(4, dtype=np.float32)
-    proj[:3, :4] = (K @ extrinsic[:3, :4]).astype(np.float32)
-    return proj
+
+
+
 
 
 def backproject_depth_to_world_points(
@@ -237,87 +145,6 @@ def save_depth_png(
 
 
 
-def save_multi_images(
-    images: Sequence[np.ndarray],
-    save_path: str,
-    rows: int | None = None,
-    cols: int | None = None,
-    titles: Sequence[str] | None = None,
-    cell_wh: tuple[int, int] = (518, 420),
-    pad: int = 8,
-    bg: int = 255,
-) -> np.ndarray:
-    """多图拼成网格保存。
-
-    自动识别每张图的类型并转成可显示的 BGR:
-      - uint8                : 原样(灰度自动转 3 通道)
-      - float 2D             : 深度图,按 2/98 百分位归一化 + TURBO 上色,无效值置黑
-      - float HxWx3 且有负值  : 法向/差值,按最大绝对值对称映射到 [0,255](0 → 灰)
-      - float HxWx3 且非负    : 当作 0-1 或 0-255 的 RGB
-
-    rows/cols 任一为 None 时自动按接近正方形排布;cell_wh 为每格 (宽, 高)。
-    """
-    def to_bgr(img: np.ndarray) -> np.ndarray:
-        a = np.asarray(img)
-        if a.ndim == 3 and a.shape[2] == 1:
-            a = a[..., 0]
-
-        # uint8:原样
-        if a.dtype == np.uint8:
-            return cv2.cvtColor(a, cv2.COLOR_GRAY2BGR) if a.ndim == 2 else a[..., :3]
-
-        # float 单通道 -> 深度图
-        if a.ndim == 2:
-            finite = np.isfinite(a) & (a > 0)
-            out = np.zeros((*a.shape, 3), np.uint8)
-            if finite.any():
-                lo, hi = np.percentile(a[finite], (2.0, 98.0))
-                norm = np.zeros_like(a, np.float32)
-                norm[finite] = np.clip((a[finite] - lo) / max(float(hi - lo), 1e-6), 0, 1)
-                out = cv2.applyColorMap((norm * 255).astype(np.uint8), cv2.COLORMAP_TURBO)
-                out[~finite] = 0
-            return out
-
-        # float 3 通道
-        a = np.nan_to_num(a.astype(np.float32))
-        if a.min() < -1e-3:  # 法向 / 差值:对称映射,0 居中(灰)
-            scale = max(float(np.percentile(np.abs(a), 99.0)), 1e-6)
-            vis = np.clip(a / (2 * scale) + 0.5, 0, 1)
-        else:                # 普通 RGB
-            vis = np.clip(a if a.max() <= 1.0 + 1e-6 else a / 255.0, 0, 1)
-        return (vis[..., ::-1] * 255).astype(np.uint8)  # RGB -> BGR
-
-    n = len(images)
-    if rows is None or cols is None:
-        cols = cols or int(np.ceil(np.sqrt(n)))
-        rows = rows or int(np.ceil(n / cols))
-    if rows * cols < n:
-        raise ValueError(f"网格容量不足: {rows}x{cols} < {n}")
-
-    cw, ch = cell_wh
-    bar = 28 if titles is not None else 0
-    tiles = []
-    for i in range(n):
-        t = cv2.resize(to_bgr(images[i]), (cw, ch), interpolation=cv2.INTER_NEAREST)
-        if titles is not None:
-            head = np.full((bar, cw, 3), 40, np.uint8)
-            cv2.putText(head, str(titles[i]), (6, bar - 9), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.55, (255, 255, 255), 1, cv2.LINE_AA)
-            t = np.vstack([head, t])
-        tiles.append(t)
-
-    th, tw = ch + bar, cw
-    canvas = np.full((rows * th + (rows + 1) * pad, cols * tw + (cols + 1) * pad, 3), bg, np.uint8)
-    for idx in range(n):
-        r, c = divmod(idx, cols)
-        y, x = pad + r * (th + pad), pad + c * (tw + pad)
-        canvas[y:y + th, x:x + tw] = tiles[idx]
-
-    parent = Path(save_path).parent
-    if parent and not parent.exists():
-        parent.mkdir(parents=True, exist_ok=True)
-    cv2.imwrite(save_path, canvas)
-    return canvas
 
 def save_pointcloud_ply(
     points: np.ndarray,                # [N, 3] 或 [V, H, W, 3] (来自 pred["world_points"])
@@ -368,54 +195,9 @@ def save_pointcloud_ply(
                 f.write(f"{p[0]} {p[1]} {p[2]} {int(c[0])} {int(c[1])} {int(c[2])}\n")
     print(f"Saved {n} points to {path}")
     return path
-def camera_center_world(extrinsic: np.ndarray) -> np.ndarray:
-    R = extrinsic[:3, :3]
-    t = extrinsic[:3, 3]
-    return (-R.T @ t).astype(np.float32)
 
 
 
 
-def downsample_mask(mask: np.ndarray, stride: int) -> np.ndarray:
-    if stride == 1:
-        return mask.astype(np.float32)
-    h, w = mask.shape[-2:]
-    out = cv2.resize(
-        mask.astype(np.float32),
-        (w // stride, h // stride),
-        interpolation=cv2.INTER_NEAREST,
-    )
-    return out
 
 
-def visualize_depth_3d(depth, stride=1, invalid_value=0.0, cmap='viridis',
-                       point_size=1.0, invert_z=False, elev=60, azim=-90):
-  
-    depth = np.asarray(depth, dtype=np.float32)
-    H, W = depth.shape
-
-    vs, us = np.mgrid[0:H:stride, 0:W:stride]
-    zs = depth[0:H:stride, 0:W:stride]
-    u, v, z = us.ravel(), vs.ravel(), zs.ravel()
-
-    # 过滤无效点（NaN / inf / invalid_value）
-    mask = np.isfinite(z)
-    if invalid_value is not None:
-        mask &= (z != invalid_value)
-    u, v, z = u[mask], v[mask], z[mask]
-
-    fig = plt.figure(figsize=(10, 8))
-    ax = fig.add_subplot(111, projection='3d')
-    p = ax.scatter(u, v, z, c=z, cmap=cmap, s=point_size, marker='.')
-
-    ax.set_xlabel('u (col)')
-    ax.set_ylabel('v (row)')
-    ax.set_zlabel('depth')
-    ax.invert_yaxis()          # 图像坐标 v 向下，保持与图像方向一致
-    if invert_z:
-        ax.invert_zaxis()
-    ax.view_init(elev=elev, azim=azim)
-    fig.colorbar(p, ax=ax, shrink=0.6, label='depth')
-    plt.tight_layout()
-    plt.show()
-    return fig, ax

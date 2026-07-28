@@ -269,11 +269,18 @@ def mode_centered_regression(
     global peak) lands between the peaks, on no surface at all; restricting the
     expectation to the winning mode keeps the estimate on a real candidate.
     Returns (depth, sigma_within_mode, argmax_idx [B,1,H,W]).
+
+    The window is *shifted* to stay in bounds rather than clamped. Clamping
+    repeats the edge index, so a mode at bin 0 of a 4-bin axis would gather bin 0
+    three times and drag the expectation onto the boundary. The fine stages of
+    the 4-level cascade have as few as 4 hypotheses, where that bias is severe.
     """
     D = prob.shape[1]
     idx = prob.argmax(dim=1, keepdim=True)
-    offs = torch.arange(-window, window + 1, device=prob.device).view(1, -1, 1, 1)
-    nbr = (idx + offs).clamp(0, D - 1)
+    w = min(2 * window + 1, D)                       # window never exceeds the axis
+    start = (idx - (w // 2)).clamp(0, D - w)         # slide, do not clamp indices
+    offs = torch.arange(w, device=prob.device).view(1, -1, 1, 1)
+    nbr = start + offs
     p = prob.gather(1, nbr)
     h = depth_hypos.gather(1, nbr)
     p = p / p.sum(dim=1, keepdim=True).clamp_min(1e-8)
@@ -293,10 +300,14 @@ def refine_range_from_posterior(
     global_interval: torch.Tensor,
     depth_min: torch.Tensor,
     depth_max: torch.Tensor,
+    stage_idx: int = 0,
 ) -> torch.Tensor:
     """Next-stage hypotheses sized by the *winning candidate's* sampling
     precision: a local winner shrinks the search, a global winner keeps a
     correction-sized range, and entropy / edge uncertainty widen it.
+
+    ``stage_idx`` selects the per-stage ``range_k`` / ``range_min_gi`` (0 for the
+    stage-1 -> stage-2 step, 1 for 2 -> 3, 2 for 3 -> 4).
 
     All geometry is detached: hypothesis placement carries no gradient, each
     stage is trained by its own losses.
@@ -305,11 +316,13 @@ def refine_range_from_posterior(
         D = prob.shape[1]
         p = prob.float().clamp_min(1e-8)
         entropy = -(p * p.log()).sum(dim=1) / float(torch.log(torch.tensor(float(D))))
-        half = config.range_k * winner_interval * (
+        # range_k / range_min_gi are per-stage: a shared value makes the cascade
+        # coarsen as the hypothesis count drops (see DepthRangeConfig).
+        half = config.range_k[stage_idx] * winner_interval * (
             1.0 + config.range_entropy_a * entropy + config.range_edge_b * edge
         )
         gi = global_interval.view(-1, 1, 1)
-        half = torch.maximum(half, config.range_min_gi * gi)
+        half = torch.maximum(half, config.range_min_gi[stage_idx] * gi)
         half = torch.minimum(half, config.range_max_gi * gi)
         steps = torch.linspace(-1.0, 1.0, num_depths, device=center.device, dtype=center.dtype)
         hypos = center.detach().unsqueeze(1) + half.unsqueeze(1) * steps.view(1, num_depths, 1, 1)
@@ -320,10 +333,3 @@ def refine_range_from_posterior(
     return hypos
 
 
-def fallback_global_range(
-    depth_min: torch.Tensor,
-    depth_max: torch.Tensor,
-    num_depths: int,
-    target_hw: tuple[int, int],
-) -> torch.Tensor:
-    return make_depth_hypotheses_global(depth_min, depth_max, num_depths, target_hw[0], target_hw[1])

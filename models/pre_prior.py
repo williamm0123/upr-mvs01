@@ -105,14 +105,6 @@ class PriorPrecomputer:
         }
 
 
-def load_or_compute(path: str | Path, precrop_sample: dict, precomputer: PriorPrecomputer,
-                    overwrite: bool = False) -> dict:
-    path = Path(path)
-    if path.exists() and not overwrite:
-        return load_prior(path)
-    prior = precomputer.compute(precrop_sample)
-    save_prior(path, prior)
-    return prior
 
 
 def _check_target_wh(image_target_wh: tuple[int, int]) -> None:

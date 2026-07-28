@@ -471,15 +471,6 @@ def robust_affine_align_depth(
     }
 
 
-def _robust_affine_align(
-    source: np.ndarray,
-    target: np.ndarray,
-    target_valid: np.ndarray,
-    trim_mad: float,
-    min_points: int,
-) -> np.ndarray:
-    aligned, _info = robust_affine_align_depth(source, target, target_valid, trim_mad, min_points)
-    return aligned
 
 
 

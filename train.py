@@ -136,8 +136,18 @@ class WindowedMeter:
     accumulates pixel-weighted sums each step; at flush they are all-reduced,
     so the logged point reflects the whole window across the whole world size.
     Also tracks the prior's own error (the baseline the network must beat) and
-    the corrupted/clean split (the guard-rescue signal), plus rank-local
-    median/P90 of per-batch mean error for spike visibility.
+    the corrupted/clean split (the guard-rescue signal), plus the median/P90 of
+    per-batch mean error, pooled over all ranks, for spike visibility.
+
+    The loss's own scalars (loss, per-stage ce/reg, spre/*, in_range, ...) are
+    merged across ranks too, each with its own count: the loss emits several
+    diagnostics only when their mask is non-empty (``spre/r_corrupt``,
+    ``stageN/oor_recoverable``, ...), so a rank that skipped a key must not be
+    averaged as if it had reported zero. That also makes the key set
+    rank-dependent, which is why the merge goes through ``all_gather_object``
+    over the union instead of a fixed-layout ``all_reduce`` — a per-rank length
+    mismatch in a tensor collective would hang the job rather than log a wrong
+    number.
     """
 
     # sums layout: [err, n, hit2, hit4, hit8, prior_err, prior_n,
@@ -159,7 +169,7 @@ class WindowedMeter:
     def reset(self) -> None:
         self.sums = torch.zeros(self.N_SLOTS, dtype=torch.float64, device=self.device)
         self.log_sums: dict[str, float] = {}
-        self.log_n = 0
+        self.log_counts: dict[str, int] = {}
         self.batch_means: list[float] = []
 
     @torch.no_grad()
@@ -200,7 +210,7 @@ class WindowedMeter:
         if logs:
             for k, v in logs.items():
                 self.log_sums[k] = self.log_sums.get(k, 0.0) + float(v)
-            self.log_n += 1
+                self.log_counts[k] = self.log_counts.get(k, 0) + 1
 
     def flush(self) -> tuple[dict[str, float], dict[str, float]]:
         """All-reduce (collective — every rank must call this at the same step)
@@ -227,11 +237,31 @@ class WindowedMeter:
             metrics["abs_err_prior_corrupted"] = float(s[7] / s[8])
         if s[10] > 0:
             metrics["abs_err_prior_clean"] = float(s[9] / s[10])
-        if self.batch_means:
-            bm = np.asarray(self.batch_means)
+
+        # Loss scalars and per-batch means travel as objects (see the class
+        # docstring). Merging in rank order keeps the summation deterministic,
+        # so every rank ends up with byte-identical numbers.
+        if self.is_ddp:
+            payload: list = [None] * dist.get_world_size()
+            dist.all_gather_object(
+                payload, (self.log_sums, self.log_counts, self.batch_means)
+            )
+        else:
+            payload = [(self.log_sums, self.log_counts, self.batch_means)]
+        log_sums: dict[str, float] = {}
+        log_counts: dict[str, int] = {}
+        batch_means: list[float] = []
+        for rank_sums, rank_counts, rank_means in payload:
+            for k, v in rank_sums.items():
+                log_sums[k] = log_sums.get(k, 0.0) + v
+                log_counts[k] = log_counts.get(k, 0) + rank_counts[k]
+            batch_means.extend(rank_means)
+
+        if batch_means:
+            bm = np.asarray(batch_means)
             metrics["abs_err_batch_median"] = float(np.median(bm))
             metrics["abs_err_batch_p90"] = float(np.percentile(bm, 90))
-        avg_logs = {k: v / max(self.log_n, 1) for k, v in self.log_sums.items()}
+        avg_logs = {k: log_sums[k] / max(log_counts[k], 1) for k in sorted(log_sums)}
         self.reset()
         return metrics, avg_logs
 

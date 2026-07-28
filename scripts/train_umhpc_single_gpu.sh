@@ -21,9 +21,9 @@ STEPS=${STEPS:-0}                 # 0=使用 profile 默认值；测试可设 2
 SPRE=${SPRE:-on}                  # on/off：DINOv3 先验可靠度头（SPRE）
 
 # RESUME: auto=从 log/model/latest.pth 续跑（SLURM 重排队要靠它）；off=从头开始。
-# ！！cross-ViT SPRE + DINOv3 LayerScale 改动之后，旧 checkpoint 的 state_dict
-# 已经对不上（多出 fusion 的 90 个键和冻结 ViT 的 24 个 ls*.gamma），auto 会直接
-# 报错退出。改动后的第一次训练必须 RESUME=off。
+# ！！4 级级联重构之后（3 级 -> 4 级、假设数 48-16-8-4、DINO 进 FPN），旧
+# checkpoint 的 state_dict 完全对不上，auto 会直接报错退出。第一次训练必须
+# RESUME=off。
 RESUME=${RESUME:-auto}
 
 # 先验与跑通测试
@@ -56,9 +56,9 @@ export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:Tr
 # 旧 checkpoint 配 auto 必然崩，且要跑完先验构建才崩，白等很久。先拦下来。
 if [[ "$RESUME" == "auto" && -f "log/model/latest.pth" ]]; then
     echo "=== 注意: log/model/latest.pth 存在且 RESUME=auto ==="
-    echo "如果这份 checkpoint 早于 cross-ViT SPRE / LayerScale 改动，加载会失败。"
+    echo "如果这份 checkpoint 早于 4 级级联重构，加载会失败。"
     echo "从头开始:  RESUME=off bash $0"
-    echo "或先挪走:  mv log/model/latest.pth log/model/latest.pth.pre_crossvit"
+    echo "或先挪走:  mv log/model/latest.pth log/model/latest.pth.pre_4stage"
 fi
 
 echo "=== job=${SLURM_JOB_ID:-manual} host=$(hostname) profile=$TRAIN_PROFILE ==="
@@ -71,11 +71,14 @@ echo "=== python=$PYTHON_BIN ==="
 "$PYTHON_BIN" - <<'PYCHECK'
 import sys
 from models.dinov3.vision_transformer import vit_base
-from models.spre import CrossViTFusion  # noqa: F401
+from models.spre import SVAFusion, DinoSVA  # noqa: F401
+from models.network import UprMVSNet
 blk = vit_base(patch_size=16, n_storage_tokens=4).blocks[0]
 if not hasattr(blk.ls1, "gamma"):
     sys.exit("DINOv3 LayerScale 仍是 nn.Identity —— 这是旧代码，git pull 后再跑")
-print("code check: DINOv3 LayerScale ok, CrossViTFusion ok")
+if UprMVSNet.fpn_stage_strides != (8, 4, 2, 1):
+    sys.exit(f"级联仍是 {UprMVSNet.fpn_stage_strides} —— 这是旧代码，git pull 后再跑")
+print("code check: LayerScale ok, SVAFusion ok, 4-stage cascade ok")
 PYCHECK
 
 echo "=== batch=$BATCH_SIZE views=$NUM_VIEWS workers=$NUM_WORKERS lr=$LEARNING_RATE warmup=$WARMUP_STEPS \

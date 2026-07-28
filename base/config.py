@@ -121,7 +121,7 @@ class FPNConfig:
 @dataclass(frozen=True)
 class DepthRangeConfig:
 
-    num_global: int = 48
+    num_global: int = 32
     num_local: int = 16
     global_quantile_lo: float = 0.002
     global_quantile_hi: float = 0.998
@@ -136,10 +136,25 @@ class DepthRangeConfig:
 
     mode_window: int = 2
 
-    range_k: float = 3.0
-    range_entropy_a: float = 1.0
-    range_edge_b: float = 1.0
-    range_min_gi: float = 1.0
+    # Next-stage window: half = range_k[k] * winner_interval * (1 + a*entropy +
+    # b*edge), clamped to [range_min_gi[k], range_max_gi] * gi.
+    #
+    # These MUST be per-stage. The resulting bin is 2*half/(D-1), so with a
+    # single range_k the shrinking hypothesis counts (16/8/4) make every stage
+    # COARSER than its parent: at range_k=3.0 and a=b=1.0 the ratios are 1.20x /
+    # 2.57x / 6.00x. MVSFormer++'s (2.67, 1.5, 1.0) against the same 16/8/4 are
+    # tuned for exactly this constraint (0.356x / 0.429x / 0.667x); the values
+    # below are the same idea with room left for the entropy/edge widening, so
+    # bin/wi stays under 1 even with both terms saturated:
+    #     stage2 0.200-0.400x   stage3 0.257-0.514x   stage4 0.400-0.800x
+    range_k: tuple[float, float, float] = (1.5, 0.9, 0.6)
+    range_entropy_a: float = 0.5
+    range_edge_b: float = 0.5
+    # Floor = recovery room, i.e. permission to grow past what the posterior
+    # suggests. That belongs at the coarse end; by stage 4 there is no later
+    # stage to recover into and only precision matters. stage2's 0.66*gi keeps
+    # the old absolute 10.83mm floor now that gi grew with num_global 48 -> 32.
+    range_min_gi: tuple[float, float, float] = (0.66, 0.20, 0.05)
     range_max_gi: float = 8.0
     edge_grad_rel: float = 0.03
     sigma_max_ratio: float = 0.15
@@ -148,14 +163,31 @@ class DepthRangeConfig:
 
 @dataclass(frozen=True)
 class CostVolumeConfig:
+    """Four cascade stages at strides 8 / 4 / 2 / 1.
+
+    Hypothesis counts (32+16) - 16 - 8 - 4 follow MVSFormer++'s coarse-to-fine
+    budget: nearly all candidates live at the cheapest resolution, and the
+    full-res stage keeps only four. A fine stage that still needs many planes is
+    evidence the previous stage failed to converge its range, not a reason to
+    add planes there — and planes cost 64x more at stride 1 than at stride 8.
+
+    Total cost-volume voxels at 512x640 drop 2.8x versus the old 3-stage
+    (64-24-16 at strides 4/2/1) layout, and 4x at the full-res stage that
+    dominated memory.
+    """
+
     num_groups: int = 8
-    num_depths_stage1: int = 64
-    num_depths_stage2: int = 24
-    num_depths_stage3: int = 16
+    num_depths_stage1: int = 48   # = depth_range.num_global + num_local
+    num_depths_stage2: int = 16
+    num_depths_stage3: int = 8
+    num_depths_stage4: int = 4
     stage1_meta_channels: int = 6
+    # Warp width shrinks as resolution grows; stage 1 moved to stride 8 so it
+    # can afford to stay wide.
     warp_channels_stage1: int = 128
-    warp_channels_stage2: int = 48
-    warp_channels_stage3: int = 16
+    warp_channels_stage2: int = 64
+    warp_channels_stage3: int = 32
+    warp_channels_stage4: int = 16
     warp_use_half: bool = True
     use_src_weights: bool = False
 
@@ -183,24 +215,24 @@ class DINOConfig:
     ``layers`` picks the intermediate blocks whose patch tokens SPRE consumes
     (shallow=more spatial, deep=more semantic — the DPT recipe). ``max_side``
     is the patch-aligned resize for the ref image before the ViT.
+
     """
     mean: tuple[float, float, float] = (0.485, 0.456, 0.406)
     std: tuple[float, float, float] = (0.229, 0.224, 0.225)
     patch_size: int = 16
-    layers: tuple[int, ...] = (4, 7, 11)
+    layers: tuple[int, ...] = (3, 7, 11)
     max_side: int = 512
+    # Inject the SVA-fused per-view DINO features into the FPN bottleneck (the
+    # 1/8 level), the way MVSFormer++ does ``conv31 = conv31 + vit_feat``. Only
+    # takes effect when SPRE is enabled, since that is what loads the backbone.
+    feed_fpn: bool = True
 
 
 @dataclass(frozen=True)
 class SPREConfig:
     """Semantic Prior Reliability Estimator (learned, DINOv3-witnessed conf).
 
-    When ``enabled`` the network predicts a per-pixel prior reliability r in
-    [0, 1] from frozen DINOv3 semantic features + online statistics of the
-    (possibly corrupted) depth prior, and r REPLACES the cached ``conf_prior``
-    fed to ``build_stage1_hypotheses``. Supervised by the corruption mask and
-    the prior's true error (see ``losses/composite.py``). ``enabled=False``
-    restores the exact previous behaviour (cached conf, no DINOv3 loaded).
+
     """
     enabled: bool = False
     proj_dim: int = 64            # fused tokens -> proj_dim, concatenated with the 4 stats
@@ -233,30 +265,14 @@ class LossConfig:
 class StageWeights:
     stage1: float = 0.5
     stage2: float = 1.0
-    stage3: float = 2.0
+    stage3: float = 1.5
+    stage4: float = 2.0
 
 
 @dataclass(frozen=True)
 class AugmentConfig:
     """Training-time augmentation (train split only; val/test stay deterministic).
 
-    Ported from MVSFormer++ (``config/mvsformer++.json``), which had both and
-    this project had neither — ``data/dtu.py`` shipped with the augment branch
-    commented out.
-
-    Photometric values are their DTU ``aug_args`` verbatim. ``scales`` is a
-    *subset* of their 25-entry list (``data.augment.MVSFORMERPP_SCALES``): their
-    largest is 1024x1280, but their finest cost volume is at stride 8 while
-    stage 3 here runs at stride 1, so the same pixel count costs far more.
-
-    Measured (one fwd+bwd, fp16, RTX 5060 Ti), 448x576: B=1/V=3 9.50 GiB,
-    B=1/V=5 12.48, and 12.98 with SPRE on — i.e. ~1.5 GiB per extra view, ~11.4
-    GiB of activations per sample, and only ~0.5 GiB for SPRE. **Peak memory is
-    set by the LARGEST scale in this list**, and an OOM lands hours into a run,
-    so the ceiling here (640x896, ~52 GiB extrapolated at B=2/V=5 on an 80 GiB
-    A100) deliberately keeps ~35% headroom. The same model puts the previously
-    working B=4/V=5 512x640 run at ~60 GiB, which matches reality. Widen toward
-    ``MVSFORMERPP_SCALES`` only after measuring on the actual card.
 
     ``resize_range`` is the random over-resize before cropping — at 1.0 the crop
     fills the frame and cannot move, above it the crop has somewhere to land.

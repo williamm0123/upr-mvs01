@@ -272,11 +272,16 @@ class ScanMeter:
 
 
 def photometric_confidence(prob: torch.Tensor, mode_idx: torch.Tensor, window: int) -> torch.Tensor:
-    """Probability mass in +-window bins around the argmax mode ([B, H, W])."""
+    """Probability mass in +-window bins around the argmax mode ([B, H, W]).
+
+    The final stage has only 4 hypotheses, so a window of 2 already spans the
+    whole axis and the confidence saturates at 1 — clamped below accordingly.
+    """
     D = prob.shape[1]
-    offs = torch.arange(-window, window + 1, device=prob.device).view(1, -1, 1, 1)
-    nbr = (mode_idx + offs).clamp(0, D - 1)
-    return prob.gather(1, nbr).sum(dim=1)
+    w = min(2 * window + 1, D)
+    start = (mode_idx - (w // 2)).clamp(0, D - w)   # shift, not clamp: repeated
+    offs = torch.arange(w, device=prob.device).view(1, -1, 1, 1)  # indices would
+    return prob.gather(1, start + offs).sum(dim=1)                # double-count
 
 
 def depth_vis(depth: np.ndarray) -> np.ndarray:
@@ -306,8 +311,8 @@ def run_inference(model, ds, cfg, args, device, out_root: Path) -> dict:
         with torch.autocast(device_type=device.type, enabled=use_amp):
             outputs = model(batch)
         pred = outputs["depth_full"].float()
-        conf = photometric_confidence(outputs["stage3"]["prob"].float(),
-                                      outputs["stage3"]["mode_idx"], mw)
+        conf = photometric_confidence(outputs["stage4"]["prob"].float(),
+                                      outputs["stage4"]["mode_idx"], mw)
         if conf.shape[-2:] != pred.shape[-2:]:
             conf = F.interpolate(conf.unsqueeze(1), size=pred.shape[-2:], mode="bilinear",
                                  align_corners=False).squeeze(1)

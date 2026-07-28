@@ -5,7 +5,7 @@
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:2
 #SBATCH --cpus-per-task=64
-#SBATCH --mem=96G
+#SBATCH --mem=128G
 #SBATCH --qos=long
 #SBATCH --time=3-00:00:00
 #SBATCH --output=logs/%x_%j.out
@@ -48,7 +48,7 @@ python train.py \
   --profile umhpc \
   --gpus 2 \
   --ddp on \
-  --batch-size 2 \
+  --batch-size 4 \
   --num-views 5 \
   --num-workers 16 \
   --lr 3.0e-4 \
@@ -57,5 +57,5 @@ python train.py \
   --spre on \
   --steps 0 \
   --build-priors skip \
-  --resume auto \
+  --resume off \
   --name uprmvs01

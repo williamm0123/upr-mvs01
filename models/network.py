@@ -16,7 +16,7 @@ from models.fpn import MultiViewFPN
 
 
 class UprMVSNet(nn.Module):
-    """End-to-end cascade MVS network: FPN -> 3-stage cost volume + 3D-UNet.
+    """End-to-end cascade MVS network: FPN -> 4-stage cost volume + 3D-UNet.
 
     Stage-1 hypothesis axis is dual-branch (see models/depth_range.py):
 
@@ -49,8 +49,8 @@ class UprMVSNet(nn.Module):
         src_weights [B, V-1]          optional per-source cost-volume weights
     """
 
-    # FPN feature strides for the three cascade stages (coarse -> fine).
-    fpn_stage_strides: tuple[int, int, int] = (4, 2, 1)
+    # FPN feature strides for the four cascade stages (coarse -> fine).
+    fpn_stage_strides: tuple[int, int, int, int] = (8, 4, 2, 1)
 
     def __init__(self, cfg: MVSConfig | None = None) -> None:
         super().__init__()
@@ -75,35 +75,41 @@ class UprMVSNet(nn.Module):
 
         # Per-stage cost-volume builders: warp-channel width shrinks as
         # resolution grows so the full-res stage does not OOM.
+        warp_chs = (cv_cfg.warp_channels_stage1, cv_cfg.warp_channels_stage2,
+                    cv_cfg.warp_channels_stage3, cv_cfg.warp_channels_stage4)
         self.cost_builders = nn.ModuleList([
-            CostVolumeBuilder(fpn_c, cv_cfg.warp_channels_stage1, cv_cfg.num_groups, cv_cfg.warp_use_half),
-            CostVolumeBuilder(fpn_c, cv_cfg.warp_channels_stage2, cv_cfg.num_groups, cv_cfg.warp_use_half),
-            CostVolumeBuilder(fpn_c, cv_cfg.warp_channels_stage3, cv_cfg.num_groups, cv_cfg.warp_use_half),
+            CostVolumeBuilder(fpn_c, wc, cv_cfg.num_groups, cv_cfg.warp_use_half)
+            for wc in warp_chs
         ])
         # Per-stage 3D-UNet decoders. Stage 1 additionally sees the hypothesis
-        # metadata channels (its axis is irregular); stages 2/3 use uniform
+        # metadata channels (its axis is irregular); stages 2-4 use uniform
         # axes and need none.
         mw = self.range_cfg.mode_window
-        self.decoders = nn.ModuleList([
-            DepthDecoder(
+        self.decoders = nn.ModuleList(
+            [DepthDecoder(
                 in_channels=cv_cfg.num_groups + cv_cfg.stage1_meta_channels,
                 base=dec_cfg.unet_base_channels, depth=dec_cfg.unet_depth, mode_window=mw,
-            ),
-            DepthDecoder(in_channels=cv_cfg.num_groups, base=dec_cfg.unet_base_channels,
-                         depth=dec_cfg.unet_depth, mode_window=mw),
-            DepthDecoder(in_channels=cv_cfg.num_groups, base=dec_cfg.unet_base_channels,
-                         depth=dec_cfg.unet_depth, mode_window=mw),
-        ])
+            )]
+            + [DepthDecoder(in_channels=cv_cfg.num_groups, base=dec_cfg.unet_base_channels,
+                            depth=dec_cfg.unet_depth, mode_window=mw) for _ in range(3)]
+        )
 
-        self.num_depths = (cv_cfg.num_depths_stage1, cv_cfg.num_depths_stage2, cv_cfg.num_depths_stage3)
+        self.num_depths = (cv_cfg.num_depths_stage1, cv_cfg.num_depths_stage2,
+                           cv_cfg.num_depths_stage3, cv_cfg.num_depths_stage4)
 
-        # Optional SPRE head: a frozen-DINOv3-witnessed learned prior reliability
-        # that replaces the (degenerate) cached conf. Off by default; when off the
-        # network is byte-for-byte the previous model and DINOv3 is never loaded.
+        # Optional DINOv3 path. One frozen backbone + SVA fusion feeds two
+        # consumers: the FPN bottleneck (per-view matching features) and the
+        # SPRE reliability head (reference view). Off by default; when off the
+        # network is byte-for-byte the previous model and DINOv3 never loads.
         self.spre_enabled = bool(self.cfg.spre.enabled)
+        self.feed_fpn = self.spre_enabled and bool(self.cfg.dino.feed_fpn)
         if self.spre_enabled:
-            from models.spre import SPRE
-            self.spre = SPRE(self.cfg.spre, self.cfg.dino, self.cfg.paths.dinov3_weights_file)
+            from models.spre import SPRE, DinoSVA
+            self.dino_sva = DinoSVA(
+                self.cfg.spre, self.cfg.dino, self.cfg.paths.dinov3_weights_file,
+                fpn_channels=fpn_c if self.feed_fpn else None,
+            )
+            self.spre = SPRE(self.cfg.spre, self.dino_sva.out_dim)
 
     def _resolve_depth_bounds(self, batch: dict) -> tuple[torch.Tensor, torch.Tensor]:
         if "depth_min" in batch and "depth_max" in batch:
@@ -191,18 +197,35 @@ class UprMVSNet(nn.Module):
         depth_min, depth_max = self._resolve_depth_bounds(batch)
         src_weights = self._resolve_src_weights(batch)
 
-        feats = self.fpn(images)  # {4: [B,V,C,h,w], 2: ..., 1: ...}
-        s1_stride, s2_stride, s3_stride = self.fpn_stage_strides
-        strides = (s1_stride, s2_stride, s3_stride)
+        strides = self.fpn_stage_strides
+        s1_stride = strides[0]
+        coarse_hw = (images.shape[-2] // s1_stride, images.shape[-1] // s1_stride)
 
-        # ---------- Stage 1 (coarsest, 1/4): dual-branch hypotheses ----------
-        feat1 = feats[s1_stride]
-        # SPRE: learned reliability from DINOv3 + online prior stats replaces the
-        # cached conf (which is degenerate). Computed at the stage-1 resolution so
-        # the hypothesis builder's internal resize is a no-op.
+        # DINOv3 + SVA runs before the FPN so its per-view features can be
+        # injected at the 1/8 bottleneck and propagate down the top-down path.
+        fused = raw_tokens = grid = None
         if self.spre_enabled:
-            # all views: the cross-attention pools source tokens against the ref
-            spre_logits = self.spre(images, depth_prior, target_hw=feat1.shape[-2:])
+            fused, raw_tokens, grid = self.dino_sva(images)   # [B, V, N, dim], [B, V, N, 768]
+
+        dino_fpn = (self.dino_sva.fpn_feature(fused, grid, coarse_hw)
+                    if self.feed_fpn else None)
+        feats = self.fpn(images, dino=dino_fpn)  # {8: [B,V,C,h,w], 4: ..., 2: ..., 1: ...}
+
+        # ---------- Stage 1 (coarsest, 1/8): dual-branch hypotheses ----------
+        feat1 = feats[s1_stride]
+        # SPRE: learned reliability from the fused reference tokens + online
+        # prior stats replaces the cached conf (which is degenerate). Computed at
+        # the stage-1 resolution so the hypothesis builder's resize is a no-op.
+        if self.spre_enabled:
+            # Cross-view evidence: reproject the prior into every source view and
+            # measure agreement. SPRE runs before the cost volume, so this is its
+            # only multi-view signal.
+            from models.spre import prior_view_consistency
+            consistency = prior_view_consistency(
+                raw_tokens, depth_prior, K, E, images.shape[-2:], grid
+            )
+            spre_logits = self.spre(fused[:, 0], grid, depth_prior,
+                                    target_hw=feat1.shape[-2:], consistency=consistency)
             conf_used = torch.sigmoid(spre_logits)
         else:
             spre_logits = None
@@ -238,7 +261,7 @@ class UprMVSNet(nn.Module):
             },
         }
 
-        # ---------- Stages 2 & 3: range from the winning candidate ----------
+        # ---------- Stages 2-4: range from the winning candidate ----------
         # winner's sampling interval decides how much correction room the next
         # stage keeps: local win -> narrow, global win -> wide.
         winner_interval = s1.interval.gather(1, mode_idx1).squeeze(1)
@@ -246,7 +269,7 @@ class UprMVSNet(nn.Module):
             "depth": depth1, "prob": prob1, "winner_interval": winner_interval,
             "edge": s1.edge, "hw": feat1.shape[-2:],
         }
-        for k in (1, 2):
+        for k in (1, 2, 3):
             feat_k = feats[strides[k]]
             hypos_k = refine_range_from_posterior(
                 center=prev["depth"],
@@ -258,6 +281,7 @@ class UprMVSNet(nn.Module):
                 global_interval=global_interval,
                 depth_min=depth_min,
                 depth_max=depth_max,
+                stage_idx=k - 1,
             )
             hypos_k = self._upsample_hypos(hypos_k, feat_k.shape[-2:])
             depth_k, sigma_k, prob_k, logits_k, mode_idx_k = self._run_stage(
@@ -276,9 +300,9 @@ class UprMVSNet(nn.Module):
                 "edge": edge_k, "hw": feat_k.shape[-2:],
             }
 
-        depth3 = stage_out["stage3"]["depth"]
+        depth_last = stage_out[f"stage{len(strides)}"]["depth"]
         depth_full = F.interpolate(
-            depth3.unsqueeze(1), size=images.shape[-2:], mode="bilinear", align_corners=False
+            depth_last.unsqueeze(1), size=images.shape[-2:], mode="bilinear", align_corners=False
         ).squeeze(1)
 
         if self.spre_enabled:

@@ -11,25 +11,25 @@ from .depth_loss import normalized_huber_loss, soft_label_cross_entropy
 class MVSLoss:
     """Cascade loss co-designed with the dual-branch stage-1 hypothesis axis.
 
-    Stage 1 (global 48 + local 16, merged sorted axis):
+    Stage 1 (global 32 + local 16, merged sorted axis):
 
-      * ``L64``  — soft-label CE over all 64 candidates. When the local branch
+      * ``L48``  — soft-label CE over all 48 candidates. When the local branch
         is right its dense bins carry most of the label mass; when it is wrong
         its candidates automatically become negatives and the correct global
         bin gets the positive signal. Supervised on ``valid & global-in-range``
         (the guard covers ~all valid pixels by construction).
-      * ``L48``  — auxiliary CE over the *global branch only* (softmax over its
-        48 gathered logits). This trains the guard to localize GT on every
-        pixel at every step, even while the local branch wins the 64-way
+      * ``L_global`` — auxiliary CE over the *global branch only* (softmax over
+        its 32 gathered logits). This trains the guard to localize GT on every
+        pixel at every step, even while the local branch wins the 48-way
         softmax, so its rescue ability never atrophies.
-      * ``L16``  — auxiliary CE over the local branch, only where GT actually
+      * ``L_local`` — auxiliary CE over the local branch, only where GT actually
         falls inside the local window (a wrong prior must not force the local
         branch to hallucinate; L64 already presses its candidates down).
       * ``reg``  — interval-normalized Huber on the mode-centered depth over
         ALL valid pixels (no in-range gating, no hard clamp): out-of-range
         pixels keep a bounded pull toward GT instead of a blind spot.
 
-    Stages 2/3: soft-label CE (in-range) + all-valid Huber whose normalizer is
+    Stages 2-4: soft-label CE (in-range) + all-valid Huber whose normalizer is
     the stage's own bin interval; the regression keeps correcting the previous
     stage's center even when GT fell outside the current window.
 
@@ -44,7 +44,7 @@ class MVSLoss:
         network must beat.
     """
 
-    stage_names = ("stage1", "stage2", "stage3")
+    stage_names = ("stage1", "stage2", "stage3", "stage4")
 
     def __init__(self, cfg: LossConfig, stage_weights: StageWeights) -> None:
         self.cfg = cfg
@@ -68,7 +68,8 @@ class MVSLoss:
     ) -> tuple[torch.Tensor, dict[str, float]]:
         cfg = self.cfg
         sw = self.stage_weights
-        weights = {"stage1": sw.stage1, "stage2": sw.stage2, "stage3": sw.stage3}
+        weights = {"stage1": sw.stage1, "stage2": sw.stage2,
+                   "stage3": sw.stage3, "stage4": sw.stage4}
 
         device = outputs["stage1"]["depth"].device
         depth_gt_full = batch["depth_gt"].to(device).float()
@@ -145,6 +146,19 @@ class MVSLoss:
             logs["stage1/local_hit"] = float(l_in_range[valid1].float().mean()) if valid1.any() else 1.0
             logs["stage1/guard_win_rate"] = float((1.0 - winner_local)[valid1].mean()) if valid1.any() else 0.0
             logs["stage1/p_max"] = float(s1["prob"].detach().amax(dim=1).mean())
+            # p_at_gt: stage-1 posterior mass on the candidate nearest GT.
+            # This decides whether the lost-tail pixels are worth chasing at all.
+            # If a pixel that later falls outside a later stage's window already had
+            # ~zero mass here, the matching evidence never supported the right
+            # depth and no window policy can recover it — widening only coarsens
+            # the bins for everyone. If instead it carries a real secondary mode,
+            # the evidence exists and the window policy is what threw it away.
+            p1 = s1["prob"].detach()
+            gt_bin = (hypos - gt1.unsqueeze(1)).abs().argmin(dim=1, keepdim=True)
+            p_at_gt = p1.gather(1, gt_bin).squeeze(1)
+            p_max_px = p1.amax(dim=1)
+            if valid1.any():
+                logs["stage1/p_at_gt"] = float(p_at_gt[valid1].mean())
             # NOTE: interval_mm averages the merged 64-bin axis, so it is
             # dominated by the 48 guard bins and sits at ~span/63 regardless of
             # what the local branch does — it says nothing about conf/SPRE.
@@ -176,8 +190,8 @@ class MVSLoss:
                 if vk.any():
                     logs["stage1/err_clean"] = float(err1[vk].mean())
 
-        # ---------------------------- stages 2 / 3 ---------------------------- #
-        for name in ("stage2", "stage3"):
+        # --------------------------- stages 2 / 3 / 4 -------------------------- #
+        for name in ("stage2", "stage3", "stage4"):
             stage = outputs[name]
             hypos_k = stage["depth_hypos"]
             logits_k = stage["logits"]
@@ -208,6 +222,18 @@ class MVSLoss:
             logs[f"{name}/in_range"] = float(in_range[valid].float().mean()) if valid.any() else 1.0
             logs[f"{name}/p_max"] = float(stage["prob"].detach().amax(dim=1).mean())
             logs[f"{name}/interval_mm"] = float(interval[valid].mean()) if valid.any() else 0.0
+            # Of the pixels this stage lost (GT outside its window), how many did
+            # stage 1 have evidence for? ``oor_recoverable`` is the fraction whose
+            # GT bin held at least 10% of stage 1's peak mass — a real secondary
+            # mode that a posterior-driven range would have kept. Near zero means
+            # the tail is a matching failure and no window policy can fix it;
+            # substantially above zero means the window policy is what lost them.
+            oor = valid & ~in_range
+            if oor.any():
+                pg = self._to_stage_res(p_at_gt, hw)[oor]
+                pm = self._to_stage_res(p_max_px, hw)[oor]
+                logs[f"{name}/p_at_gt_oor"] = float(pg.mean())
+                logs[f"{name}/oor_recoverable"] = float((pg >= 0.1 * pm).float().mean())
 
         # ------------------------- SPRE reliability head ------------------------- #
         if "spre" in outputs:

@@ -13,8 +13,8 @@ Answers the three questions the training logs cannot:
    in-scene mask filter**; ``--no-in-scene`` removes ours so the rulers match.
 
 3. **Is ``mode_window`` costing us sub-bin precision?**  ``--mode-window 1,2,3``
-   re-runs the stage-3 mode-centred regression from the *same* forward pass, so
-   scanning several values costs one inference.  (Stage 1/2 windows change the
+   re-runs the final stage's mode-centred regression from the *same* forward pass, so
+   scanning several values costs one inference.  (Earlier stages' windows change the
    hypothesis axes downstream, so a strict full-cascade sweep needs
    ``--mw-full-cascade``, which re-runs inference per value.)
 
@@ -84,11 +84,11 @@ def parse_args() -> argparse.Namespace:
                         "filter, so this is REQUIRED for a like-for-like e_n comparison. The fraction "
                         "it removes is reported either way.")
     p.add_argument("--mode-window", default=None,
-                   help="comma list of stage-3 mode_window values to score, e.g. '1,2,3'. "
+                   help="comma list of final-stage mode_window values to score, e.g. '1,2,3'. "
                         "Default: the configured value only.")
     p.add_argument("--mw-full-cascade", action="store_true",
                    help="apply each mode_window to ALL stages and re-run inference (strict but "
-                        "N x slower). Without it only stage 3 is rescanned, reusing one forward pass.")
+                        "N x slower). Without it only the final stage is rescanned, reusing one forward pass.")
     p.add_argument("--out", default=None, help="output json (default outputs/ablation_<split>/metrics.json)")
     return p.parse_args()
 
@@ -218,7 +218,7 @@ def evaluate(model, ds, cfg, args, device, windows: list[int]) -> tuple[dict[int
             continue
 
         full_hw = batch["images"].shape[-2:]
-        s3 = outputs["stage3"]
+        s3 = outputs["stage4"]
         for w in windows:
             if w == native_w:
                 pred = outputs["depth_full"].float()
@@ -240,7 +240,7 @@ def print_report(results: dict[int, dict], per_scan: dict[str, dict], stats: dic
     print("\n" + "=" * 100)
     print(f"split={args.split}  eval_res={eval_hw[0]}x{eval_hw[1]}  "
           f"in_scene_filter={'OFF' if args.no_in_scene else 'ON'}  "
-          f"cascade={'full' if args.mw_full_cascade else 'stage3-only'}")
+          f"cascade={'full' if args.mw_full_cascade else 'final-stage-only'}")
     print(f"GT-out-of-scene pixels: {oos_pct:.2f}% of the DTU mask "
           f"({'counted as error — matches MVSFormer++' if args.no_in_scene else 'EXCLUDED — MVSFormer++ does not exclude them'})")
     print("=" * 100)

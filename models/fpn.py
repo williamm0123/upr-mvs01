@@ -58,12 +58,12 @@ class ScaleTower(nn.Module):
 
 
 class FPNFeatureExtractor(nn.Module):
-    """从头训练的特征塔 + FPN，产出 1/4、1/2、全分辨率三级特征。
+    """从头训练的特征塔 + FPN，产出 1/8、1/4、1/2、全分辨率四级特征。
 
     自底向上：原图 -> 1/2 塔 -> 1/4 塔 -> 1/8 塔（每塔第 1 层 stride=2 降采样，
     同尺度再叠加 conv + 残差块加深）。下探到 1/8 主要是为了扩感受野——1/8
-    分辨率的特征图很便宜（显存/参数增量都很小），它不直接参与代价体，
-    价值是让 1/4 特征经过更深的 top-down 路径、带上更全局的语义。
+    分辨率的特征图很便宜（显存/参数增量都很小），四级级联把最粗的那一级放在
+    这里：绝大多数深度假设在 1/8 上评估，代价只有 stride-1 的 1/64。
 
     自顶向下：p8(1/8) -> 上采样加到 p4(1/4) -> 加到 p2(1/2) -> 加到 p1(全分辨率)。
     全分辨率分支用 2 层 Conv-GN-ReLU-Conv 而不是单层线性投影，至少经过一次
@@ -80,7 +80,7 @@ class FPNFeatureExtractor(nn.Module):
         c_quarter = base_channel * 4   # 1/4 尺度内部通道
         c_eighth = base_channel * 8    # 1/8 尺度内部通道
 
-        # ---- 自底向上：三级特征塔 ----
+        # ---- 自底向上：三级特征塔 (1/2, 1/4, 1/8) ----
         self.tower_half = ScaleTower(3, c_half)             # 原图 -> 1/2
         self.tower_quarter = ScaleTower(c_half, c_quarter)  # 1/2 -> 1/4
         self.tower_eighth = ScaleTower(c_quarter, c_eighth)  # 1/4 -> 1/8
@@ -97,12 +97,19 @@ class FPNFeatureExtractor(nn.Module):
         )
 
         # ---- 输出平滑：消除上采样混叠 ----
+        self.smooth_p8 = nn.Conv2d(out_channels, out_channels, 3, padding=1)
         self.smooth_p1 = nn.Conv2d(out_channels, out_channels, 3, padding=1)
         self.smooth_p2 = nn.Conv2d(out_channels, out_channels, 3, padding=1)
         self.smooth_p4 = nn.Conv2d(out_channels, out_channels, 3, padding=1)
         self.out_channels = out_channels
 
-    def forward(self, x: torch.Tensor) -> dict[int, torch.Tensor]:
+    def forward(self, x: torch.Tensor, dino: torch.Tensor | None = None) -> dict[int, torch.Tensor]:
+        """``dino``: 可选的 [B, out_channels, H/8, W/8] 语义特征, 注入 1/8 瓶颈。
+
+        注入点选在 top-down 之前而不是之后 —— 这样 DINO 的语义会沿 p8->p4->p2->p1
+        传遍所有尺度, 和 MVSFormer++ 的 ``conv31 = conv31 + vit_feat`` 位置一致
+        (他们也是加在 encoder 的 1/8 输出上, 再进 decoder)。
+        """
         # 自底向上
         f_half = self.tower_half(x)          # [B, c_half, H/2, W/2]
         f_quarter = self.tower_quarter(f_half)  # [B, c_quarter, H/4, W/4]
@@ -110,6 +117,10 @@ class FPNFeatureExtractor(nn.Module):
 
         # 自顶向下：从 1/8 开始逐级上采样相加
         p8 = self.lateral_eighth(f_eighth)      # [B, out_channels, H/8, W/8]
+        if dino is not None:
+            if dino.shape[-2:] != p8.shape[-2:]:
+                dino = F.interpolate(dino, size=p8.shape[-2:], mode="bilinear", align_corners=False)
+            p8 = p8 + dino
         p4 = self.lateral_quarter(f_quarter) + F.interpolate(
             p8, size=f_quarter.shape[-2:], mode="bilinear", align_corners=False
         )                                        # [B, out_channels, H/4, W/4]
@@ -121,6 +132,7 @@ class FPNFeatureExtractor(nn.Module):
         )                                        # [B, out_channels, H, W]
 
         return {
+            8: self.smooth_p8(p8),
             4: self.smooth_p4(p4),
             2: self.smooth_p2(p2),
             1: self.smooth_p1(p1),
@@ -140,7 +152,9 @@ class MultiViewFPN(nn.Module):
         )
         self.out_channels = out_channels
 
-    def forward(self, imgs: torch.Tensor) -> dict[int, torch.Tensor]:
+    def forward(self, imgs: torch.Tensor, dino: torch.Tensor | None = None) -> dict[int, torch.Tensor]:
+        """``dino``: 可选 [B, V, out_channels, h8, w8], 每个视角一份。"""
         B, V, C, H, W = imgs.shape
-        feats = self.fpn(imgs.view(B * V, C, H, W))
+        d = dino.reshape(B * V, *dino.shape[2:]) if dino is not None else None
+        feats = self.fpn(imgs.view(B * V, C, H, W), dino=d)
         return {s: f.view(B, V, f.shape[1], f.shape[2], f.shape[3]) for s, f in feats.items()}
