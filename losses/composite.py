@@ -145,8 +145,20 @@ class MVSLoss:
             logs["stage1/local_hit"] = float(l_in_range[valid1].float().mean()) if valid1.any() else 1.0
             logs["stage1/guard_win_rate"] = float((1.0 - winner_local)[valid1].mean()) if valid1.any() else 0.0
             logs["stage1/p_max"] = float(s1["prob"].detach().amax(dim=1).mean())
+            # NOTE: interval_mm averages the merged 64-bin axis, so it is
+            # dominated by the 48 guard bins and sits at ~span/63 regardless of
+            # what the local branch does — it says nothing about conf/SPRE.
             logs["stage1/interval_mm"] = float(s1["interval"][valid1.unsqueeze(1).expand_as(s1["interval"])].mean()) \
                 if valid1.any() else 0.0
+            # The local window half-width IS conf/SPRE's only effect on the
+            # search: half = (0.75 + 1.25*(1-r)) * gi, i.e. 8.1mm at r=1 and
+            # 21.7mm at r=0 on DTU. The std across pixels is the falsifiable
+            # part — a constant r (SPRE learning nothing) pins it near zero.
+            local_half = 0.5 * (s1["local_hi"] - s1["local_lo"])
+            if valid1.any():
+                lh = local_half[valid1]
+                logs["stage1/local_half_mm"] = float(lh.mean())
+                logs["stage1/local_half_std"] = float(lh.std()) if lh.numel() > 1 else 0.0
             logs["stage1/edge_frac"] = float(edge1.mean())
             prior_err = (s1["prior"] - gt1).abs()
             prior_valid = valid1 & (s1["prior"] > 0)

@@ -145,6 +145,25 @@ class Mlp(nn.Module):
         return self.fc2(self.act(self.fc1(x)))
 
 
+class LayerScale(nn.Module):
+    """Per-channel residual-branch scale (``blocks.*.ls{1,2}.gamma``).
+
+    Not optional: the released DINOv3 ViT-B/16 ships these and they are nowhere
+    near 1 — block 11's ls1 has median 6.20 and range [-28.1, 25.0], block 0's
+    median is ~0. Stubbing them out as nn.Identity() (as this file used to) made
+    load_state_dict(strict=False) drop all 24 tensors silently and produced
+    patch features with ~0 cosine similarity to real DINOv3 output and almost no
+    patch-to-patch contrast (0.026 vs 0.440) — i.e. a near-constant feature map.
+    """
+
+    def __init__(self, dim: int, init_values: float = 1.0):
+        super().__init__()
+        self.gamma = nn.Parameter(init_values * torch.ones(dim))
+
+    def forward(self, x: Tensor) -> Tensor:
+        return x * self.gamma
+
+
 class SelfAttentionBlock(nn.Module):
     def __init__(
         self,
@@ -159,10 +178,10 @@ class SelfAttentionBlock(nn.Module):
         super().__init__()
         self.norm1 = norm_layer(dim)
         self.attn = SelfAttention(dim, num_heads=num_heads, qkv_bias=qkv_bias, proj_bias=proj_bias)
-        self.ls1 = nn.Identity()
+        self.ls1 = LayerScale(dim)
         self.norm2 = norm_layer(dim)
         self.mlp = Mlp(dim, hidden_features=int(dim * ffn_ratio), bias=ffn_bias)
-        self.ls2 = nn.Identity()
+        self.ls2 = LayerScale(dim)
 
     def forward(self, x: Tensor, rope: tuple[Tensor, Tensor] | None = None) -> Tensor:
         x = x + self.ls1(self.attn(self.norm1(x), rope=rope))

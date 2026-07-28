@@ -201,7 +201,8 @@ class UprMVSNet(nn.Module):
         # cached conf (which is degenerate). Computed at the stage-1 resolution so
         # the hypothesis builder's internal resize is a no-op.
         if self.spre_enabled:
-            spre_logits = self.spre(images[:, 0], depth_prior, target_hw=feat1.shape[-2:])
+            # all views: the cross-attention pools source tokens against the ref
+            spre_logits = self.spre(images, depth_prior, target_hw=feat1.shape[-2:])
             conf_used = torch.sigmoid(spre_logits)
         else:
             spre_logits = None

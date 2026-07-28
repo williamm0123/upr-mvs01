@@ -4,8 +4,9 @@ A learned, supervised, DINOv3-witnessed successor to the hand-engineered
 offline ``conf`` (``models/conf.py``). SPRE predicts a per-pixel reliability
 ``r in [0, 1]`` for the (possibly corrupted) depth prior from:
 
-  * frozen DINOv3 semantic features of the reference image — an *independent*
-    witness that does not depend on the prior's own depth values, and
+  * frozen DINOv3 semantic features of every view, fused by ``CrossViTFusion``
+    (ported from MVSFormer++) — an *independent* witness that does not depend
+    on the prior's own depth values, and
   * cheap online statistics of the depth prior (local MAD, gradient, validity)
     computed AFTER prior-corruption, so injected failures are visible.
 
@@ -13,7 +14,7 @@ offline ``conf`` (``models/conf.py``). SPRE predicts a per-pixel reliability
 low ``r`` widens the local search (leaning on the prior-independent guard),
 high ``r`` keeps it tight. The head is supervised by the corruption mask and
 the prior's true error (see ``losses/composite.py``). DINOv3 is frozen; only
-the projection + head (+ optional attention) train.
+the fusion + projection + head train.
 
 The module emits raw LOGITS (not the sigmoid) so the loss can use the
 autocast-safe ``binary_cross_entropy_with_logits``; the network applies the
@@ -60,6 +61,102 @@ def _grad_mag_rel(d: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
     return (gx.abs() + gy.abs()) / (d.abs() + 1.0)
 
 
+class _AttnBlock(nn.Module):
+    """Pre-norm transformer block; self-attention when ``kv`` is None, else cross.
+
+    Uses scaled_dot_product_attention so the [B, heads, N_q, N_kv] matrix is
+    never materialised — with all source views as keys N_kv is (V-1)*N, which
+    would otherwise cost hundreds of MB per block just to hold for backward.
+    """
+
+    def __init__(self, dim: int, num_heads: int, mlp_ratio: float = 4.0, cross: bool = False) -> None:
+        super().__init__()
+        self.num_heads = num_heads
+        self.norm_q = nn.LayerNorm(dim, eps=1e-6)
+        # self-attention reuses norm_q for the keys; allocating an unused
+        # norm_kv would leave parameters without gradients, which DDP rejects.
+        self.norm_kv = nn.LayerNorm(dim, eps=1e-6) if cross else None
+        self.to_q = nn.Linear(dim, dim)
+        self.to_kv = nn.Linear(dim, 2 * dim)
+        self.proj = nn.Linear(dim, dim)
+        self.norm2 = nn.LayerNorm(dim, eps=1e-6)
+        hidden = int(dim * mlp_ratio)
+        self.mlp = nn.Sequential(nn.Linear(dim, hidden), nn.GELU(), nn.Linear(hidden, dim))
+
+    def _heads(self, t: torch.Tensor) -> torch.Tensor:
+        B, N, C = t.shape
+        return t.view(B, N, self.num_heads, C // self.num_heads).transpose(1, 2)
+
+    def forward(self, x: torch.Tensor, kv: torch.Tensor | None = None) -> torch.Tensor:
+        q_in = self.norm_q(x)
+        kv_in = q_in if kv is None or self.norm_kv is None else self.norm_kv(kv)
+        q = self._heads(self.to_q(q_in))
+        k, v = self.to_kv(kv_in).chunk(2, dim=-1)
+        a = F.scaled_dot_product_attention(q, self._heads(k), self._heads(v))
+        B, _, N, _ = a.shape
+        x = x + self.proj(a.transpose(1, 2).reshape(B, N, -1))
+        return x + self.mlp(self.norm2(x))
+
+
+class CrossViTFusion(nn.Module):
+    """MVSFormer++'s CrossVITDecoder, adapted to SPRE's single-output-map job.
+
+    Reference branch (identical to theirs): the shallowest DINOv3 layer seeds the
+    stream, then each further layer is folded in as
+    ``norm(aas * self_attn(prev) + layer_i)`` — the AAS residual that carries
+    their ablation gain, not a plain concatenation of the three layers.
+
+    Cross branch (**direction reversed**): they use src as query and ref as
+    key/value because every view needs its own feature for the plane sweep. SPRE
+    needs one map in the *reference* frame, so here the ref tokens query the
+    pooled source tokens. A ref token that finds no support across the sources is
+    occluded or monocular-guessed — exactly the "do not trust the prior here"
+    signal, and unavailable from the cost volume since SPRE runs before it.
+    """
+
+    def __init__(self, in_dim: int, cfg: SPREConfig, n_layers: int) -> None:
+        super().__init__()
+        dim, heads = int(cfg.attn_dim), int(cfg.num_heads)
+        self.cross_view = bool(cfg.cross_view)
+        self.in_proj = nn.Linear(in_dim, dim)
+
+        self.self_blocks = nn.ModuleList(_AttnBlock(dim, heads) for _ in range(n_layers - 1))
+        self.self_norms = nn.ModuleList(nn.LayerNorm(dim, eps=1e-6) for _ in range(n_layers - 1))
+        self.self_aas = nn.ParameterList(
+            nn.Parameter(torch.tensor(float(cfg.aas_init))) for _ in range(n_layers - 1)
+        )
+        if self.cross_view:
+            self.cross_blocks = nn.ModuleList(_AttnBlock(dim, heads, cross=True) for _ in range(n_layers))
+            self.cross_norms = nn.ModuleList(nn.LayerNorm(dim, eps=1e-6) for _ in range(n_layers - 1))
+            self.cross_aas = nn.ParameterList(
+                nn.Parameter(torch.tensor(float(cfg.aas_init))) for _ in range(n_layers - 1)
+            )
+        self.out_dim = dim * 2 if self.cross_view else dim
+
+    def forward(self, layers: list[torch.Tensor]) -> torch.Tensor:
+        """``layers``: per DINOv3 layer, [B, V, N, in_dim]. Returns [B, N, out_dim]."""
+        x = [self.in_proj(t) for t in layers]
+
+        ref = [x[0][:, 0]]
+        for i, (blk, norm, aas) in enumerate(zip(self.self_blocks, self.self_norms, self.self_aas)):
+            ref.append(norm(aas * blk(ref[-1]) + x[i + 1][:, 0]))
+        if not self.cross_view:
+            return ref[-1]
+
+        V = x[0].shape[1]
+        ctx = None
+        for i, blk in enumerate(self.cross_blocks):
+            # V == 1 has no sources: degenerate to self-attention rather than
+            # feeding an empty key tensor (SDPA cannot normalise over 0 keys).
+            src = x[i][:, 1:].flatten(1, 2) if V > 1 else ref[i]
+            if i == 0:
+                q = ref[i]
+            else:
+                q = self.cross_norms[i - 1](self.cross_aas[i - 1] * ctx + ref[i])
+            ctx = blk(q, kv=src)
+        return torch.cat([ref[-1], ctx], dim=-1)
+
+
 class SPRE(nn.Module):
     N_STAT = 4  # depth_norm, mad_rel, grad_rel, valid
 
@@ -78,17 +175,16 @@ class SPRE(nn.Module):
         self.register_buffer("dino_mean", torch.tensor(dino_cfg.mean).view(1, 3, 1, 1))
         self.register_buffer("dino_std", torch.tensor(dino_cfg.std).view(1, 3, 1, 1))
 
-        dino_dim = 768 * len(self.layers)
-        self.dino_proj = nn.Sequential(
-            nn.Conv2d(dino_dim, cfg.proj_dim, kernel_size=1),
+        self.fusion = CrossViTFusion(768, cfg, n_layers=len(self.layers))
+        # 1x1 projection lives at token resolution: a pointwise conv commutes
+        # exactly with bilinear upsampling, so projecting the 26x32 grid instead
+        # of the 128x160 one is arithmetically identical and ~18x cheaper in the
+        # activations held for backward.
+        self.dino_proj = nn.Conv2d(self.fusion.out_dim, cfg.proj_dim, kernel_size=1)
+        self.proj_post = nn.Sequential(
             nn.GroupNorm(min(8, cfg.proj_dim), cfg.proj_dim),
             nn.GELU(),
         )
-
-        self.use_attention = bool(cfg.use_attention)
-        if self.use_attention:
-            self.attn = nn.MultiheadAttention(cfg.proj_dim, cfg.num_heads, batch_first=True)
-            self.attn_norm = nn.LayerNorm(cfg.proj_dim)
 
         in_ch = cfg.proj_dim + self.N_STAT
         self.head = nn.Sequential(
@@ -107,39 +203,40 @@ class SPRE(nn.Module):
         self.dino.eval()
         return self
 
-    def _dino_features(self, ref_img: torch.Tensor, target_hw: tuple[int, int]) -> torch.Tensor:
-        B, _, H, W = ref_img.shape
+    def _dino_features(self, images: torch.Tensor) -> tuple[list[torch.Tensor], tuple[int, int]]:
+        """Frozen witness over every view. Returns per-layer [B, V, N, 768] token
+        sequences (still on the patch grid) plus that grid's (h, w)."""
+        B, V, _, H, W = images.shape
         dh, dw = compute_patch_aligned_size(H, W, self.max_side, self.patch_size)
         self.dino.eval()
         with torch.no_grad():
-            x = F.interpolate(ref_img, size=(dh, dw), mode="bilinear", align_corners=False)
+            x = images.reshape(B * V, 3, H, W)
+            x = F.interpolate(x, size=(dh, dw), mode="bilinear", align_corners=False)
             x = (x - self.dino_mean) / self.dino_std
             feats = self.dino.get_intermediate_layers(x, n=self.layers, reshape=True, norm=True)
-            feats = [F.interpolate(f.float(), size=target_hw, mode="bilinear", align_corners=False)
-                     for f in feats]
-            f_sem = torch.cat(feats, dim=1)  # [B, 768*L, h, w], no grad (frozen witness)
-        return f_sem
+        gh, gw = feats[0].shape[-2:]
+        tokens = [f.float().flatten(2).transpose(1, 2).view(B, V, gh * gw, -1) for f in feats]
+        return tokens, (gh, gw)
 
     def forward(
         self,
-        ref_img: torch.Tensor,
+        images: torch.Tensor,
         depth_prior: torch.Tensor,
         target_hw: tuple[int, int],
     ) -> torch.Tensor:
         """Return reliability LOGITS ``[B, h, w]`` at ``target_hw``.
 
-        ref_img     : [B, 3, H, W] in [0, 1] (reference view only)
-        depth_prior : [B, H, W]    the possibly-corrupted metric prior
+        images      : [B, V, 3, H, W] in [0, 1]; view 0 is the reference, the
+                      rest are the sources the cross-attention pools over
+        depth_prior : [B, H, W]       the possibly-corrupted metric prior
         """
-        f_sem = self._dino_features(ref_img, target_hw)
-        f_sem = self.dino_proj(f_sem)  # trainable; grad flows here, not into DINOv3
-
-        if self.use_attention:
-            B, C, h, w = f_sem.shape
-            t = f_sem.flatten(2).transpose(1, 2)   # [B, h*w, C]
-            a, _ = self.attn(t, t, t)              # self-attention (region consistency)
-            t = self.attn_norm(t + a)
-            f_sem = t.transpose(1, 2).reshape(B, C, h, w)
+        tokens, (gh, gw) = self._dino_features(images)
+        fused = self.fusion(tokens)                                   # [B, N, out_dim]
+        B, _, C = fused.shape
+        f_sem = fused.transpose(1, 2).reshape(B, C, gh, gw)
+        f_sem = self.dino_proj(f_sem)                                 # project on the patch grid
+        f_sem = F.interpolate(f_sem, size=target_hw, mode="bilinear", align_corners=False)
+        f_sem = self.proj_post(f_sem)
 
         # Online depth statistics at target_hw (fp32, corruption-consistent).
         d = F.interpolate(depth_prior.unsqueeze(1).float(), size=target_hw, mode="nearest").squeeze(1)

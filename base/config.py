@@ -203,10 +203,16 @@ class SPREConfig:
     restores the exact previous behaviour (cached conf, no DINOv3 loaded).
     """
     enabled: bool = False
-    proj_dim: int = 64            # DINOv3 (768*len(layers)) -> proj_dim via 1x1 conv
+    proj_dim: int = 64            # fused tokens -> proj_dim, concatenated with the 4 stats
     hidden: int = 64
-    use_attention: bool = False   # v1 off; v2 self-attention over tokens
-    num_heads: int = 4
+    # Cross-ViT fusion of the DINOv3 layers, ported from MVSFormer++'s
+    # CrossVITDecoder. ``attn_dim`` is the width the blocks run at (768 -> 384
+    # first): SPRE emits one scalar per pixel, so full ViT width is 4x the
+    # parameters for no extra capacity where it matters.
+    attn_dim: int = 384
+    num_heads: int = 6            # 64 dims/head, the same ratio MVSFormer++ uses
+    aas_init: float = 0.5         # their ``prev_values``: scale on the previous stage
+    cross_view: bool = True       # source views as cross-attention keys/values
 
 
 @dataclass(frozen=True)
@@ -220,7 +226,7 @@ class LossConfig:
     # SPRE supervision (only active when the network emits a 'spre' output)
     w_spre: float = 0.5           # corruption-BCE weight (corrupted prior -> 0, clean -> 1)
     w_spre_soft: float = 0.5      # prior-error soft-target weight
-    spre_soft_tau_mm: float = 2.0 # exp(-(|prior-gt|/tau)^2) scale, in the depth unit (mm)
+    spre_soft_tau_mm: float = 10.8 # exp(-(|prior-gt|/tau)^2) scale, in the depth unit (mm)
 
 
 @dataclass(frozen=True)

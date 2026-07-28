@@ -504,7 +504,19 @@ def main_worker(
         ckpt_path = ProjectPaths().project_path / "log" / "model" / "latest.pth"
         if ckpt_path.exists():
             ckpt = torch.load(ckpt_path, map_location=device)
-            (model.module if isinstance(model, DDP) else model).load_state_dict(ckpt["model"])
+            try:
+                (model.module if isinstance(model, DDP) else model).load_state_dict(ckpt["model"])
+            except RuntimeError as exc:
+                # An architecture change (SPRE's cross-ViT fusion, DINOv3's
+                # LayerScale, ...) makes old checkpoints unloadable. Failing
+                # here is correct — silently partial-loading would train a new
+                # head on top of weights fitted to the old one — but say so.
+                raise RuntimeError(
+                    f"{ckpt_path} was written by a different architecture and cannot be resumed.\n"
+                    "Start fresh with --resume off (and move the stale checkpoint aside), "
+                    "or check out the commit the checkpoint came from.\n"
+                    f"original error: {exc}"
+                ) from exc
             optimizer.load_state_dict(ckpt["optimizer"])
             start_step = int(ckpt.get("step", -1)) + 1
             logger.best_metric = float(ckpt.get("best_metric", float("inf")))
