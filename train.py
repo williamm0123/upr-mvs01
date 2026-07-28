@@ -614,6 +614,7 @@ def _run_training(model, loss_fn, optimizer, scaler, cfg, device, args, world_si
         sampler=sampler,
         num_workers=cfg.train.num_workers,
         collate_fn=_collate,
+        worker_init_fn=_worker_init,
         pin_memory=True,
         drop_last=True,
     )
@@ -639,6 +640,7 @@ def _run_training(model, loss_fn, optimizer, scaler, cfg, device, args, world_si
         sampler=val_sampler,
         num_workers=cfg.train.num_workers,
         collate_fn=_collate,
+        worker_init_fn=_worker_init,
         pin_memory=True,
         drop_last=False,
     )
@@ -709,6 +711,21 @@ def _run_training(model, loss_fn, optimizer, scaler, cfg, device, args, world_si
         logger.log_val(val_metrics, step)
         logger.save(model, optimizer, step, val_metric=val_metrics["abs_err"])
         print(f"[val final step {step}] " + " ".join(f"{k}={v:.4f}" for k, v in val_metrics.items()))
+
+
+def _worker_init(worker_id: int) -> None:
+    """Keep每个 DataLoader worker 单线程。
+
+    torch 在 worker 里本来就是单线程, 但 OpenCV 不是: 它的线程池默认取满核数。
+    dtu.py 每个样本要调十几次 cv2.resize, 于是 N 个 worker 各自开 N_core 个线程:
+    单卡 16 worker 在 64 核上已经超订, DDP 两个 rank 就是 32 个 worker, 直接翻倍。
+    争用导致某个 rank 取一个 batch 要几分钟 —— 单卡时只是变慢, DDP 下另一个 rank
+    会卡在梯度 all-reduce 上被 NCCL watchdog (默认 10 分钟) 判定超时并杀掉作业。
+    """
+    import cv2
+
+    cv2.setNumThreads(0)
+    torch.set_num_threads(1)
 
 
 def _collate(samples: list[dict]) -> dict:
