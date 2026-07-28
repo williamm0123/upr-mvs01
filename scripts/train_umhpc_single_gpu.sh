@@ -6,21 +6,28 @@ set -euo pipefail
 PROJECT_DIR=${PROJECT_DIR:-/scr/user/qinglong/projects/upr-mvs01}
 # 直接指定 uprmvs 环境的解释器，不依赖当前 shell 的 conda activate/PATH。
 PYTHON_BIN=${PYTHON_BIN:-/home/user/qinglong/.conda/envs/uprmvs/bin/python}
-TRAIN_PROFILE=${TRAIN_PROFILE:-local}
+TRAIN_PROFILE=${TRAIN_PROFILE:-local}   # local = 单卡档 (max_steps 20000)；要 30000 步就设 umhpc 或 STEPS=30000
 RUN_NAME=${RUN_NAME:-uprmvs_1gpu_${SLURM_JOB_ID:-manual}}
 
 # 核心训练参数（命令行会覆盖 TRAIN_PROFILE 中的同名参数）
-BATCH_SIZE=${BATCH_SIZE:-2}       # 每卡 batch (DistributedSampler 下是 per-rank)；OOM 就设 1 或降 NUM_VIEWS
+BATCH_SIZE=${BATCH_SIZE:-2}       # 每卡 batch；SPRE 现在对全部 NUM_VIEWS 个视角跑 DINOv3，OOM 就设 1
 NUM_VIEWS=${NUM_VIEWS:-5}         # MVS 总视图数：1 个参考视图 + 4 个源视图
 NUM_WORKERS=${NUM_WORKERS:-16}    # DataLoader 进程数；32 CPU 下建议 8~16
 LEARNING_RATE=${LEARNING_RATE:-3.0e-4}
 WARMUP_STEPS=${WARMUP_STEPS:-1000}
+VAL_INTERVAL=${VAL_INTERVAL:-500} # 500 步一次 val；val 集 882 样本，约占 8% 训练时间，嫌慢设 1000
 AMP=${AMP:-on}                    # on/off；A100 建议 on
 STEPS=${STEPS:-0}                 # 0=使用 profile 默认值；测试可设 2
 SPRE=${SPRE:-on}                  # on/off：DINOv3 先验可靠度头（SPRE）
 
+# RESUME: auto=从 log/model/latest.pth 续跑（SLURM 重排队要靠它）；off=从头开始。
+# ！！cross-ViT SPRE + DINOv3 LayerScale 改动之后，旧 checkpoint 的 state_dict
+# 已经对不上（多出 fusion 的 90 个键和冻结 ViT 的 24 个 ls*.gamma），auto 会直接
+# 报错退出。改动后的第一次训练必须 RESUME=off。
+RESUME=${RESUME:-auto}
+
 # 先验与跑通测试
-BUILD_PRIORS=${BUILD_PRIORS:-auto}git
+BUILD_PRIORS=${BUILD_PRIORS:-auto}
 # BUILD_PRIORS: auto=补齐缺失先验，force=全部重算，skip=要求缓存已存在，
 #               only=只构建先验然后退出（换 val 列表后先跑一次这个）
 SMOKE=${SMOKE:-0}                 # 1=合成数据跑通测试；0=真实数据训练
@@ -46,12 +53,33 @@ export PYTHONUNBUFFERED=1
 # 缓解显存碎片（错误信息里 "reserved but unallocated" 就是碎片）。可被外部覆盖。
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 
+# 旧 checkpoint 配 auto 必然崩，且要跑完先验构建才崩，白等很久。先拦下来。
+if [[ "$RESUME" == "auto" && -f "log/model/latest.pth" ]]; then
+    echo "=== 注意: log/model/latest.pth 存在且 RESUME=auto ==="
+    echo "如果这份 checkpoint 早于 cross-ViT SPRE / LayerScale 改动，加载会失败。"
+    echo "从头开始:  RESUME=off bash $0"
+    echo "或先挪走:  mv log/model/latest.pth log/model/latest.pth.pre_crossvit"
+fi
 
 echo "=== job=${SLURM_JOB_ID:-manual} host=$(hostname) profile=$TRAIN_PROFILE ==="
 nvidia-smi -L
 echo "=== python=$PYTHON_BIN ==="
 "$PYTHON_BIN" -c 'import importlib.util, sys, torch, huggingface_hub; print("python:", sys.executable); print("torch:", torch.__version__, torch.__file__); print("huggingface_hub:", huggingface_hub.__version__); print("vggt:", importlib.util.find_spec("vggt.models.vggt").origin)'
-echo "=== batch=$BATCH_SIZE views=$NUM_VIEWS workers=$NUM_WORKERS lr=$LEARNING_RATE warmup=$WARMUP_STEPS amp=$AMP steps=$STEPS build_priors=$BUILD_PRIORS smoke=$SMOKE ==="
+
+# 确认跑的是改动后的代码：LayerScale 必须已接回（否则 DINOv3 特征是常数图），
+# CrossViTFusion 必须存在。任一缺失说明 checkout 是旧的，直接退出而不是白跑一天。
+"$PYTHON_BIN" - <<'PYCHECK'
+import sys
+from models.dinov3.vision_transformer import vit_base
+from models.spre import CrossViTFusion  # noqa: F401
+blk = vit_base(patch_size=16, n_storage_tokens=4).blocks[0]
+if not hasattr(blk.ls1, "gamma"):
+    sys.exit("DINOv3 LayerScale 仍是 nn.Identity —— 这是旧代码，git pull 后再跑")
+print("code check: DINOv3 LayerScale ok, CrossViTFusion ok")
+PYCHECK
+
+echo "=== batch=$BATCH_SIZE views=$NUM_VIEWS workers=$NUM_WORKERS lr=$LEARNING_RATE warmup=$WARMUP_STEPS \
+val_interval=$VAL_INTERVAL amp=$AMP steps=$STEPS spre=$SPRE resume=$RESUME build_priors=$BUILD_PRIORS smoke=$SMOKE ==="
 
 train_args=(
     --profile "$TRAIN_PROFILE"
@@ -62,6 +90,7 @@ train_args=(
     --num-workers "$NUM_WORKERS"
     --lr "$LEARNING_RATE"
     --warmup-steps "$WARMUP_STEPS"
+    --val-interval "$VAL_INTERVAL"
     --amp "$AMP"
     --spre "$SPRE"
     --name "$RUN_NAME"
@@ -79,6 +108,7 @@ case "$SMOKE" in
         train_args+=(
             --steps "$STEPS"
             --build-priors "$BUILD_PRIORS"
+            --resume "$RESUME"
         )
         ;;
     *)
