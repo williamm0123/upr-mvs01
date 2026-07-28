@@ -76,6 +76,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-refs", type=int, default=0, help="limit ref views per scan (0 = all 49)")
     p.add_argument("--num-workers", type=int, default=2)
     p.add_argument("--build-priors", choices=["auto", "skip", "force"], default="auto")
+    p.add_argument("--spre", choices=["auto", "on", "off"], default="auto",
+                   help="SPRE DINOv3 prior-reliability head: 'auto' (default) mirrors the checkpoint")
     # --- what this script adds ---
     p.add_argument("--no-in-scene", action="store_true",
                    help="drop the in-scene GT filter from the metric mask. MVSFormer++ has no such "

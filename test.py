@@ -30,6 +30,7 @@ import json
 import subprocess
 import sys
 from collections import defaultdict
+from dataclasses import replace
 from pathlib import Path
 
 import cv2
@@ -69,6 +70,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-scans", type=int, default=0)
     p.add_argument("--max-refs", type=int, default=0, help="limit ref views per scan (0 = all 49)")
     p.add_argument("--num-workers", type=int, default=2)
+    p.add_argument("--spre", choices=["auto", "on", "off"], default="auto",
+                   help="SPRE DINOv3 prior-reliability head: 'auto' (default) mirrors whatever the "
+                        "checkpoint was trained with; 'on'/'off' force it and load non-strictly.")
     p.add_argument("--out", default=None, help="output root (default outputs/test_<split>)")
     p.add_argument("--vis", type=int, default=0, help="save the first N depth visualizations per scan")
     p.add_argument("--build-priors", choices=["auto", "skip", "force"], default="auto")
@@ -169,11 +173,41 @@ def _resolve_ckpt(args) -> Path:
     )
 
 
+def _align_cfg_to_ckpt(cfg, state: dict, override: str = "auto"):
+    """Checkpoints store weights only, never the config they were trained with,
+    so architecture switches must be recovered from the key set. Currently that
+    means the SPRE head (``spre.*``, plus its optional ``spre.attn.*``); with
+    ``--spre auto`` the model is rebuilt to match the checkpoint."""
+    has_spre = any(k.startswith("spre.") for k in state)
+    want = has_spre if override == "auto" else (override == "on")
+    if want != cfg.spre.enabled:
+        cfg = replace(cfg, spre=replace(cfg.spre, enabled=want))
+        src = "checkpoint" if override == "auto" else f"--spre {override}"
+        print(f"[test] spre.enabled -> {want} (from {src})")
+    if want:
+        has_attn = any(k.startswith("spre.attn.") for k in state)
+        if override == "auto" and has_attn != cfg.spre.use_attention:
+            cfg = replace(cfg, spre=replace(cfg.spre, use_attention=has_attn))
+            print(f"[test] spre.use_attention -> {has_attn} (from checkpoint)")
+    return cfg, has_spre
+
+
 def load_model(cfg, args, device: torch.device) -> tuple[UprMVSNet, Path]:
     ckpt_path = _resolve_ckpt(args)
     ckpt = torch.load(ckpt_path, map_location=device)
+    state = ckpt["model"]
+    cfg, has_spre = _align_cfg_to_ckpt(cfg, state, getattr(args, "spre", "auto"))
     model = UprMVSNet(cfg).to(device)
-    model.load_state_dict(ckpt["model"])
+    if cfg.spre.enabled == has_spre:
+        model.load_state_dict(state)
+    else:
+        # explicit --spre override that contradicts the checkpoint: the SPRE
+        # weights are either absent (head stays at init) or unused (cached conf
+        # instead). Either way the numbers are NOT the trained model's.
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        print(f"[test] WARNING: --spre {args.spre} contradicts the checkpoint "
+              f"({len(missing)} missing / {len(unexpected)} unexpected keys); "
+              f"this is an ablation, not the trained configuration")
     model.eval()
     step = ckpt.get("step", "?")
     print(f"[test] loaded {ckpt_path} (step {step}, best_metric {ckpt.get('best_metric', float('nan')):.4f})")
