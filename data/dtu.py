@@ -31,7 +31,7 @@ class DTUMVSDataset(Dataset):
         self.height = kwargs.get('height', 512)
         self.width  = kwargs.get('width', 640)
         self.sfm_cache_dir = Path(ProjectPaths().sfm_cache_path)
-        self.prior_cache_dir = Path(ProjectPaths().project_path) / "log" / "prior_cache"
+        self.prior_cache_dir = Path(ProjectPaths().prior_cache_path)
         # 训练默认随机裁剪做增广, 其余模式居中裁剪保证可复现; 可用 kwarg 覆盖
         self.random_crop = kwargs.get('random_crop', mode == 'train')
         # prior 失败模式增强 (仅训练): 见 data/prior_corruption.py。默认关闭,

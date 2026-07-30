@@ -42,10 +42,32 @@ def _default_paths() -> dict[str, Path]:
     return {
             "project_path": project_path,
             "output_root": project_path/ "uprmvs_outputs",
+            # Every split — train, val AND test — is served from dtu_train_root:
+            # data/dtu.py reads Rectified_raw/ (1200x1600 PNG), Cameras/ and
+            # Depths_raw/ from it. For the 22 test scans that source is the
+            # official eval data: Cameras/ and pair.txt are byte-identical to
+            # dtu_testing/scan*/, and Rectified_raw/scan*/rect_*_3_r5000.png is
+            # the lossless original of dtu_testing/scan*/images/*.jpg (test modes
+            # pin light_idx=3). Reading it here additionally gives GT depth, so
+            # the depth metrics work on the test split too.
             "dtu_train_root": data_path / "DTU/dtu_training",
+            # The MVSNet-format eval set (scan*/{images,cams}/, pair.txt, no GT
+            # depth). NOT currently read by any code path — see above.
             "dtu_test_root": data_path / "DTU/dtu_testing",
             "dtu_list_path": project_path / "lists/dtu/train.txt",
             "sfm_cache_path":project_path / "log/sfm_depth",
+            # VGGT/DA3 depth+conf priors, one npz per (scan, ref_view, light).
+            # The filename encodes none of the resolutions it was built at, so a
+            # changed --prior-resize-scale / --prior-target-* needs a force rebuild.
+            "prior_cache_path": project_path / "log/prior_cache",
+            # per-view depth/conf/K/E/image that fusion consumes, plus metrics.json,
+            # under a <split>/ subdir. Kept after the run on purpose: re-fusing at
+            # different --photo-thresh/--geo-* costs nothing while re-running
+            # inference does.
+            "depth_cache_path": project_path / "log/depth_cache",
+            # fused point clouds from test.py, named mvsnet{scan:03d}_l3.ply —
+            # feed this directory straight to Fast-DTU-Evaluation --pred_dir.
+            "pred_points_path": project_path / "log/pred_points",
             "resnet50_weights_file": data_path / "Resnet50/Model_v2.pth",
             "dinov3_weights_file":
                 data_path/"DINOv3/pre_trained/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth",
@@ -65,6 +87,9 @@ class ProjectPaths:
     dtu_test_root: Path = _DEFAULT_PATHS["dtu_test_root"]
     dtu_list_path: Path = _DEFAULT_PATHS["dtu_list_path"]
     sfm_cache_path: Path = _DEFAULT_PATHS["sfm_cache_path"]
+    prior_cache_path: Path = _DEFAULT_PATHS["prior_cache_path"]
+    depth_cache_path: Path = _DEFAULT_PATHS["depth_cache_path"]
+    pred_points_path: Path = _DEFAULT_PATHS["pred_points_path"]
     resnet50_weights_file: Path = _DEFAULT_PATHS["resnet50_weights_file"]
     dinov3_weights_file: Path = _DEFAULT_PATHS["dinov3_weights_file"]
     da3_weights_file: Path = _DEFAULT_PATHS["da3_weights_file"]

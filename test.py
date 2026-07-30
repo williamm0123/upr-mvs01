@@ -1,27 +1,36 @@
-"""Test / evaluation driver for UprMVSNet.
+"""Inference / point-cloud driver for UprMVSNet.
 
-Three levels, fastest first:
+Runs the checkpoint over a DTU split and does two things:
 
-1. Depth metrics (default): run the checkpoint over a DTU split and report
-   masked depth-map errors (same masking as train.py validation) with a
-   per-scan breakdown plus median/p90. The quick "did it get better" signal.
-2. ``--fuse``: additionally cache per-view depth/conf and fuse each scan into
-   a point cloud (photometric + geometric consistency filtering), written as
-   ``<out>/ply/mvsnet{scan:03d}_l3.ply`` — the naming Fast-DTU-Evaluation
-   expects.
-3. ``--run-eval``: invoke the GPU Fast-DTU-Evaluation (accuracy /
-   completeness / overall against the official STL points) on the fused
-   clouds.
+1. Depth metrics: masked depth-map errors (same masking as train.py
+   validation) with a per-scan breakdown plus median/p90, written to
+   ``<out>/metrics.json``. Free — the same forward pass fusion needs.
+2. Fusion (default, ``--no-fuse`` to skip): caches per-view depth/conf and
+   fuses each scan into a point cloud (photometric + geometric consistency
+   filtering), written as ``cfg.paths.pred_points_path/mvsnet{scan:03d}_l3.ply``
+   (i.e. ``<project>/log/pred_points``) — the naming and layout
+   Fast-DTU-Evaluation expects.
 
-Priors: the network consumes cached depth/conf priors; missing entries for
-the requested split are built automatically (VGGT + DA3 loaded once) unless
-``--build-priors skip``.
+Scoring stops here: point the standalone Fast-DTU-Evaluation at that
+directory. ``run_fast_eval`` below still implements the subprocess call and
+``--run-eval`` still parses, but main() no longer invokes it — running the
+benchmark separately keeps a long fusion job from being held hostage by the
+scorer, and lets the scorer be re-run at different thresholds for free.
+
+Priors: the network never computes them inline — it reads a disk cache, which
+this script fills first (VGGT + DA3 loaded once, then freed before the MVS
+model is built). ``--prior-resize-scale`` decouples the cache resolution from
+``--resize-scale``; build once at 1.0 and every inference resolution is served
+by a downsample. The cache filename encodes only (scan, ref_view, light), NOT
+the resize or ``--prior-target-*``, so changing either needs ``--build-priors
+force`` — otherwise the stale cache is silently reused.
 
 Examples
 --------
-python test.py --split val                        # depth metrics on val scans
-python test.py --split test --max-refs 5          # quick test-split check
-python test.py --split test --fuse --run-eval     # full point-cloud benchmark
+python test.py --split test --build-priors force --priors-only   # phase 1
+python test.py --split test --build-priors skip                  # phase 2 -> ply
+python test.py --split val --no-fuse                             # depth metrics only
+python test.py --split test --max-refs 5 --no-fuse               # quick smoke check
 """
 from __future__ import annotations
 
@@ -47,7 +56,7 @@ from utils.geometry import unproject_depth
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser("UprMVSNet test / DTU evaluation")
-    p.add_argument("--profile", choices=["local", "umhpc"], default=None)
+    p.add_argument("--profile", choices=["local", "umhpc"], default="umhpc")
     p.add_argument("--device", default=None)
     p.add_argument("--ckpt", default=None, help="explicit checkpoint file; overrides --ckpt-dir")
     p.add_argument("--ckpt-dir", default="log/model_eval",
@@ -61,29 +70,58 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--full-image", action="store_true",
                    help="reconstruct the whole image (no center crop). Sets the crop window to the "
                         "full resized DTU frame (1200x1600 * resize_scale) so no pixels are dropped.")
+    p.add_argument("--prior-resize-scale", type=float, default=1.0,
+                   help="resize scale the prior cache is BUILT at, independent of --resize-scale "
+                        "(default 1.0 = native 1200x1600). Priors are stored at this resolution and "
+                        "resampled to the inference resolution on load, so building at 1.0 once serves "
+                        "every inference resolution — downsampling loses nothing, upsampling does. It "
+                        "also runs the SfM metric-scale calibration on the sharpest images. Only "
+                        "affects runs that actually build (--build-priors auto/force).")
     p.add_argument("--prior-target-w", type=int, default=None,
                    help="VGGT/DA3 prior width (default cfg 518; must be a multiple of 14). Raises the "
                         "true depth-prior resolution. Needs --build-priors force to take effect (else "
                         "the existing cache is reused). VGGT cost/memory grows ~O((w*h/196)^2).")
     p.add_argument("--prior-target-h", type=int, default=None,
                    help="VGGT/DA3 prior height (default cfg 420; must be a multiple of 14)")
+    p.add_argument("--scans", type=int, nargs="+", default=None, metavar="ID",
+                   help="run only these scan ids (e.g. --scans 1 4 9). Lets N jobs split the split "
+                        "across N GPUs: the ply filenames are per-scan so they can share --ply-dir, "
+                        "but give each job its own --out (the per-view npz cache and metrics.json).")
     p.add_argument("--max-scans", type=int, default=0)
     p.add_argument("--max-refs", type=int, default=0, help="limit ref views per scan (0 = all 49)")
     p.add_argument("--num-workers", type=int, default=2)
     p.add_argument("--spre", choices=["auto", "on", "off"], default="auto",
                    help="SPRE DINOv3 prior-reliability head: 'auto' (default) mirrors whatever the "
                         "checkpoint was trained with; 'on'/'off' force it and load non-strictly.")
-    p.add_argument("--out", default=None, help="output root (default outputs/test_<split>)")
+    p.add_argument("--out", default=None,
+                   help="per-view npz cache + metrics.json root (default "
+                        "cfg.paths.depth_cache_path/<split>, i.e. <project>/log/depth_cache/<split>). "
+                        "NOT where the ply goes — that is --ply-dir. Relative paths resolve under "
+                        "the project root.")
     p.add_argument("--vis", type=int, default=0, help="save the first N depth visualizations per scan")
-    p.add_argument("--build-priors", choices=["auto", "skip", "force"], default="auto")
+    p.add_argument("--build-priors", choices=["auto", "skip", "force"], default="auto",
+                   help="auto = fill in missing priors; force = rebuild all (needed after changing "
+                        "--prior-resize-scale / --prior-target-*, since the cache filename encodes "
+                        "none of them); skip = require a complete cache")
+    p.add_argument("--priors-only", action="store_true",
+                   help="exit after the prior phase, without loading the MVS model. Phase 1 of a "
+                        "two-process run: VGGT/DA3 are then fully gone before inference starts, and "
+                        "an interrupted build resumes with --build-priors auto instead of redoing it.")
     # fusion
-    p.add_argument("--fuse", action="store_true", help="save per-view outputs and fuse point clouds")
-    p.add_argument("--photo-thresh", type=float, default=0.3, help="stage-3 mode-probability threshold")
+    p.add_argument("--fuse", action=argparse.BooleanOptionalAction, default=True,
+                   help="save per-view outputs and fuse point clouds (default on; --no-fuse "
+                        "for depth metrics only)")
+    p.add_argument("--ply-dir", default=None,
+                   help="where the fused clouds go (default cfg.paths.pred_points_path, i.e. "
+                        "<project>/log/pred_points). Relative paths resolve under the project root.")
+    p.add_argument("--photo-thresh", type=float, default=0.3, help="stage-4 mode-probability threshold")
     p.add_argument("--geo-views", type=int, default=3, help="min consistent source views")
     p.add_argument("--geo-pix", type=float, default=1.0, help="max reprojection error (px)")
     p.add_argument("--geo-rel", type=float, default=0.01, help="max relative depth difference")
-    # Fast-DTU-Evaluation
-    p.add_argument("--run-eval", action="store_true", help="run Fast-DTU-Evaluation on the fused clouds")
+    # Fast-DTU-Evaluation — parsed but no longer driven from main(); see the module docstring.
+    p.add_argument("--run-eval", action="store_true",
+                   help="DEPRECATED / inert: scoring is now a separate Fast-DTU-Evaluation run "
+                        "against --ply-dir. Kept so old command lines still parse.")
     p.add_argument("--eval-tool", default="/home/william/Downloads/Fast-DTU-Evaluation")
     p.add_argument("--eval-gt", default="/home/william/project/dataset/DTU/SampleSet/MVS Data")
     p.add_argument("--eval-workers", type=int, default=1)
@@ -134,6 +172,12 @@ def build_dataset(cfg, args) -> DTUMVSDataset:
         if meta[0]:
             per_scan[meta[0]].append(meta)
     scans = list(per_scan)
+    if args.scans:
+        want = {f"scan{s}" for s in args.scans}
+        missing = want - set(scans)
+        if missing:
+            raise SystemExit(f"--scans: {sorted(missing)} not in {listfile}")
+        scans = [s for s in scans if s in want]
     if args.max_scans > 0:
         scans = scans[: args.max_scans]
     metas = []
@@ -176,19 +220,15 @@ def _resolve_ckpt(args) -> Path:
 def _align_cfg_to_ckpt(cfg, state: dict, override: str = "auto"):
     """Checkpoints store weights only, never the config they were trained with,
     so architecture switches must be recovered from the key set. Currently that
-    means the SPRE head (``spre.*``, plus its optional ``spre.attn.*``); with
-    ``--spre auto`` the model is rebuilt to match the checkpoint."""
+    means the SPRE head (``spre.*``, whose DINOv3/SVA trunk lives under
+    ``dino_sva.*``); with ``--spre auto`` the model is rebuilt to match the
+    checkpoint."""
     has_spre = any(k.startswith("spre.") for k in state)
     want = has_spre if override == "auto" else (override == "on")
     if want != cfg.spre.enabled:
         cfg = replace(cfg, spre=replace(cfg.spre, enabled=want))
         src = "checkpoint" if override == "auto" else f"--spre {override}"
         print(f"[test] spre.enabled -> {want} (from {src})")
-    if want:
-        has_attn = any(k.startswith("spre.attn.") for k in state)
-        if override == "auto" and has_attn != cfg.spre.use_attention:
-            cfg = replace(cfg, spre=replace(cfg.spre, use_attention=has_attn))
-            print(f"[test] spre.use_attention -> {has_attn} (from checkpoint)")
     return cfg, has_spre
 
 
@@ -215,12 +255,27 @@ def load_model(cfg, args, device: torch.device) -> tuple[UprMVSNet, Path]:
 
 
 def ensure_priors(ds: DTUMVSDataset, device: torch.device, mode: str,
-                  image_target_wh: tuple[int, int]) -> None:
+                  image_target_wh: tuple[int, int], prior_resize: float) -> None:
+    """Build the missing (or all, under 'force') priors, then free VGGT/DA3.
+
+    ``build_prior_cache`` drives ``ds.precrop_inputs``, which sizes its images
+    from ``ds.resize_scale`` — so the prior is stored at whatever resize the
+    dataset carries. Swap in ``prior_resize`` for the build and restore after,
+    which is what decouples the cache resolution from the inference resolution:
+    ``_match_hw`` resamples on load, and downsampling a 1200x1600 prior costs
+    nothing while upsampling a 600x800 one cannot invent detail.
+    """
     if mode == "skip":
         return
     from models.pre_prior import build_prior_cache
 
-    build_prior_cache(ds, device, overwrite=(mode == "force"), image_target_wh=image_target_wh)
+    saved = ds.resize_scale
+    ds.resize_scale = prior_resize
+    try:
+        build_prior_cache(ds, device, overwrite=(mode == "force"),
+                          image_target_wh=image_target_wh)
+    finally:
+        ds.resize_scale = saved
     torch.cuda.empty_cache() if device.type == "cuda" else None
 
 
@@ -438,8 +493,7 @@ def fuse_scan(scan_dir: Path, args, device: torch.device) -> tuple[np.ndarray, n
     return np.concatenate(all_pts), np.concatenate(all_cols)
 
 
-def run_fusion(out_root: Path, args, device: torch.device) -> Path:
-    ply_dir = out_root / "ply"
+def run_fusion(out_root: Path, ply_dir: Path, args, device: torch.device) -> Path:
     ply_dir.mkdir(parents=True, exist_ok=True)
     scan_dirs = sorted((out_root / "depth").iterdir())
     for sd in scan_dirs:
@@ -453,6 +507,11 @@ def run_fusion(out_root: Path, args, device: torch.device) -> Path:
 
 # --------------------------------------------------------------------------- #
 # Fast-DTU-Evaluation
+#
+# No longer called from main() — scoring runs as its own Fast-DTU-Evaluation
+# invocation against the ply directory. Kept because it encodes the exact
+# argument set the tool wants (and the first-run build hints); re-hook it in
+# main() if in-process scoring is ever wanted again.
 # --------------------------------------------------------------------------- #
 def run_fast_eval(ply_dir: Path, scan_ids: list[int], args) -> None:
     tool = Path(args.eval_tool)
@@ -480,16 +539,30 @@ def main() -> None:
     cfg = build_mvs_config(profile=args.profile)
     device = torch.device(args.device) if args.device else \
         torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    out_root = Path(args.out) if args.out else Path("outputs") / f"test_{args.split}"
+    # 逐视角 npz + metrics.json；和 ply 一样默认落在 config 的 log/ 下面
+    out_root = Path(args.out) if args.out else cfg.paths.depth_cache_path / args.split
+    if not out_root.is_absolute():
+        out_root = cfg.paths.project_path / out_root
     out_root.mkdir(parents=True, exist_ok=True)
+    # ply goes to the config path (<project>/log/pred_points) unless overridden,
+    # so it lands in the same place on the laptop and on the cluster.
+    ply_dir = Path(args.ply_dir) if args.ply_dir else cfg.paths.pred_points_path
+    if not ply_dir.is_absolute():
+        ply_dir = cfg.paths.project_path / ply_dir
 
     ds = build_dataset(cfg, args)
     scans = sorted({m[0] for m in ds.metas}, key=lambda s: int(s.replace("scan", "")))
     prior_wh = (args.prior_target_w or cfg.prior.target_w, args.prior_target_h or cfg.prior.target_h)
     print(f"[test] split={args.split} scans={len(scans)} samples={len(ds)} out={out_root} "
-          f"resize={args.resize_scale} full_image={args.full_image} prior_target_wh={prior_wh}")
+          f"resize={args.resize_scale} full_image={args.full_image} prior_target_wh={prior_wh} "
+          f"prior_resize={args.prior_resize_scale}")
+    if args.fuse and not args.priors_only:
+        print(f"[test] fused point clouds -> {ply_dir}")
 
-    ensure_priors(ds, device, args.build_priors, prior_wh)
+    ensure_priors(ds, device, args.build_priors, prior_wh, args.prior_resize_scale)
+    if args.priors_only:
+        print("[test] --priors-only: prior phase done, exiting before the MVS model")
+        return
     model, ckpt_path = load_model(cfg, args, device)
 
     result = run_inference(model, ds, cfg, args, device, out_root)
@@ -508,12 +581,21 @@ def main() -> None:
     (out_root / "metrics.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print(f"[test] wrote {out_root / 'metrics.json'}")
 
-    if args.fuse:
-        del model
-        torch.cuda.empty_cache() if device.type == "cuda" else None
-        ply_dir = run_fusion(out_root, args, device)
-        if args.run_eval:
-            run_fast_eval(ply_dir, [int(s.replace("scan", "")) for s in scans], args)
+    if not args.fuse:
+        return
+
+    del model
+    torch.cuda.empty_cache() if device.type == "cuda" else None
+    run_fusion(out_root, ply_dir, args, device)
+
+    # Scoring is deliberately detached: run Fast-DTU-Evaluation against ply_dir.
+    scan_ids = " ".join(str(int(s.replace("scan", ""))) for s in scans)
+    print(f"\n[test] {len(scans)} clouds in {ply_dir}\n"
+          f"[test] score them with:\n"
+          f"  python eval_dtu.py --scans {scan_ids} --method mvsnet \\\n"
+          f"      --pred_dir {ply_dir} --gt_dir <DTU GT root> --save")
+    if args.run_eval:
+        print("[test] note: --run-eval is inert now; scoring runs as its own job (see above)")
 
 
 if __name__ == "__main__":
