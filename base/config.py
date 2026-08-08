@@ -205,7 +205,21 @@ class CostVolumeConfig:
     num_depths_stage1: int = 48   # = depth_range.num_global + num_local
     num_depths_stage2: int = 16
     num_depths_stage3: int = 8
-    num_depths_stage4: int = 4
+    # 4 -> 8: the isolated quantisation test. The stage-4 window is unchanged
+    # (refine_range_from_posterior still uses range_k[2] / range_min_gi[2]), so
+    # doubling the plane count halves the terminal bin — 2*half/7 instead of
+    # 2*half/3, i.e. 0.43x — and nothing else moves. If DTU Acc does not improve,
+    # the terminal bin was not the binding constraint and the three-stage
+    # restructure should not be attempted for that reason.
+    #
+    # Costs: stage 4 is the full-resolution stage and dominates memory, so this
+    # roughly doubles the largest term (total cost-volume voxels 2.54M -> 3.86M
+    # at 512x640, ~1.5x). Revert to 4 here if it will not fit.
+    #
+    # It also un-saturates the fusion confidence: mode_window=2 spans
+    # min(5, D) bins, which was the whole axis at D=4 (see test.py
+    # posterior_confidence) and is 5 of 8 now.
+    num_depths_stage4: int = 8
     stage1_meta_channels: int = 6
     # Warp width shrinks as resolution grows; stage 1 moved to stride 8 so it
     # can afford to stay wide.
@@ -294,6 +308,30 @@ class StageWeights:
     stage4: float = 2.0
 
 
+_ALL_SCALES: tuple[tuple[int, int], ...] = (
+    (448, 576), (448, 640), (512, 640), (512, 704), (512, 768),
+    (576, 704), (576, 768), (576, 832), (640, 832), (640, 896),
+)
+
+
+def _augment_scales() -> tuple[tuple[int, int], ...]:
+    """Multi-scale crop menu, capped by ``UPRMVS_MAX_SCALE`` (max crop height).
+
+    Peak memory is set by the largest crop in the menu, not the average one, so
+    dropping the top entries is the cheapest OOM fallback available: it changes
+    neither the model nor the batch size, only how big the biggest step gets.
+    ``UPRMVS_MAX_SCALE=576`` drops the two 640-high crops.
+    """
+    cap = os.environ.get("UPRMVS_MAX_SCALE")
+    if not cap:
+        return _ALL_SCALES
+    limit = int(cap)
+    kept = tuple(s for s in _ALL_SCALES if s[0] <= limit)
+    if not kept:
+        raise ValueError(f"UPRMVS_MAX_SCALE={limit} excludes every crop in {_ALL_SCALES}")
+    return kept
+
+
 @dataclass(frozen=True)
 class AugmentConfig:
     """Training-time augmentation (train split only; val/test stay deterministic).
@@ -312,10 +350,7 @@ class AugmentConfig:
     max_gamma: float = 1.1
 
     multi_scale: bool = True
-    scales: tuple[tuple[int, int], ...] = (
-        (448, 576), (448, 640), (512, 640), (512, 704), (512, 768),
-        (576, 704), (576, 768), (576, 832), (640, 832), (640, 896),
-    )
+    scales: tuple[tuple[int, int], ...] = field(default_factory=lambda: _augment_scales())
     resize_range: tuple[float, float] = (1.0, 1.2)
 
 

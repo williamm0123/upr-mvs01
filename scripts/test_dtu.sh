@@ -48,7 +48,7 @@ PRIOR_RESIZE=${PRIOR_RESIZE:-1.0}   # prior 按原生 1200x1600 建，与下面�
 # ---- 推理设置 ---------------------------------------------------------------
 NUM_VIEWS=${NUM_VIEWS:-5}         # 与训练一致：1 参考 + 4 源视图。降到 3 会明显变差
                                   # （scan1 实测 abs_err 0.493 -> 0.560），别为省显存动它。
-RESIZE=${RESIZE:-1.0}             # 1600x1200 -> 1280x960
+RESIZE=${RESIZE:-0.8}             # 1600x1200 -> 1280x960
 FULL_IMAGE=${FULL_IMAGE:-1}       # 1 = 整幅不裁剪。裁剪只重建 68% 画面，完整度虚高。
                                   # 5060Ti 16G 上限：0.8+整幅+5视角 = 9.26 GiB 可以；
                                   # 1.0+整幅+5视角 = 14.22 GiB 实跑 OOM。
@@ -57,7 +57,7 @@ VIS=${VIS:-0}                     # 每个 scan 存前 N 张深度可视化 png
 
 # ---- 融合 -------------------------------------------------------------------
 FUSE=${FUSE:-1}                   # 0 = 只算深度图指标，不融合
-PHOTO_THRESH=${PHOTO_THRESH:-0.3} # stage4 众数概率阈值，调高 -> acc 好 comp 差
+PHOTO_THRESH=${PHOTO_THRESH:-0.7} # stage4 众数概率阈值，调高 -> acc 好 comp 差
 GEO_VIEWS=${GEO_VIEWS:-3}         # 最少几个源视图几何一致
 GEO_PIX=${GEO_PIX:-1.0}           # 重投影误差上限（像素）
 GEO_REL=${GEO_REL:-0.01}          # 相对深度差上限

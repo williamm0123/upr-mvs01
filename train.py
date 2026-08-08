@@ -64,6 +64,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from base.config import ProjectPaths, build_mvs_config
 from losses import MVSLoss
 from models.network import UprMVSNet
+from utils.stage_metrics import stage_diagnostics
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -123,6 +124,66 @@ def depth_metrics(pred: torch.Tensor, gt: torch.Tensor, mask: torch.Tensor) -> d
     }
 
 
+def cascade_signature(net) -> dict:
+    """The parts of the cascade layout the state_dict cannot express."""
+    return {"strides": list(net.fpn_stage_strides), "num_depths": list(net.num_depths)}
+
+
+def scene_metric_mask(batch: dict) -> torch.Tensor:
+    """``mask`` with GT outside the scene's physical depth range removed.
+
+    Those pixels are unreachable by any hypothesis confined to [dmin, dmax]. The
+    loss already excludes them, so the pixel metrics and the stage diagnostics
+    must exclude them too or the three sets of numbers stop being comparable.
+    """
+    gt = batch["depth_gt"].float()
+    m = batch["mask"].float()
+    if "depth_values" in batch:
+        dv = batch["depth_values"].float()
+        in_scene = (gt >= dv.amin(dim=1).view(-1, 1, 1)) & (gt <= dv.amax(dim=1).view(-1, 1, 1))
+        m = m * in_scene.float()
+    return m
+
+
+def _fmt_stage_line(d: dict[str, float], stages: tuple[str, ...]) -> str:
+    """One-line cascade summary: is each stage refining, and why not."""
+    parts = []
+    for s in stages:
+        if f"{s}/mae" not in d:
+            continue
+        parts.append(
+            f"{s[-1]}: mae={d[f'{s}/mae']:.2f} orc={d.get(f'{s}/oracle_err', float('nan')):.2f} "
+            f"sel={d.get(f'{s}/selection_err', float('nan')):+.2f} "
+            f"bin={d.get(f'{s}/bin_mode_mm', float('nan')):.2f} "
+            f"ir={d.get(f'{s}/in_range', float('nan')):.3f}"
+        )
+    return " | ".join(parts)
+
+
+def _print_val(m: dict[str, float], step: int, stages: tuple[str, ...], final: bool = False) -> None:
+    """Three lines, not ninety.
+
+    The stage diagnostics add ~90 scalars; dumping them all on one line makes
+    the val output unreadable in a SLURM log. Everything still reaches
+    TensorBoard — this prints only what a human watches a run for.
+    """
+    tag = "val final step" if final else "val step"
+    print(f"[{tag} {step}] " + " ".join(
+        f"{k}={m[k]:.4f}" for k in
+        ("abs_err", "acc_2mm", "acc_4mm", "acc_8mm", "abs_err_body_2mm",
+         "abs_err_tail_8mm", "tail_frac_8mm") if k in m))
+    cascade = _fmt_stage_line(m, stages)
+    if cascade:
+        print(f"          {cascade}")
+    rc = " ".join(f"{k.split('/')[-1]}={m[k]:.3f}" for k in sorted(m)
+                  if k.startswith("rc/ause_"))
+    last = stages[-1] if stages else ""
+    acc = " ".join(f"{k.split('/')[-1]}={m[k]:.3f}" for k in
+                   (f"{last}/acc_0.25mm", f"{last}/acc_0.5mm", f"{last}/acc_1mm") if k in m)
+    if rc or acc:
+        print(f"          {acc}   AUSE: {rc}")
+
+
 def _norm_map(x: torch.Tensor, vmin: float, vmax: float) -> torch.Tensor:
     x = (x.float() - vmin) / (vmax - vmin + 1e-8)
     return x.clamp(0, 1).unsqueeze(0)  # [1, H, W]
@@ -169,7 +230,7 @@ class WindowedMeter:
     def reset(self) -> None:
         self.sums = torch.zeros(self.N_SLOTS, dtype=torch.float64, device=self.device)
         self.log_sums: dict[str, float] = {}
-        self.log_counts: dict[str, int] = {}
+        self.log_counts: dict[str, float] = {}
         self.batch_means: list[float] = []
 
     @torch.no_grad()
@@ -209,8 +270,14 @@ class WindowedMeter:
                     self.sums[10] += mk.sum()
         if logs:
             for k, v in logs.items():
-                self.log_sums[k] = self.log_sums.get(k, 0.0) + float(v)
-                self.log_counts[k] = self.log_counts.get(k, 0) + 1
+                # A ``(sum, count)`` pair is pixel-weighted; a bare float is one
+                # observation. Accepting both lets the loss keep emitting batch
+                # means while utils.stage_metrics stays pixel-weighted, without
+                # a second merge path (and the cross-rank merge below is already
+                # count-aware, so nothing else changes).
+                s, c = v if isinstance(v, tuple) else (v, 1.0)
+                self.log_sums[k] = self.log_sums.get(k, 0.0) + float(s)
+                self.log_counts[k] = self.log_counts.get(k, 0.0) + float(c)
 
     def flush(self) -> tuple[dict[str, float], dict[str, float]]:
         """All-reduce (collective — every rank must call this at the same step)
@@ -249,19 +316,19 @@ class WindowedMeter:
         else:
             payload = [(self.log_sums, self.log_counts, self.batch_means)]
         log_sums: dict[str, float] = {}
-        log_counts: dict[str, int] = {}
+        log_counts: dict[str, float] = {}
         batch_means: list[float] = []
         for rank_sums, rank_counts, rank_means in payload:
             for k, v in rank_sums.items():
                 log_sums[k] = log_sums.get(k, 0.0) + v
-                log_counts[k] = log_counts.get(k, 0) + rank_counts[k]
+                log_counts[k] = log_counts.get(k, 0.0) + rank_counts[k]
             batch_means.extend(rank_means)
 
         if batch_means:
             bm = np.asarray(batch_means)
             metrics["abs_err_batch_median"] = float(np.median(bm))
             metrics["abs_err_batch_p90"] = float(np.percentile(bm, 90))
-        avg_logs = {k: log_sums[k] / max(log_counts[k], 1) for k in sorted(log_sums)}
+        avg_logs = {k: log_sums[k] / max(log_counts[k], 1.0) for k in sorted(log_sums)}
         self.reset()
         return metrics, avg_logs
 
@@ -281,13 +348,18 @@ class TrainLogger:
     def _tag(cls, name: str) -> str:
         return f"{cls.TAG_PREFIX}/{name}"
 
-    def __init__(self, run_name: str, enabled: bool) -> None:
+    def __init__(self, run_name: str, enabled: bool, smoke: bool = False) -> None:
         self.enabled = enabled
         self.best_metric = float("inf")
         if not enabled:
             return
         log_root = ProjectPaths().project_path / "log"
-        self.model_dir = log_root / "model"
+        # A smoke run trains a randomly-initialised model for a couple of steps
+        # on synthetic data and then calls save() — into the same latest.pth /
+        # best.pth a real run writes. It will always "improve" on a fresh
+        # best_metric of +inf, so running --smoke in a checkout that holds a
+        # trained checkpoint silently destroys it. Give smoke its own directory.
+        self.model_dir = log_root / ("model_smoke" if smoke else "model")
         self.model_dir.mkdir(parents=True, exist_ok=True)
         # Timestamp the run subdir so repeated runs with the same --name land in
         # distinct TensorBoard directories instead of piling onto one another.
@@ -309,6 +381,9 @@ class TrainLogger:
             if key == "loss":
                 continue
             stage, _, field = key.partition("/")
+            if not field:                      # flat key (valid_px, ...)
+                self.tb.add_scalar(self._tag(f"diag_{stage}"), value, step)
+                continue
             prefix = "loss" if field.startswith(("ce", "reg")) else "diag"
             self.tb.add_scalar(self._tag(f"{prefix}_{stage}_{field}"), value, step)
         self.tb.add_scalar(self._tag("learning_rate"), lr, step)
@@ -358,12 +433,18 @@ class TrainLogger:
         is_best = val_metric is not None and val_metric < self.best_metric
         if is_best:
             self.best_metric = float(val_metric)
-        state = (model.module if isinstance(model, DDP) else model).state_dict()
+        net = model.module if isinstance(model, DDP) else model
         ckpt = {
             "step": step,
-            "model": state,
+            "model": net.state_dict(),
             "optimizer": optimizer.state_dict(),
             "best_metric": self.best_metric,
+            # Hypothesis counts do NOT appear in the state_dict — a Conv3d kernel
+            # is [out, in, 3, 3, 3] whatever D is. So changing num_depths_stage*
+            # leaves a checkpoint that loads cleanly and behaves differently, and
+            # a requeued job would resume a 4-plane model into an 8-plane cascade
+            # without a word. Record the shape so resume can refuse.
+            "cascade": cascade_signature(net),
         }
         torch.save(ckpt, self.model_dir / "latest.pth")
         if is_best:
@@ -523,7 +604,7 @@ def main_worker(
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     run_name = args.name + ("_smoke" if args.smoke else "")
-    logger = TrainLogger(run_name, enabled=is_main)
+    logger = TrainLogger(run_name, enabled=is_main, smoke=bool(args.smoke))
 
     # Resume from latest.pth so a walltime-killed job continues where it left
     # off (model + optimizer + step + best val metric). Every rank loads the
@@ -534,8 +615,18 @@ def main_worker(
         ckpt_path = ProjectPaths().project_path / "log" / "model" / "latest.pth"
         if ckpt_path.exists():
             ckpt = torch.load(ckpt_path, map_location=device)
+            net = model.module if isinstance(model, DDP) else model
+            want = cascade_signature(net)
+            have = ckpt.get("cascade")
+            if have is not None and have != want:
+                raise RuntimeError(
+                    f"{ckpt_path} was trained with cascade {have}, this run is {want}.\n"
+                    "The state_dict would load anyway — hypothesis counts are not in it — so "
+                    "resuming would silently train one layout on another's weights.\n"
+                    "Start fresh with --resume off (and move the stale checkpoint aside)."
+                )
             try:
-                (model.module if isinstance(model, DDP) else model).load_state_dict(ckpt["model"])
+                net.load_state_dict(ckpt["model"])
             except RuntimeError as exc:
                 # An architecture change (SPRE's cross-ViT fusion, DINOv3's
                 # LayerScale, ...) makes old checkpoints unloadable. Failing
@@ -594,27 +685,43 @@ def _run_smoke(model, loss_fn, optimizer, scaler, cfg, device, args, logger, is_
     for step in range(args.smoke_steps):
         batch = _synthetic_batch(cfg, device, cfg.train.batch_size)
         logs, outputs = _train_step(model, loss_fn, optimizer, scaler, batch, cfg, device, step, use_amp)
+        # Exercise the diagnostics here too: they run reductions over every
+        # stage's hypothesis axis, so a shape mistake after a cascade change
+        # should surface in the smoke test rather than 2000 steps into a job.
+        diag = stage_diagnostics(outputs, batch["depth_gt"].float(), scene_metric_mask(batch),
+                                 loss_fn.stage_names,
+                                 corrupt_mask=batch.get("prior_corrupt_mask"))
         if is_main:
             metrics = depth_metrics(outputs["depth_full"], batch["depth_gt"], batch["mask"])
-            logger.log_scalars(logs, cfg.train.lr, metrics, step)
+            flat = {k: s / max(c, 1.0) for k, (s, c) in diag.items()}
+            logger.log_scalars({**logs, **flat}, cfg.train.lr, metrics, step)
             logger.log_images(batch, outputs, step)
             logger.save(model, optimizer, step, val_metric=logs["loss"])
             print(f"[smoke step {step}] loss={logs['loss']:.4f} abs_err={metrics.get('abs_err', float('nan')):.2f}")
+            print(f"          {_fmt_stage_line(flat, loss_fn.stage_names)}")
     if is_main:
-        print("[smoke] OK - model + loss + backward + tensorboard + ckpt path verified")
+        print(f"[smoke] OK - model + loss + backward + {len(diag)} stage diagnostics "
+              "+ tensorboard + ckpt path verified")
 
 
 @torch.no_grad()
-def _run_validation(model, loader, device, use_amp, is_ddp) -> dict[str, float]:
-    """Masked depth metrics over the val split.
+def _run_validation(model, loader, device, use_amp, is_ddp,
+                    stage_names: tuple[str, ...] = ()) -> dict[str, float]:
+    """Masked depth metrics over the val split, plus per-stage diagnostics.
 
     All ranks run their DistributedSampler shard and the pixel-weighted sums are
     all-reduced, so the result is identical on every rank (and SyncBN-safe,
-    should it ever be enabled)."""
+    should it ever be enabled).
+
+    The stage diagnostics come from the same forward pass, so they cost only
+    their reductions — this is the val-side half of the "no per-stage fusion"
+    decision (see utils/stage_metrics)."""
     model.eval()
     # [abs_err_sum, pixel_count, hits<2mm, hits<4mm, hits<8mm,
     #  body2_err_sum, body4_err_sum, body8_err_sum]  (see WindowedMeter for why)
     stats = torch.zeros(8, device=device, dtype=torch.float64)
+    diag_sums: dict[str, float] = {}
+    diag_counts: dict[str, float] = {}
     for batch in loader:
         batch = {k: (v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v)
                  for k, v in batch.items()}
@@ -634,8 +741,26 @@ def _run_validation(model, loader, device, use_amp, is_ddp) -> dict[str, float]:
                 hit = err < t
                 stats[2 + i] += hit.sum()
                 stats[5 + i] += err[hit].sum()
+        if stage_names:
+            for k, (s, c) in stage_diagnostics(
+                outputs, gt, m.float(), stage_names,
+                corrupt_mask=batch.get("prior_corrupt_mask"),
+            ).items():
+                diag_sums[k] = diag_sums.get(k, 0.0) + s
+                diag_counts[k] = diag_counts.get(k, 0.0) + c
     if is_ddp:
         dist.all_reduce(stats)
+        # Key set is rank-dependent (a diagnostic is emitted only when its mask
+        # is non-empty), so this cannot be a fixed-layout tensor collective —
+        # a per-rank length mismatch would hang the job instead of logging a
+        # wrong number. Same reasoning as WindowedMeter.flush.
+        payload: list = [None] * dist.get_world_size()
+        dist.all_gather_object(payload, (diag_sums, diag_counts))
+        diag_sums, diag_counts = {}, {}
+        for rank_sums, rank_counts in payload:
+            for k, v in rank_sums.items():
+                diag_sums[k] = diag_sums.get(k, 0.0) + v
+                diag_counts[k] = diag_counts.get(k, 0.0) + rank_counts[k]
     model.train()
     if stats[1].item() == 0:
         raise RuntimeError(
@@ -643,7 +768,7 @@ def _run_validation(model, loader, device, use_amp, is_ddp) -> dict[str, float]:
             "misconfigured (empty list, missing GT, or all-zero masks)"
         )
     n = stats[1]
-    return {
+    out = {
         "abs_err": float(stats[0] / n),
         "acc_2mm": float(stats[2] / n),
         "acc_4mm": float(stats[3] / n),
@@ -653,6 +778,8 @@ def _run_validation(model, loader, device, use_amp, is_ddp) -> dict[str, float]:
         "abs_err_tail_8mm": float((stats[0] - stats[7]) / (n - stats[4]).clamp(min=1)),
         "tail_frac_8mm": float((n - stats[4]) / n),
     }
+    out.update({k: diag_sums[k] / max(diag_counts[k], 1.0) for k in sorted(diag_sums)})
+    return out
 
 
 class _EpochShuffleSampler(torch.utils.data.Sampler):
@@ -749,6 +876,11 @@ def _run_training(model, loss_fn, optimizer, scaler, cfg, device, args, world_si
     model.train()
     use_amp = cfg.train.amp and device.type == "cuda"
     meter = WindowedMeter(device, is_ddp)
+    stage_names = loss_fn.stage_names
+    # ~4 diagnostic samples per logging window. Every rank uses the same step
+    # counter, so the sampled steps agree across ranks and the count-weighted
+    # cross-rank merge stays exact.
+    diag_interval = max(1, cfg.train.log_interval // 4)
     step = start_step
     epoch = start_step // max(len(loader), 1)
     while step < max_steps:
@@ -771,11 +903,17 @@ def _run_training(model, loss_fn, optimizer, scaler, cfg, device, args, world_si
             # GT beyond the scene's physical depth range is unreachable by any
             # in-range hypothesis — excluded from metrics (loss excludes it too).
             gt_b = batch["depth_gt"].float()
-            metric_mask = batch["mask"].float()
-            if "depth_values" in batch:
-                dv_b = batch["depth_values"].float()
-                in_scene = (gt_b >= dv_b.amin(dim=1).view(-1, 1, 1)) & (gt_b <= dv_b.amax(dim=1).view(-1, 1, 1))
-                metric_mask = metric_mask * in_scene.float()
+            metric_mask = scene_metric_mask(batch)
+            # Per-stage diagnostics are ~4 reductions per stage, but they are the
+            # only thing that separates a placement failure (oracle_err) from a
+            # selection failure (selection_err). Run them a few times per logging
+            # window rather than every step: enough samples to average, negligible
+            # cost next to the forward pass.
+            if step % diag_interval == 0:
+                logs = {**logs, **stage_diagnostics(
+                    outputs, gt_b, metric_mask, stage_names,
+                    corrupt_mask=batch.get("prior_corrupt_mask"),
+                )}
             meter.update(
                 outputs["depth_full"].detach(),
                 gt_b,
@@ -794,27 +932,30 @@ def _run_training(model, loss_fn, optimizer, scaler, cfg, device, args, world_si
                         f"prior_err={win_metrics.get('prior_abs_err', float('nan')):.2f} "
                         f"rescue_err={win_metrics.get('abs_err_prior_corrupted', float('nan')):.2f}"
                     )
+                    cascade = _fmt_stage_line(win_logs, stage_names)
+                    if cascade:
+                        print(f"          {cascade}")
             if is_main and cfg.train.vis_interval > 0 and step % cfg.train.vis_interval == 0:
                 logger.log_images(batch, outputs, step)
             # Validation runs on ALL ranks (metrics are all-reduced); the
             # elif keeps ckpt_interval multiples of val_interval from double-saving.
             if step > 0 and cfg.train.val_interval > 0 and step % cfg.train.val_interval == 0:
-                val_metrics = _run_validation(model, val_loader, device, use_amp, is_ddp)
+                val_metrics = _run_validation(model, val_loader, device, use_amp, is_ddp, stage_names)
                 if is_main:
                     logger.log_val(val_metrics, step)
                     logger.save(model, optimizer, step, val_metric=val_metrics["abs_err"])
-                    print(f"[val step {step}] " + " ".join(f"{k}={v:.4f}" for k, v in val_metrics.items()))
+                    _print_val(val_metrics, step, stage_names)
             elif is_main and step > 0 and step % cfg.train.ckpt_interval == 0:
                 logger.save(model, optimizer, step)
             step += 1
         epoch += 1
 
     # Final validation so the last weights are also considered for best.pth.
-    val_metrics = _run_validation(model, val_loader, device, use_amp, is_ddp)
+    val_metrics = _run_validation(model, val_loader, device, use_amp, is_ddp, stage_names)
     if is_main:
         logger.log_val(val_metrics, step)
         logger.save(model, optimizer, step, val_metric=val_metrics["abs_err"])
-        print(f"[val final step {step}] " + " ".join(f"{k}={v:.4f}" for k, v in val_metrics.items()))
+        _print_val(val_metrics, step, stage_names, final=True)
 
 
 def _worker_init(worker_id: int) -> None:

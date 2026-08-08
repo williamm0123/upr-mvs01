@@ -10,6 +10,12 @@ TRAIN_PROFILE=${TRAIN_PROFILE:-local}   # local = 单卡档 (max_steps 20000)；
 RUN_NAME=${RUN_NAME:-uprmvs_1gpu_${SLURM_JOB_ID:-manual}}
 
 # 核心训练参数（命令行会覆盖 TRAIN_PROFILE 中的同名参数）
+# !! 末级假设数已从 4 改为 8 (base/config.py num_depths_stage4)。stage 4 是全
+#    分辨率级、显存占大头, 这一改把最大的那一项翻倍 (512x640 下 cost volume 体素
+#    2.54M -> 3.86M, 约 1.5x)。OOM 的退让顺序:
+#      1) BATCH_SIZE 2 -> 1
+#      2) UPRMVS_MAX_SCALE=576 (砍掉 augment 里 640x832 / 640x896 两档)
+#      3) 把 num_depths_stage4 改回 4 (那就等于放弃 P5 这个实验)
 BATCH_SIZE=${BATCH_SIZE:-2}       # 每卡 batch；SPRE 现在对全部 NUM_VIEWS 个视角跑 DINOv3，OOM 就设 1
 NUM_VIEWS=${NUM_VIEWS:-5}         # MVS 总视图数：1 个参考视图 + 4 个源视图
 NUM_WORKERS=${NUM_WORKERS:-16}    # DataLoader 进程数；32 CPU 下建议 8~16
@@ -20,10 +26,15 @@ AMP=${AMP:-on}                    # on/off；A100 建议 on
 STEPS=${STEPS:-0}                 # 0=使用 profile 默认值；测试可设 2
 SPRE=${SPRE:-on}                  # on/off：DINOv3 先验可靠度头（SPRE）
 
-# RESUME: auto=从 log/model/latest.pth 续跑（SLURM 重排队要靠它）；off=从头开始。
-# ！！4 级级联重构之后（3 级 -> 4 级、假设数 48-16-8-4、DINO 进 FPN），旧
-# checkpoint 的 state_dict 完全对不上，auto 会直接报错退出。第一次训练必须
-# RESUME=off。
+# FRESH=1（默认）：训练开始前把 log/model/ 里已有的 .pth 整体挪到
+# log/model.bak_<时间戳>/。挪走不是删除，但本次训练绝对读不到任何旧权重。
+# 之所以必须物理隔离而不是靠加载报错兜底：末级 D4->D8 不改变 state_dict
+# （Conv3d 权重是 [out,in,3,3,3]，与 D 无关），旧 checkpoint 会干净地加载进来
+# 然后训练一个不是你要的模型。train.py 的级联签名检查是第二道防线。
+FRESH=${FRESH:-1}
+# RESUME=auto 在 FRESH=1 之后是安全的：目录已被清空，auto 找不到东西，从 step 0
+# 开始；SLURM 重排队时 job id 不变，preflight 认出是同一次运行、跳过归档，auto
+# 于是正确续上本次训练自己写的 checkpoint。要完全禁用续跑就设 RESUME=off。
 RESUME=${RESUME:-auto}
 
 # 先验与跑通测试
@@ -53,36 +64,24 @@ export PYTHONUNBUFFERED=1
 # 缓解显存碎片（错误信息里 "reserved but unallocated" 就是碎片）。可被外部覆盖。
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 
-# 旧 checkpoint 配 auto 必然崩，且要跑完先验构建才崩，白等很久。先拦下来。
-if [[ "$RESUME" == "auto" && -f "log/model/latest.pth" ]]; then
-    echo "=== 注意: log/model/latest.pth 存在且 RESUME=auto ==="
-    echo "如果这份 checkpoint 早于 4 级级联重构，加载会失败。"
-    echo "从头开始:  RESUME=off bash $0"
-    echo "或先挪走:  mv log/model/latest.pth log/model/latest.pth.pre_4stage"
-fi
 
 echo "=== job=${SLURM_JOB_ID:-manual} host=$(hostname) profile=$TRAIN_PROFILE ==="
 nvidia-smi -L
 echo "=== python=$PYTHON_BIN ==="
 "$PYTHON_BIN" -c 'import importlib.util, sys, torch, huggingface_hub; print("python:", sys.executable); print("torch:", torch.__version__, torch.__file__); print("huggingface_hub:", huggingface_hub.__version__); print("vggt:", importlib.util.find_spec("vggt.models.vggt").origin)'
 
-# 确认跑的是改动后的代码：LayerScale 必须已接回（否则 DINOv3 特征是常数图），
-# CrossViTFusion 必须存在。任一缺失说明 checkout 是旧的，直接退出而不是白跑一天。
-"$PYTHON_BIN" - <<'PYCHECK'
-import sys
-from models.dinov3.vision_transformer import vit_base
-from models.spre import SVAFusion, DinoSVA  # noqa: F401
-from models.network import UprMVSNet
-blk = vit_base(patch_size=16, n_storage_tokens=4).blocks[0]
-if not hasattr(blk.ls1, "gamma"):
-    sys.exit("DINOv3 LayerScale 仍是 nn.Identity —— 这是旧代码，git pull 后再跑")
-if UprMVSNet.fpn_stage_strides != (8, 4, 2, 1):
-    sys.exit(f"级联仍是 {UprMVSNet.fpn_stage_strides} —— 这是旧代码，git pull 后再跑")
-print("code check: LayerScale ok, SVAFusion ok, 4-stage cascade ok")
-PYCHECK
+# 确认跑的是改动后的代码，并（FRESH=1 时）把旧 checkpoint 挪开。
+# 任一检查失败说明 checkout 是旧的，直接退出而不是白跑一天。
+# SMOKE 不归档：冒烟跑合成数据、写 log/model_smoke/，不该动真实训练的目录。
+preflight_args=()
+if [[ "$FRESH" == "1" && "$SMOKE" != "1" ]]; then
+    preflight_args+=(--fresh --run-id "${SLURM_JOB_ID:-manual}")
+fi
+"$PYTHON_BIN" scripts/preflight.py "${preflight_args[@]}"
 
 echo "=== batch=$BATCH_SIZE views=$NUM_VIEWS workers=$NUM_WORKERS lr=$LEARNING_RATE warmup=$WARMUP_STEPS \
-val_interval=$VAL_INTERVAL amp=$AMP steps=$STEPS spre=$SPRE resume=$RESUME build_priors=$BUILD_PRIORS smoke=$SMOKE ==="
+val_interval=$VAL_INTERVAL amp=$AMP steps=$STEPS spre=$SPRE fresh=$FRESH resume=$RESUME \
+build_priors=$BUILD_PRIORS smoke=$SMOKE max_scale=${UPRMVS_MAX_SCALE:-none} ==="
 
 train_args=(
     --profile "$TRAIN_PROFILE"
