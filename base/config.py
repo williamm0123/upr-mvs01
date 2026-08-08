@@ -42,31 +42,13 @@ def _default_paths() -> dict[str, Path]:
     return {
             "project_path": project_path,
             "output_root": project_path/ "uprmvs_outputs",
-            # Every split — train, val AND test — is served from dtu_train_root:
-            # data/dtu.py reads Rectified_raw/ (1200x1600 PNG), Cameras/ and
-            # Depths_raw/ from it. For the 22 test scans that source is the
-            # official eval data: Cameras/ and pair.txt are byte-identical to
-            # dtu_testing/scan*/, and Rectified_raw/scan*/rect_*_3_r5000.png is
-            # the lossless original of dtu_testing/scan*/images/*.jpg (test modes
-            # pin light_idx=3). Reading it here additionally gives GT depth, so
-            # the depth metrics work on the test split too.
+
             "dtu_train_root": data_path / "DTU/dtu_training",
-            # The MVSNet-format eval set (scan*/{images,cams}/, pair.txt, no GT
-            # depth). NOT currently read by any code path — see above.
             "dtu_test_root": data_path / "DTU/dtu_testing",
             "dtu_list_path": project_path / "lists/dtu/train.txt",
             "sfm_cache_path":project_path / "log/sfm_depth",
-            # VGGT/DA3 depth+conf priors, one npz per (scan, ref_view, light).
-            # The filename encodes none of the resolutions it was built at, so a
-            # changed --prior-resize-scale / --prior-target-* needs a force rebuild.
             "prior_cache_path": project_path / "log/prior_cache",
-            # per-view depth/conf/K/E/image that fusion consumes, plus metrics.json,
-            # under a <split>/ subdir. Kept after the run on purpose: re-fusing at
-            # different --photo-thresh/--geo-* costs nothing while re-running
-            # inference does.
             "depth_cache_path": project_path / "log/depth_cache",
-            # fused point clouds from test.py, named mvsnet{scan:03d}_l3.ply —
-            # feed this directory straight to Fast-DTU-Evaluation --pred_dir.
             "pred_points_path": project_path / "log/pred_points",
             "resnet50_weights_file": data_path / "Resnet50/Model_v2.pth",
             "dinov3_weights_file":
@@ -116,18 +98,7 @@ class DataConfig:
 
 @dataclass(frozen=True)
 class PriorConfig:
-    """VGGT/DA3 depth-prior generation.
 
-    ``target_w`` / ``target_h`` is the resolution VGGT + DA3 actually run at, and
-    therefore the prior's *true* resolution before ``inverse_transform_map``
-    resamples it up to the working image size. Raising it makes the depth prior
-    genuinely sharper (instead of an upsampled 518x420) at the cost of VGGT/DA3
-    compute+memory (attention is ~O(tokens^2), tokens = (w/14)*(h/14)).
-
-    Both dims MUST be multiples of the backbone patch size (14); the DPT head
-    reassembles on ``H//14`` patches and a non-multiple truncates / misaligns.
-    Defaults 518=37*14, 420=30*14.
-    """
     target_w: int = 518
     target_h: int = 420
 
@@ -161,24 +132,11 @@ class DepthRangeConfig:
 
     mode_window: int = 2
 
-    # Next-stage window: half = range_k[k] * winner_interval * (1 + a*entropy +
-    # b*edge), clamped to [range_min_gi[k], range_max_gi] * gi.
-    #
-    # These MUST be per-stage. The resulting bin is 2*half/(D-1), so with a
-    # single range_k the shrinking hypothesis counts (16/8/4) make every stage
-    # COARSER than its parent: at range_k=3.0 and a=b=1.0 the ratios are 1.20x /
-    # 2.57x / 6.00x. MVSFormer++'s (2.67, 1.5, 1.0) against the same 16/8/4 are
-    # tuned for exactly this constraint (0.356x / 0.429x / 0.667x); the values
-    # below are the same idea with room left for the entropy/edge widening, so
-    # bin/wi stays under 1 even with both terms saturated:
-    #     stage2 0.200-0.400x   stage3 0.257-0.514x   stage4 0.400-0.800x
-    range_k: tuple[float, float, float] = (1.5, 0.9, 0.6)
+
+    range_k: tuple[float, float, float] = (1.5, 0.9, 1.5)
     range_entropy_a: float = 0.5
     range_edge_b: float = 0.5
-    # Floor = recovery room, i.e. permission to grow past what the posterior
-    # suggests. That belongs at the coarse end; by stage 4 there is no later
-    # stage to recover into and only precision matters. stage2's 0.66*gi keeps
-    # the old absolute 10.83mm floor now that gi grew with num_global 48 -> 32.
+
     range_min_gi: tuple[float, float, float] = (0.66, 0.20, 0.05)
     range_max_gi: float = 8.0
     edge_grad_rel: float = 0.03
@@ -188,41 +146,14 @@ class DepthRangeConfig:
 
 @dataclass(frozen=True)
 class CostVolumeConfig:
-    """Four cascade stages at strides 8 / 4 / 2 / 1.
-
-    Hypothesis counts (32+16) - 16 - 8 - 4 follow MVSFormer++'s coarse-to-fine
-    budget: nearly all candidates live at the cheapest resolution, and the
-    full-res stage keeps only four. A fine stage that still needs many planes is
-    evidence the previous stage failed to converge its range, not a reason to
-    add planes there — and planes cost 64x more at stride 1 than at stride 8.
-
-    Total cost-volume voxels at 512x640 drop 2.8x versus the old 3-stage
-    (64-24-16 at strides 4/2/1) layout, and 4x at the full-res stage that
-    dominated memory.
-    """
 
     num_groups: int = 8
     num_depths_stage1: int = 48   # = depth_range.num_global + num_local
     num_depths_stage2: int = 16
     num_depths_stage3: int = 8
-    # 4 -> 8: the isolated quantisation test. The stage-4 window is unchanged
-    # (refine_range_from_posterior still uses range_k[2] / range_min_gi[2]), so
-    # doubling the plane count halves the terminal bin — 2*half/7 instead of
-    # 2*half/3, i.e. 0.43x — and nothing else moves. If DTU Acc does not improve,
-    # the terminal bin was not the binding constraint and the three-stage
-    # restructure should not be attempted for that reason.
-    #
-    # Costs: stage 4 is the full-resolution stage and dominates memory, so this
-    # roughly doubles the largest term (total cost-volume voxels 2.54M -> 3.86M
-    # at 512x640, ~1.5x). Revert to 4 here if it will not fit.
-    #
-    # It also un-saturates the fusion confidence: mode_window=2 spans
-    # min(5, D) bins, which was the whole axis at D=4 (see test.py
-    # posterior_confidence) and is 5 of 8 now.
     num_depths_stage4: int = 8
     stage1_meta_channels: int = 6
-    # Warp width shrinks as resolution grows; stage 1 moved to stride 8 so it
-    # can afford to stay wide.
+
     warp_channels_stage1: int = 128
     warp_channels_stage2: int = 64
     warp_channels_stage3: int = 32
@@ -249,21 +180,13 @@ class DecoderConfig:
 
 @dataclass(frozen=True)
 class DINOConfig:
-    """Frozen DINOv3 ViT-B/16 backbone used as the SPRE 'independent witness'.
 
-    ``layers`` picks the intermediate blocks whose patch tokens SPRE consumes
-    (shallow=more spatial, deep=more semantic — the DPT recipe). ``max_side``
-    is the patch-aligned resize for the ref image before the ViT.
-
-    """
     mean: tuple[float, float, float] = (0.485, 0.456, 0.406)
     std: tuple[float, float, float] = (0.229, 0.224, 0.225)
     patch_size: int = 16
     layers: tuple[int, ...] = (3, 7, 11)
     max_side: int = 512
-    # Inject the SVA-fused per-view DINO features into the FPN bottleneck (the
-    # 1/8 level), the way MVSFormer++ does ``conv31 = conv31 + vit_feat``. Only
-    # takes effect when SPRE is enabled, since that is what loads the backbone.
+
     feed_fpn: bool = True
 
 

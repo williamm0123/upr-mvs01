@@ -2,8 +2,10 @@
 
 set -euo pipefail
 
-PROJECT_DIR=${PROJECT_DIR:-/home/william/project/uprmvs01}
-CONDA_ENV=${CONDA_ENV:-uprmvs}
+# PROJECT_DIR / PYTHON_BIN / PYTHONPATH / UPRMVS_MACHINE 都来自 _common.sh，
+# 路径不再写死（这个脚本原来钉在 /home/william/project/uprmvs01）。
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_common.sh"
+
 GPU_ID=${GPU_ID:-0}
 RUN_NAME=${RUN_NAME:-uprmvs_local}
 
@@ -27,14 +29,11 @@ PRECOMPUTE_PRIORS=${PRECOMPUTE_PRIORS:-1}
 SMOKE=${SMOKE:-0}
 SMOKE_STEPS=${SMOKE_STEPS:-100}
 
-cd "$PROJECT_DIR"
-
-export UPRMVS_MACHINE=ubuntu
+# 其余环境变量来自 _common.sh；这里只加本脚本特有的。
 export UPRMVS_PROFILE=local
-export PYTHONPATH="$PROJECT_DIR:$PROJECT_DIR/models:$PROJECT_DIR/models/Depth-Anything-3/src:${PYTHONPATH:-}"
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-4}
-export PYTHONUNBUFFERED=1
 
+uprmvs_env_banner
 echo "=== local training: GPU=$GPU_ID batch=$BATCH_SIZE views=$NUM_VIEWS workers=$NUM_WORKERS amp=$AMP ==="
 
 common_args=(
@@ -53,7 +52,7 @@ common_args=(
 
 case "$SMOKE" in
     1|true|TRUE|yes|YES)
-        exec conda run -n "$CONDA_ENV" --no-capture-output python train.py \
+        exec "$PYTHON_BIN" train.py \
             "${common_args[@]}" \
             --smoke \
             --smoke-steps "$SMOKE_STEPS" \
@@ -70,7 +69,7 @@ esac
 
 case "$PRECOMPUTE_PRIORS" in
     1|true|TRUE|yes|YES)
-        conda run -n "$CONDA_ENV" --no-capture-output python train.py \
+        "$PYTHON_BIN" train.py \
             --profile local \
             --devices "$GPU_ID" \
             --ddp off \
@@ -85,7 +84,7 @@ case "$PRECOMPUTE_PRIORS" in
         ;;
 esac
 
-exec conda run -n "$CONDA_ENV" --no-capture-output python train.py \
+exec "$PYTHON_BIN" train.py \
     "${common_args[@]}" \
     --steps "$STEPS" \
     --build-priors skip \

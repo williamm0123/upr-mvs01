@@ -24,6 +24,8 @@ set -euo pipefail
 # 从脚本自身位置推出仓库根目录，本机 / 集群都不用改
 PROJECT_DIR=${PROJECT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
 CONDA_ENV=${CONDA_ENV:-uprmvs}
+# 集群上正式权重的位置，只用于「找不到权重」时的 scp 提示。集群路径变了改这一处。
+REMOTE_CKPT=${REMOTE_CKPT:-login01.dicc.um.edu.my:/scr/user/qinglong/projects/upr-mvs01/log/model/best.pth}
 GPU_ID=${GPU_ID:-0}
 
 # ---- 跑哪些数据 -------------------------------------------------------------
@@ -57,10 +59,23 @@ VIS=${VIS:-0}                     # 每个 scan 存前 N 张深度可视化 png
 
 # ---- 融合 -------------------------------------------------------------------
 FUSE=${FUSE:-1}                   # 0 = 只算深度图指标，不融合
-PHOTO_THRESH=${PHOTO_THRESH:-0.7} # stage4 众数概率阈值，调高 -> acc 好 comp 差
+# 置信度过滤。旧的 PHOTO_THRESH 打在一个恒等于 1.0 的量上（mode_window=2 覆盖了
+# 末级全部 4 个假设），所以历史上从来没过滤掉任何一个点。现在改成显式选通道：
+#   pmax / margin / mass1mm / mass2mm  -> 保留「高」值
+#   entropy / sigma_mm                 -> 保留「低」值（阈值照字面读）
+# 默认 -inf = 不做光度过滤，与历史行为一致；先在 val 上标定再启用。
+CONF_CHANNEL=${CONF_CHANNEL:-pmax}
+CONF_THRESH=${CONF_THRESH:--inf}
+PHOTO_THRESH=${PHOTO_THRESH:-}    # 弃用；非空时转发到 CONF_THRESH
 GEO_VIEWS=${GEO_VIEWS:-3}         # 最少几个源视图几何一致
-GEO_PIX=${GEO_PIX:-1.0}           # 重投影误差上限（像素）
-GEO_REL=${GEO_REL:-0.01}          # 相对深度差上限
+GEO_PIX=${GEO_PIX:-1.0}           # 重投影误差上限（像素）；实测这一项才是真正起作用的门
+GEO_REL=${GEO_REL:-0.01}          # 相对深度差上限；0.01 在 700mm 处 = 7mm，几乎被 GEO_PIX 完全包含，
+                                  # 要它起作用得收到 ~0.001。先用 scripts/geo_sweep.sh 离线扫。
+GEO_ABS_MM=${GEO_ABS_MM:-}        # 绝对深度差上限（mm）。DTU 按毫米打分，比 GEO_REL 好解释。留空=关
+FUSION_SRC_VIEWS=${FUSION_SRC_VIEWS:-10}
+                                  # 允许投票的源视角数（缓存里存的是完整 top-10，
+                                  # 而网络只看过 NUM_VIEWS-1 个）。设 4 才是
+                                  # 「网络看过的 4 个里有 GEO_VIEWS 个一致」。
 PLY_DIR=${PLY_DIR:-}              # 留空 = config 的 pred_points_path（<project>/log/pred_points）
 
 # ---- checkpoint -------------------------------------------------------------
@@ -74,37 +89,15 @@ OUT=${OUT:-}                      # 逐视角 npz 缓存 + metrics.json 的去�
                                   # 即 <project>/log/depth_cache/<split>。多作业切分时要各给一个。
 # =============================================================================
 
-cd "$PROJECT_DIR"
+# 解释器搜索、PROJECT_DIR、PYTHONPATH 都收进 _common.sh 了（这段候选搜索原本就
+# 是从这里抄过去的，现在五个脚本共用一份）。
+source "$PROJECT_DIR/scripts/_common.sh"
+uprmvs_env_banner
 
-# 依次试几个候选：集群上 conda 多半不在 PATH（训练脚本就是刻意绕开它的），
-# env 装在 ~/.conda/envs 而不是 ~/miniconda3/envs。任何一个可执行就用哪个。
-if [[ -z "${PYTHON_BIN:-}" ]]; then
-    for _cand in \
-        "${ENV_PREFIX:-}/bin/python" \
-        "$HOME/.conda/envs/$CONDA_ENV/bin/python" \
-        "$HOME/miniconda3/envs/$CONDA_ENV/bin/python" \
-        "$(conda info --base 2>/dev/null)/envs/$CONDA_ENV/bin/python"
-    do
-        [[ -n "$_cand" && -x "$_cand" ]] && { PYTHON_BIN="$_cand"; break; }
-    done
-fi
-
-if [[ -z "${PYTHON_BIN:-}" || ! -x "$PYTHON_BIN" ]]; then
-    echo "找不到 $CONDA_ENV 环境的解释器。试过：" >&2
-    echo "  \${ENV_PREFIX}/bin/python, ~/.conda/envs/$CONDA_ENV/bin/python," >&2
-    echo "  ~/miniconda3/envs/$CONDA_ENV/bin/python, \$(conda info --base)/envs/$CONDA_ENV/bin/python" >&2
-    echo "显式指定：PYTHON_BIN=/home/user/qinglong/.conda/envs/uprmvs/bin/python bash $0" >&2
-    exit 1
-fi
-echo "=== python: $PYTHON_BIN ==="
-
-export PYTHONPATH="$PROJECT_DIR:$PROJECT_DIR/models:$PROJECT_DIR/models/Depth-Anything-3/src:${PYTHONPATH:-}"
+# PYTHONPATH / PYTHONNOUSERSITE / PYTHONUNBUFFERED / OMP_NUM_THREADS /
+# PYTORCH_CUDA_ALLOC_CONF（整幅推理不设它会在 reserved-but-unallocated 上碎掉，
+# 实测 9 GiB 卡在碎片里）都来自 _common.sh。这里只加本脚本特有的：
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-$GPU_ID}
-export OMP_NUM_THREADS=${OMP_NUM_THREADS:-4}
-export PYTHONUNBUFFERED=1
-# 不设这个，整幅推理会在 reserved-but-unallocated 上碎掉：实测 9 GiB 卡在碎片里，
-# 明明还有余量却 OOM。训练脚本一直设着，测试脚本之前漏了。
-export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 
 case "$PHASE" in
     all|priors|infer) ;;
@@ -142,7 +135,7 @@ else
     if [[ ! -f "$CKPT_SHOWN" ]]; then
         echo "在 $CKPT_DIR 里找不到 best.pth / latest.pth。" >&2
         echo "从集群拷一份下来（训练已跑完 30k 步）：" >&2
-        echo "  mkdir -p $CKPT_DIR && scp login01.dicc.um.edu.my:/scr/user/qinglong/projects/upr-mvs01/log/model/best.pth $CKPT_DIR/" >&2
+        echo "  mkdir -p $CKPT_DIR && scp ${REMOTE_CKPT} $CKPT_DIR/" >&2
         exit 1
     fi
     CKPT_ARGS=(--ckpt-dir "$CKPT_DIR")
@@ -175,7 +168,7 @@ if [[ "$ALLOW_STALE" != "1" && "$CKPT_STEP" -lt "$MIN_STEP" ]]; then
     echo "" >&2
     echo "这份权重只有 $CKPT_STEP 步（< MIN_STEP=$MIN_STEP），是训练中断留下的残骸，不是 30k 的模型。" >&2
     echo "从集群拷正式权重：" >&2
-    echo "  scp login01.dicc.um.edu.my:/scr/user/qinglong/projects/upr-mvs01/log/model/best.pth $CKPT_DIR/" >&2
+    echo "  scp ${REMOTE_CKPT} $CKPT_DIR/" >&2
     echo "确认要用这份跑，就加 ALLOW_STALE=1。" >&2
     exit 1
 fi
@@ -204,13 +197,17 @@ esac
 infer_args=(--vis "$VIS" "${CKPT_ARGS[@]}")
 case "$FUSE" in
     1|true|TRUE|yes|YES)
+        [[ -n "$PHOTO_THRESH" ]] && CONF_THRESH="$PHOTO_THRESH"
         infer_args+=(
             --fuse
-            --photo-thresh "$PHOTO_THRESH"
+            --conf-channel "$CONF_CHANNEL"
+            --conf-thresh "$CONF_THRESH"
             --geo-views "$GEO_VIEWS"
             --geo-pix "$GEO_PIX"
             --geo-rel "$GEO_REL"
+            --fusion-src-views "$FUSION_SRC_VIEWS"
         )
+        [[ -n "$GEO_ABS_MM" ]] && infer_args+=(--geo-abs-mm "$GEO_ABS_MM")
         [[ -n "$PLY_DIR" ]] && infer_args+=(--ply-dir "$PLY_DIR")
         # 几何一致性只在"已缓存的"视角之间做：截断参考视角会把源视角一起截掉，
         # GEO_VIEWS 个一致视角凑不齐，整个 scan 融出 0 个点。

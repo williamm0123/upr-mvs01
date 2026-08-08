@@ -3,9 +3,11 @@
 set -euo pipefail
 
 
-PROJECT_DIR=${PROJECT_DIR:-/scr/user/qinglong/projects/upr-mvs01}
-# 直接指定 uprmvs 环境的解释器，不依赖当前 shell 的 conda activate/PATH。
-PYTHON_BIN=${PYTHON_BIN:-/home/user/qinglong/.conda/envs/uprmvs/bin/python}
+# PROJECT_DIR 由 _common.sh 从本脚本位置推导（不再写死路径）；解释器是搜出来的,
+# 不是假设的 —— 无论 conda env 装在 $HOME/.conda、/scr/user/$USER/.conda 还是别处
+# 都能找到, 找不到时会把试过的路径全部列出来。要指定就 PYTHON_BIN=... 覆盖。
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_common.sh"
+
 TRAIN_PROFILE=${TRAIN_PROFILE:-local}   # local = 单卡档 (max_steps 20000)；要 30000 步就设 umhpc 或 STEPS=30000
 RUN_NAME=${RUN_NAME:-uprmvs_1gpu_${SLURM_JOB_ID:-manual}}
 
@@ -45,30 +47,14 @@ SMOKE=${SMOKE:-0}                 # 1=合成数据跑通测试；0=真实数据�
 SMOKE_STEPS=${SMOKE_STEPS:-2}     # SMOKE=1 时执行的训练步数
 # =============================================================================
 
-if [[ ! -x "$PYTHON_BIN" ]]; then
-    echo "Python interpreter not found or not executable: $PYTHON_BIN" >&2
-    echo "Override it with: PYTHON_BIN=/path/to/uprmvs/bin/python bash $0" >&2
-    exit 1
-fi
-
-cd "$PROJECT_DIR"
-
-export UPRMVS_MACHINE=umhpc
+# PROJECT_DIR / PYTHON_BIN / PYTHONPATH / PYTHONNOUSERSITE / UPRMVS_MACHINE /
+# PYTORCH_CUDA_ALLOC_CONF / OMP_NUM_THREADS 全部来自 _common.sh。这里只加
+# 本脚本特有的:
 export UPRMVS_PROFILE="$TRAIN_PROFILE"
-# vggt 是 PROJECT_DIR/models 下的顶层 namespace package；不继承外部
-# PYTHONPATH，避免误导入 /scr/user/qinglong/projects/vggt。
-export PYTHONPATH="$PROJECT_DIR:$PROJECT_DIR/models:$PROJECT_DIR/models/Depth-Anything-3/src"
-export PYTHONNOUSERSITE=1
-export OMP_NUM_THREADS=${OMP_NUM_THREADS:-16}
-export PYTHONUNBUFFERED=1
-# 缓解显存碎片（错误信息里 "reserved but unallocated" 就是碎片）。可被外部覆盖。
-export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
-
 
 echo "=== job=${SLURM_JOB_ID:-manual} host=$(hostname) profile=$TRAIN_PROFILE ==="
 nvidia-smi -L
-echo "=== python=$PYTHON_BIN ==="
-"$PYTHON_BIN" -c 'import importlib.util, sys, torch, huggingface_hub; print("python:", sys.executable); print("torch:", torch.__version__, torch.__file__); print("huggingface_hub:", huggingface_hub.__version__); print("vggt:", importlib.util.find_spec("vggt.models.vggt").origin)'
+uprmvs_env_banner
 
 # 确认跑的是改动后的代码，并（FRESH=1 时）把旧 checkpoint 挪开。
 # 任一检查失败说明 checkout 是旧的，直接退出而不是白跑一天。

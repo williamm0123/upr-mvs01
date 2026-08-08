@@ -20,9 +20,9 @@
 #   MODE=fuse PIX=0.5 REL=0.001 VIEWS=3 POOL=4 bash scripts/geo_sweep.sh
 set -euo pipefail
 
-PROJECT_DIR=${PROJECT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
-PYTHON_BIN=${PYTHON_BIN:-python}
-cd "$PROJECT_DIR"
+# PROJECT_DIR / PYTHON_BIN / PYTHONPATH / UPRMVS_MACHINE 都来自 _common.sh，
+# 所以这个脚本在笔记本和集群上是同一份，不需要任何路径参数。
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_common.sh"
 
 # The complete 22 x 49 cache. NOT log/depth_cache/test — that one holds only a
 # few scans and one of them is short, which would silently change every number.
@@ -69,4 +69,5 @@ case "$MODE" in
 esac
 
 echo "=== geo_sweep mode=$MODE cache=$CACHE scans=${SCANS:-all} ==="
+echo "=== python=$PYTHON_BIN ==="
 exec "$PYTHON_BIN" test.py "${args[@]}"
