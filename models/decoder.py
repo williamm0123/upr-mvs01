@@ -63,10 +63,12 @@ class CostVolumeUNet(nn.Module):
 
 
 class DepthDecoder(nn.Module):
-    def __init__(self, in_channels: int = 8, base: int = 16, depth: int = 3, mode_window: int = 2) -> None:
+    def __init__(self, in_channels: int = 8, base: int = 16, depth: int = 3,
+                 mode_window: int = 2, mode_radius_mm: float | None = None) -> None:
         super().__init__()
         self.unet = CostVolumeUNet(in_channels=in_channels, base=base, depth=depth)
         self.mode_window = mode_window
+        self.mode_radius_mm = mode_radius_mm
 
     def forward(
         self,
@@ -81,5 +83,7 @@ class DepthDecoder(nn.Module):
         # Mode-centered regression instead of a global soft-argmin: over a
         # bimodal posterior (wrong local peak + correct global peak) the global
         # expectation lands between the peaks, on no real surface.
-        depth, sigma, mode_idx = mode_centered_regression(prob, depth_hypos.float(), self.mode_window)
+        depth, sigma, mode_idx = mode_centered_regression(
+            prob, depth_hypos.float(), self.mode_window, self.mode_radius_mm
+        )
         return depth, sigma, prob, logits, mode_idx

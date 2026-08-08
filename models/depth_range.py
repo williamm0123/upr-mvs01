@@ -262,21 +262,43 @@ def mode_centered_regression(
     prob: torch.Tensor,
     depth_hypos: torch.Tensor,
     window: int,
+    radius_mm: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Expectation restricted to +-window bins around the argmax mode.
+    """Expectation restricted to a neighbourhood of the argmax mode.
 
     A global soft-argmin over a bimodal posterior (wrong local peak + correct
     global peak) lands between the peaks, on no surface at all; restricting the
     expectation to the winning mode keeps the estimate on a real candidate.
     Returns (depth, sigma_within_mode, argmax_idx [B,1,H,W]).
 
-    The window is *shifted* to stay in bounds rather than clamped. Clamping
+    Two ways to define the neighbourhood:
+
+    * ``window`` (default) — +-window BINS. Cheap, but the support is a function
+      of the axis: on a 4-hypothesis stage ``window=2`` spans the whole axis
+      (4/4) while on an 8-hypothesis stage it spans 5/8. That makes a D=4 vs
+      D=8 comparison confound the plane count with the estimator, so it is not
+      a clean quantisation ablation.
+    * ``radius_mm`` — bins within a fixed PHYSICAL distance of the winning
+      hypothesis. Resolution- and plane-count-independent, which is what an
+      honest D ablation needs. Overrides ``window`` when set.
+
+    The bin window is *shifted* to stay in bounds rather than clamped. Clamping
     repeats the edge index, so a mode at bin 0 of a 4-bin axis would gather bin 0
-    three times and drag the expectation onto the boundary. The fine stages of
-    the 4-level cascade have as few as 4 hypotheses, where that bias is severe.
+    three times and drag the expectation onto the boundary.
     """
     D = prob.shape[1]
     idx = prob.argmax(dim=1, keepdim=True)
+
+    if radius_mm is not None and radius_mm > 0:
+        # The mode itself is always at distance 0, so the support is never empty.
+        mode_d = depth_hypos.gather(1, idx)
+        sel = ((depth_hypos - mode_d).abs() <= float(radius_mm)).to(prob.dtype)
+        p = prob * sel
+        p = p / p.sum(dim=1, keepdim=True).clamp_min(1e-8)
+        depth = (p * depth_hypos).sum(dim=1)
+        var = (p * (depth_hypos - depth.unsqueeze(1)) ** 2).sum(dim=1)
+        return depth, var.clamp_min(1e-12).sqrt(), idx
+
     w = min(2 * window + 1, D)                       # window never exceeds the axis
     start = (idx - (w // 2)).clamp(0, D - w)         # slide, do not clamp indices
     offs = torch.arange(w, device=prob.device).view(1, -1, 1, 1)
@@ -311,6 +333,17 @@ def refine_range_from_posterior(
 
     All geometry is detached: hypothesis placement carries no gradient, each
     stage is trained by its own losses.
+
+    The window is placed by SLIDING it inside [depth_min, depth_max], never by
+    clamping the candidates individually. A per-plane clamp collapses every
+    plane that falls outside onto the same boundary value, which produces
+    duplicate hypotheses, zero-width Voronoi bins, and a non-monotone axis that
+    ``searchsorted`` in the soft-label CE then has to divide by. Measured on the
+    1k-step run this made ``mean(err/bin)`` read 3268 at stage 2 while the
+    ratio of means was 3.5 — a handful of degenerate pixels, but enough to make
+    the metric unusable and to distort the interval-normalised regression.
+    (The stage-1 local branch has always placed its window this way; stages 2+
+    were the inconsistent ones.)
     """
     with torch.no_grad():
         D = prob.shape[1]
@@ -324,12 +357,14 @@ def refine_range_from_posterior(
         gi = global_interval.view(-1, 1, 1)
         half = torch.maximum(half, config.range_min_gi[stage_idx] * gi)
         half = torch.minimum(half, config.range_max_gi * gi)
-        steps = torch.linspace(-1.0, 1.0, num_depths, device=center.device, dtype=center.dtype)
-        hypos = center.detach().unsqueeze(1) + half.unsqueeze(1) * steps.view(1, num_depths, 1, 1)
-        hypos = hypos.clamp(
-            min=depth_min.view(-1, 1, 1, 1),
-            max=depth_max.view(-1, 1, 1, 1),
-        )
+
+        d_lo = depth_min.view(-1, 1, 1)
+        d_hi = depth_max.view(-1, 1, 1)
+        width = torch.minimum(2.0 * half, (d_hi - d_lo).clamp_min(1e-4))
+        lo = torch.minimum(center.detach() - 0.5 * width, d_hi - width)
+        lo = torch.maximum(lo, d_lo)
+        t = torch.linspace(0.0, 1.0, num_depths, device=center.device, dtype=center.dtype)
+        hypos = lo.unsqueeze(1) + width.unsqueeze(1) * t.view(1, num_depths, 1, 1)
     return hypos
 
 

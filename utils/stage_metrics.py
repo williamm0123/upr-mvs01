@@ -53,6 +53,10 @@ Accum = dict[str, tuple[float, float]]
 # acc_2mm saturates long before the metric we actually care about moves.
 ACC_THRESH_MM: tuple[float, ...] = (0.25, 0.5, 1.0, 2.0)
 RETENTION: tuple[float, ...] = (0.8, 0.6, 0.4, 0.2)
+# A hypothesis axis with duplicate candidates has zero-width bins there. Well
+# below any real DTU bin (the finest is ~0.27 mm), so this only catches
+# degeneracy, never a legitimately fine axis.
+DEGENERATE_BIN_MM: float = 1e-3
 
 
 def _put(out: Accum, name: str, values: torch.Tensor, mask: torch.Tensor) -> None:
@@ -181,8 +185,33 @@ def stage_diagnostics(
             mode_idx = prob.argmax(dim=1, keepdim=True)
         bin_mode = intervals.gather(1, mode_idx).squeeze(1)
         _put(out, f"{name}/bin_mode_mm", bin_mode, valid_n)
-        # err / bin separates "quantisation-limited" from "matching-limited"
-        _put(out, f"{name}/err_over_bin", err_n / bin_mode.clamp_min(1e-6), valid_n)
+
+        # err / bin separates "quantisation-limited" from "matching-limited",
+        # but the plain mean of the per-pixel RATIO is not robust: a per-plane
+        # clamp at the scene boundary produces duplicate hypotheses and hence
+        # near-zero Voronoi bins, and a handful of those pixels dominate. On the
+        # 1k-step run this read 3268 at stage 2 while the ratio of means was 3.5.
+        # So report five things and let them disagree visibly:
+        #   * _rom     — exact ratio of means (sum err / sum bin), aggregation-safe
+        #   * plain    — mean of the ratio, EXCLUDING degenerate bins
+        #   * median/p90 — order statistics, which the ratio-of-means hides when
+        #                  high error correlates with small bins
+        #   * degenerate_bin_rate — the thing that broke it; must be ~0 once the
+        #                  window is placed by sliding instead of clamping
+        degen = bin_mode < DEGENERATE_BIN_MM
+        ok = valid_n & ~degen
+        _put(out, f"{name}/degenerate_bin_rate", degen.float(), valid_n)
+        # (sum, count) = (sum err, sum bin) makes the window/rank average an
+        # exact ratio of means rather than an average of per-batch ratios.
+        if valid_n.any():
+            out[f"{name}/err_over_bin_rom"] = (
+                float(err_n[valid_n].sum()), float(bin_mode[valid_n].sum().clamp_min(1e-6)))
+        if ok.any():
+            ratio = (err_n / bin_mode.clamp_min(1e-6))[ok]
+            _put(out, f"{name}/err_over_bin", err_n / bin_mode.clamp_min(1e-6), ok)
+            _put_scalar(out, f"{name}/err_over_bin_median", float(ratio.median()))
+            _put_scalar(out, f"{name}/err_over_bin_p90", float(torch.quantile(
+                ratio.float() if ratio.numel() < 8_000_000 else ratio[::4].float(), 0.9)))
 
         # posterior shape. sigma_full is the full-axis spread about the reported
         # depth — this is the quantity a sigma-driven range policy would consume,

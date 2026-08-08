@@ -5,7 +5,7 @@ import torch.nn.functional as F
 
 from base.config import LossConfig, StageWeights
 
-from .depth_loss import normalized_huber_loss, soft_label_cross_entropy
+from .depth_loss import huber_contributions, normalized_huber_loss, soft_label_cross_entropy
 
 
 class MVSLoss:
@@ -124,14 +124,18 @@ class MVSLoss:
         l_ce16 = soft_label_cross_entropy(logits16, hypos16, gt1, sup16) if cfg.use_cross_entropy \
             else logits.new_zeros(())
 
+        # Stage 1 has no parent, and its normaliser is already child-axis
+        # independent: gi is the scene span over the guard-branch count, not a
+        # function of anything a later stage or a window setting changes.
         gi1 = s1["global_interval"].view(B, 1, 1).expand_as(gt1)
         l_reg1 = normalized_huber_loss(s1["depth"], gt1, valid1, gi1, weight=w_edge1)
 
+        w_reg1 = cfg.w_reg * cfg.w_reg_stage[0]
         total = total + weights["stage1"] * (
             cfg.w_ce * l_ce64
             + cfg.w_global_aux * l_ce48
             + cfg.w_local_aux * l_ce16
-            + cfg.w_reg * l_reg1
+            + w_reg1 * l_reg1
         )
 
         # stage-1 diagnostics
@@ -141,6 +145,16 @@ class MVSLoss:
             logs["stage1/ce_global_aux"] = float(l_ce48.detach())
             logs["stage1/ce_local_aux"] = float(l_ce16.detach())
             logs["stage1/reg"] = float(l_reg1.detach())
+            r_in1, r_oor1, _ = huber_contributions(
+                s1["depth"].detach(), gt1, valid1, gi1, g_in_range, weight=w_edge1)
+            logs["stage1/reg_in"] = r_in1
+            logs["stage1/reg_oor"] = r_oor1
+            logs["stage1/reg_in_contrib"] = weights["stage1"] * w_reg1 * r_in1
+            logs["stage1/reg_oor_contrib"] = weights["stage1"] * w_reg1 * r_oor1
+            logs["stage1/ce_contrib"] = weights["stage1"] * (
+                cfg.w_ce * float(l_ce64.detach())
+                + cfg.w_global_aux * float(l_ce48.detach())
+                + cfg.w_local_aux * float(l_ce16.detach()))
             logs["stage1/in_range"] = float(g_in_range[valid1].float().mean()) if valid1.any() else 1.0
             logs["stage1/global_in_range"] = logs["stage1/in_range"]
             logs["stage1/local_hit"] = float(l_in_range[valid1].float().mean()) if valid1.any() else 1.0
@@ -191,7 +205,7 @@ class MVSLoss:
                     logs["stage1/err_clean"] = float(err1[vk].mean())
 
         # --------------------------- stages 2 / 3 / 4 -------------------------- #
-        for name in ("stage2", "stage3", "stage4"):
+        for idx, name in enumerate(("stage2", "stage3", "stage4"), start=1):
             stage = outputs[name]
             hypos_k = stage["depth_hypos"]
             logits_k = stage["logits"]
@@ -207,21 +221,45 @@ class MVSLoss:
             sup = valid & in_range
             interval = ((hypo_max - hypo_min) / max(hypos_k.shape[1] - 1, 1)).detach().clamp(min=1e-4)
 
+            # Regression normaliser. "parent" uses the interval that PLACED this
+            # window rather than the window's own bin, so neither num_depths nor
+            # range_k can change the loss scale — without that, every window or
+            # plane-count ablation also silently reweights the stage and cannot
+            # be attributed. See LossConfig.reg_normalizer.
+            parent_itv = stage.get("parent_interval")
+            if cfg.reg_normalizer == "parent" and parent_itv is not None:
+                scale = parent_itv.detach().clamp(min=1e-4)
+            else:
+                scale = interval
+
             w_edge = self._edge_weight(stage["edge"]) if "edge" in stage else None
 
             l_ce = soft_label_cross_entropy(logits_k, hypos_k, gt, sup) if cfg.use_cross_entropy \
                 else depth_k.new_zeros(())
             # ALL valid pixels: even when GT fell outside this stage's window the
             # regression keeps a bounded pull on the previous stage's center.
-            l_reg = normalized_huber_loss(depth_k, gt, valid, interval, weight=w_edge)
+            l_reg = normalized_huber_loss(depth_k, gt, valid, scale, weight=w_edge)
 
-            total = total + weights[name] * (cfg.w_ce * l_ce + cfg.w_reg * l_reg)
+            w_reg_k = cfg.w_reg * cfg.w_reg_stage[idx]
+            total = total + weights[name] * (cfg.w_ce * l_ce + w_reg_k * l_reg)
 
             logs[f"{name}/ce"] = float(l_ce.detach())
             logs[f"{name}/reg"] = float(l_reg.detach())
+            # Additive split of the SAME number: reg_in + reg_oor == reg. This is
+            # what shows whether a stage's loss is dominated by pixels it has
+            # already lost (out-of-window) rather than by refinement.
+            r_in, r_oor, _ = huber_contributions(
+                depth_k.detach(), gt, valid, scale, in_range, weight=w_edge)
+            logs[f"{name}/reg_in"] = r_in
+            logs[f"{name}/reg_oor"] = r_oor
+            sw_k = weights[name] * w_reg_k
+            logs[f"{name}/reg_in_contrib"] = sw_k * r_in
+            logs[f"{name}/reg_oor_contrib"] = sw_k * r_oor
+            logs[f"{name}/ce_contrib"] = weights[name] * cfg.w_ce * float(l_ce.detach())
             logs[f"{name}/in_range"] = float(in_range[valid].float().mean()) if valid.any() else 1.0
             logs[f"{name}/p_max"] = float(stage["prob"].detach().amax(dim=1).mean())
             logs[f"{name}/interval_mm"] = float(interval[valid].mean()) if valid.any() else 0.0
+            logs[f"{name}/reg_scale_mm"] = float(scale[valid].mean()) if valid.any() else 0.0
             # Of the pixels this stage lost (GT outside its window), how many did
             # stage 1 have evidence for? ``oor_recoverable`` is the fraction whose
             # GT bin held at least 10% of stage 1's peak mass — a real secondary

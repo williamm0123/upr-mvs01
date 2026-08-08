@@ -103,7 +103,37 @@ def main() -> None:
     # Per-stage diagnostics: without them a run produces no oracle/selection
     # split and the next decision has nothing to stand on.
     from utils.stage_metrics import stage_diagnostics  # noqa: F401
-    checks.append("stage_metrics")
+    from losses.depth_loss import huber_contributions  # noqa: F401
+    checks.append("stage_metrics + reg in/oor split")
+
+    # --- the A'/B' common baseline -------------------------------------------
+    # Both properties below have to hold for a window or plane-count ablation to
+    # be single-variable. Neither shows up as a crash if it regresses, so assert.
+    if cfg.loss.reg_normalizer != "parent":
+        fail(f"loss.reg_normalizer={cfg.loss.reg_normalizer!r}: regression is normalised by the "
+             "CHILD bin, so num_depths and range_k silently reweight the stage and no ablation "
+             "is attributable. Set 'parent' (or knowingly accept the confound).")
+
+    # Functional check, not a source grep: place windows whose centres sit right
+    # on the scene bounds and require the axis to stay strictly increasing. The
+    # old per-plane clamp collapsed candidates onto dmin/dmax there, producing
+    # zero-width bins that broke err/bin and distorted the normalised regression.
+    import torch
+    from models.depth_range import refine_range_from_posterior
+    B, H, W, Dk = 1, 4, 64, depths[3]
+    lo, hi = torch.full((B,), 425.0), torch.full((B,), 933.8)
+    centre = torch.linspace(425.0, 933.8, H * W).view(B, H, W)
+    hyp = refine_range_from_posterior(
+        center=centre, winner_interval=torch.full((B, H, W), 1.07),
+        prob=torch.softmax(torch.randn(B, Dk, H, W), 1), edge=torch.zeros(B, H, W),
+        config=cfg.depth_range, num_depths=Dk, global_interval=(hi - lo) / 47,
+        depth_min=lo, depth_max=hi, stage_idx=2)
+    gaps = hyp[:, 1:] - hyp[:, :-1]
+    if not bool((gaps > 0).all()):
+        fail(f"hypothesis axis is not strictly increasing at the scene bounds "
+             f"({int((gaps <= 0).sum())} duplicate planes) — refine_range_from_posterior is "
+             "still clamping per plane instead of sliding the whole window")
+    checks.append(f"window slide (min gap {float(gaps.min()):.3f}mm, 0 duplicates)")
 
     # Smoke isolation: --smoke used to write latest.pth/best.pth into the shared
     # log/model, destroying a trained checkpoint with two steps of random weights.
@@ -125,6 +155,13 @@ def main() -> None:
     checks.append("fuse-only + posterior_confidence")
 
     print("[preflight] OK: " + ", ".join(checks))
+    # Which arm this job is. range_k[2] is the whole A'/B' distinction and it
+    # lives in a config default, so print it — otherwise a finished run's log
+    # cannot say which experiment it was.
+    print(f"[preflight] arm: range_k={tuple(cfg.depth_range.range_k)} "
+          f"num_depths={depths} reg_normalizer={cfg.loss.reg_normalizer!r} "
+          f"w_reg_stage={tuple(cfg.loss.w_reg_stage)} "
+          f"mode_radius_mm={cfg.depth_range.mode_radius_mm}")
     if args.fresh:
         archive_checkpoints(Path(args.model_dir), args.run_id)
 

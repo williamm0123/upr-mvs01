@@ -131,6 +131,11 @@ class DepthRangeConfig:
     local_half_max_gi: float = 2.0
 
     mode_window: int = 2
+    # Physical regression support in mm; None = use ``mode_window`` bins.
+    # ``mode_window`` spans min(2w+1, D) BINS, so at D=4 it covers the whole
+    # axis (4/4) and at D=8 only 5/8 — a D ablation using it compares two
+    # different estimators. Set this (both arms) to make the support identical.
+    mode_radius_mm: float | None = None
 
 
     range_k: tuple[float, float, float] = (1.5, 0.9, 1.5)
@@ -213,6 +218,26 @@ class SPREConfig:
 class LossConfig:
     w_ce: float = 1.0         # unified 64-candidate soft-label CE (stage1) / per-stage CE (2,3)
     w_reg: float = 1.0        # interval-normalized Huber on the regressed depth, ALL valid pixels
+    # Which interval normalises the stage-2..4 regression.
+    #
+    #   "parent" (default) — the PREVIOUS stage's interval. Child-axis
+    #       independent: neither ``num_depths_stage*`` nor ``range_k`` can then
+    #       silently reweight a stage, so window and plane-count ablations are
+    #       single-variable. This is what makes the A'/B' comparison honest.
+    #   "child" — this stage's own bin, i.e. the pre-2026-08 behaviour. Kept so
+    #       the old normalisation is one config value away instead of a revert.
+    #
+    # Why it mattered: at 1k steps stage 4 was 71.9% of the total loss, almost
+    # all of it the bin-normalised regression on out-of-window pixels
+    # (err/interval ~= 50). D4->D8 alone had scaled that term by 7/3, and
+    # widening range_k[2] would have scaled it back down by ~2.5 — so both
+    # "experiments" were really changing the per-stage loss weighting too.
+    reg_normalizer: Literal["parent", "child"] = "parent"
+    # Explicit per-stage regression weight. Under "parent" normalisation the
+    # fine stages no longer get an implicit boost from their smaller bins; if
+    # they need more weight it now has to be asked for here rather than
+    # smuggled in through the axis.
+    w_reg_stage: tuple[float, float, float, float] = (1.0, 1.0, 1.0, 1.0)
     w_global_aux: float = 0.5
     w_local_aux: float = 0.25
     edge_reg_boost: float = 2.0

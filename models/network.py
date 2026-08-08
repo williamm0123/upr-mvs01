@@ -85,13 +85,16 @@ class UprMVSNet(nn.Module):
         # metadata channels (its axis is irregular); stages 2-4 use uniform
         # axes and need none.
         mw = self.range_cfg.mode_window
+        mr = self.range_cfg.mode_radius_mm
         self.decoders = nn.ModuleList(
             [DepthDecoder(
                 in_channels=cv_cfg.num_groups + cv_cfg.stage1_meta_channels,
-                base=dec_cfg.unet_base_channels, depth=dec_cfg.unet_depth, mode_window=mw,
+                base=dec_cfg.unet_base_channels, depth=dec_cfg.unet_depth,
+                mode_window=mw, mode_radius_mm=mr,
             )]
             + [DepthDecoder(in_channels=cv_cfg.num_groups, base=dec_cfg.unet_base_channels,
-                            depth=dec_cfg.unet_depth, mode_window=mw) for _ in range(3)]
+                            depth=dec_cfg.unet_depth, mode_window=mw, mode_radius_mm=mr)
+               for _ in range(3)]
         )
 
         self.num_depths = (cv_cfg.num_depths_stage1, cv_cfg.num_depths_stage2,
@@ -288,10 +291,16 @@ class UprMVSNet(nn.Module):
                 k, feat_k, K, E, hypos_k, strides[k], src_weights
             )
             edge_k = self._resize_map(s1.edge, feat_k.shape[-2:])
+            # The interval that PLACED this stage's window, resampled to this
+            # stage's resolution. The loss normalises the regression by it
+            # instead of by this stage's own bin, so that changing num_depths or
+            # range_k cannot silently reweight the stage (losses/composite.py).
+            parent_interval = self._resize_map(prev["winner_interval"], feat_k.shape[-2:])
             stage_out[f"stage{k + 1}"] = {
                 "depth": depth_k, "sigma": sigma_k, "prob": prob_k,
                 "logits": logits_k, "depth_hypos": hypos_k,
                 "mode_idx": mode_idx_k, "edge": edge_k,
+                "parent_interval": parent_interval,
             }
             # uniform axis: per-pixel interval = span / (D - 1)
             interval_k = (hypos_k[:, -1] - hypos_k[:, 0]) / max(self.num_depths[k] - 1, 1)

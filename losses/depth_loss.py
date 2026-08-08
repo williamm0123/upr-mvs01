@@ -32,6 +32,43 @@ def normalized_huber_loss(
     return (per_px[m] * w).sum() / w.sum().clamp(min=1e-6)
 
 
+@torch.no_grad()
+def huber_contributions(
+    depth_pred: torch.Tensor,
+    depth_gt: torch.Tensor,
+    mask: torch.Tensor,
+    scale: torch.Tensor,
+    split: torch.Tensor,
+    weight: torch.Tensor | None = None,
+) -> tuple[float, float, float]:
+    """Split the reported regression loss into two ADDITIVE shares.
+
+    Returns ``(contrib_where_split, contrib_where_not, frac_split)``. Both
+    contributions use the same denominator as ``normalized_huber_loss``, so they
+    sum to it exactly — which is what "how much of stage 4's loss is
+    out-of-window pixels" actually asks. Reporting two separately-normalised
+    means instead would answer a different question and could not be compared
+    against the logged total.
+
+    Diagnostic only: no_grad, and it recomputes the per-pixel term rather than
+    threading extra returns through the loss path.
+    """
+    m = mask.bool()
+    if not m.any():
+        return 0.0, 0.0, 0.0
+    err = (depth_pred - depth_gt) / scale.clamp(min=1e-6)
+    per_px = F.smooth_l1_loss(err, torch.zeros_like(err), beta=1.0, reduction="none")
+    w = torch.ones_like(per_px) if weight is None else weight
+    denom = w[m].sum().clamp(min=1e-6)
+    s = m & split.bool()
+    n = m & ~split.bool()
+    return (
+        float((per_px[s] * w[s]).sum() / denom) if s.any() else 0.0,
+        float((per_px[n] * w[n]).sum() / denom) if n.any() else 0.0,
+        float(s.sum() / m.sum().clamp(min=1)),
+    )
+
+
 def soft_label_cross_entropy(
     logits: torch.Tensor,
     depth_hypos: torch.Tensor,
