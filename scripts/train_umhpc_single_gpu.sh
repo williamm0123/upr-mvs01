@@ -13,10 +13,10 @@ RUN_NAME=${RUN_NAME:-uprmvs_1gpu_${SLURM_JOB_ID:-manual}}
 # !! 末级假设数已从 4 改为 8 (base/config.py num_depths_stage4)。stage 4 是全
 #    分辨率级、显存占大头, 这一改把最大的那一项翻倍 (512x640 下 cost volume 体素
 #    2.54M -> 3.86M, 约 1.5x)。OOM 的退让顺序:
-#      1) BATCH_SIZE 2 -> 1
+#      1) BATCH_SIZE 4 -> 1
 #      2) UPRMVS_MAX_SCALE=576 (砍掉 augment 里 640x832 / 640x896 两档)
 #      3) 把 num_depths_stage4 改回 4 (那就等于放弃 P5 这个实验)
-BATCH_SIZE=${BATCH_SIZE:-2}       # 每卡 batch；SPRE 现在对全部 NUM_VIEWS 个视角跑 DINOv3，OOM 就设 1
+BATCH_SIZE=${BATCH_SIZE:-4}       # 每卡 batch；SPRE 现在对全部 NUM_VIEWS 个视角跑 DINOv3，OOM 就设 1
 NUM_VIEWS=${NUM_VIEWS:-5}         # MVS 总视图数：1 个参考视图 + 4 个源视图
 NUM_WORKERS=${NUM_WORKERS:-16}    # DataLoader 进程数；32 CPU 下建议 8~16
 LEARNING_RATE=${LEARNING_RATE:-3.0e-4}
