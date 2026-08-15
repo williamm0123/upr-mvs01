@@ -59,7 +59,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from base.config import ProjectPaths, build_mvs_config
 from data.dtu import DTUMVSDataset
-from models.pre_prior import PIPELINE_VERSION, PriorPrecomputer, save_prior
+from models.pre_prior import (PIPELINE_VERSION, PriorPrecomputer,
+                              cache_signature_from_file, save_prior)
 
 # 每样本耗时/体积的经验值 (RTX 5060 Ti, nviews=5, 2026-08-15 实测), 只用来给
 # --dry-run 报预估; 真实 ETA 跑起来后按实际速率算。体积几乎和 resize 无关 ——
@@ -102,21 +103,20 @@ def read_list(path: Path) -> list[str]:
 
 
 def probe(path: Path) -> dict | None:
-    """只读缓存的元数据标量。
+    """元数据 + sfm_valid。
 
-    npz 就是个 zip, 单独取几个 0 维数组不会解压 depth/normal 那几个大数组 ——
-    实测 0.35 ms/个 (对比 load_prior 的 4.2 ms), 全量 28k 个文件 10 秒扫完。
-    返回 None = 文件读不了 (截断/损坏), 按缺失处理。
+    版本/分辨率那几个字段直接用 pre_prior 的共享实现 (训练启动时的过期判定走的
+    是同一条路), 这里只多读一个 sfm_valid —— 未标尺的样本要单独统计。
     """
+    sig = cache_signature_from_file(path)
+    if sig is None:
+        return None
     try:
         with np.load(path) as z:
-            def g(k: str) -> float:
-                return float(z[k]) if k in z.files else 0.0
-            return {"pipeline_version": g("pipeline_version"),
-                    "target_w": g("target_w"), "target_h": g("target_h"),
-                    "num_views": g("num_views"), "sfm_valid": g("sfm_valid")}
+            sig["sfm_valid"] = float(z["sfm_valid"]) if "sfm_valid" in z.files else 0.0
     except Exception:
         return None
+    return sig
 
 
 def resolve_scan_set(spec: str, splits: dict[str, list[str]], disk: list[str]) -> list[str]:

@@ -59,6 +59,38 @@ def cache_signature(prior: dict) -> dict:
     }
 
 
+def cache_signature_from_file(path: str | Path) -> dict | None:
+    """只读元数据标量版的 :func:`cache_signature` —— 不解压大数组。
+
+    ``load_prior`` 会把 depth_prior / conf_prior / norm_depth_fill 三个大数组
+    全部解压, 用它做"缓存是否过期"的判定就等于**每次启动训练都把整个缓存读一遍**
+    (train split 27097 个文件 × 3.7 MB ≈ 100 GB)。本地 SSD 上 4.2 ms/个 (约
+    114 秒), 集群的共享 /scr 上要慢一个量级, 而且每次 launch 都来一次 —— 表现
+    就是卡在 "[pre_prior] ensuring priors for train split" 不动。
+
+    npz 就是个 zip: 只取几个 0 维标量不会碰大数组, 实测 0.35 ms/个 (快 12 倍,
+    I/O 从 100 GB 降到几十 MB)。文件读不了 (截断/损坏) 返回 None, 调用方按
+    "过期"处理, 和原来 ``except Exception: return True`` 的语义一致。
+    """
+    try:
+        with np.load(path) as z:
+            def g(k: str) -> float:
+                return float(z[k]) if k in z.files else 0.0
+            return {"pipeline_version": int(g("pipeline_version")),
+                    "num_views": int(g("num_views")),
+                    "target_w": int(g("target_w")),
+                    "target_h": int(g("target_h"))}
+    except Exception:
+        return None
+
+
+def signature_is_current(sig: dict, target_wh: tuple[int, int]) -> bool:
+    """判据本体, 见 :func:`cache_is_current` 的说明。"""
+    return (sig["pipeline_version"] >= PIPELINE_VERSION
+            and sig["target_w"] == int(target_wh[0])
+            and sig["target_h"] == int(target_wh[1]))
+
+
 def cache_is_current(prior: dict, num_views: int, target_wh: tuple[int, int]) -> bool:
     """缓存是否需要重建。
 
@@ -76,10 +108,7 @@ def cache_is_current(prior: dict, num_views: int, target_wh: tuple[int, int]) ->
     ``target_wh`` 则是真的判据 —— 它决定 VGGT/DA3 实际跑的分辨率, 也就是
     先验的真实细节量, ``_match_hw`` 的重采样造不出来。
     """
-    sig = cache_signature(prior)
-    return (sig["pipeline_version"] >= PIPELINE_VERSION
-            and sig["target_w"] == int(target_wh[0])
-            and sig["target_h"] == int(target_wh[1]))
+    return signature_is_current(cache_signature(prior), target_wh)
 
 
 # --------------------------------------------------------------------------- #
@@ -214,10 +243,8 @@ def build_prior_cache(
         f = Path(dataset.prior_cache_path_for(i))
         if not f.exists():
             return True
-        try:
-            return not cache_is_current(load_prior(f), dataset.nviews, image_target_wh)
-        except Exception:
-            return True
+        sig = cache_signature_from_file(f)      # 只读元数据, 不解压大数组
+        return sig is None or not signature_is_current(sig, image_target_wh)
 
     pending = [i for i in range(n) if overwrite or _stale(i)]
     if pending and not overwrite and verbose:
@@ -231,12 +258,9 @@ def build_prior_cache(
             f = Path(dataset.prior_cache_path_for(i))
             if not f.exists():
                 continue
-            try:
-                v = cache_signature(load_prior(f))["num_views"]
-                if v and v != dataset.nviews:
-                    mism[v] = mism.get(v, 0) + 1
-            except Exception:
-                pass
+            sig = cache_signature_from_file(f)
+            if sig and sig["num_views"] and sig["num_views"] != dataset.nviews:
+                mism[sig["num_views"]] = mism.get(sig["num_views"], 0) + 1
         if mism:
             print(f"[pre_prior] 提示: 部分缓存的 num_views={mism}, 当前训练 "
                   f"nviews={dataset.nviews}。这*不会*触发重建 —— 先验只是参考"

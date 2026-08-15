@@ -36,9 +36,9 @@ from data.dtu import DTUMVSDataset
 from models.pre_prior import (
     PIPELINE_VERSION,
     PriorPrecomputer,
-    cache_is_current,
-    load_prior,
+    cache_signature_from_file,
     save_prior,
+    signature_is_current,
 )
 
 
@@ -109,10 +109,8 @@ def main() -> None:
             f = Path(ds.prior_cache_path_for(i))
             if args.force or not f.exists():
                 todo.append((sp, ds, i)); continue
-            try:
-                if not cache_is_current(load_prior(f), ds.nviews, twh):
-                    todo.append((sp, ds, i))
-            except Exception:
+            sig = cache_signature_from_file(f)   # 只读元数据, 不解压大数组
+            if sig is None or not signature_is_current(sig, twh):
                 todo.append((sp, ds, i))
             if args.limit and len(todo) >= args.limit:
                 break
