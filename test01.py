@@ -8,11 +8,11 @@ import torch
 
 from base.config import ProjectPaths, build_mvs_config
 from data.dtu import DTUMVSDataset
-import data.norm_fill as norm_fill
+import models.norm_fill as norm_fill
 import data.camera_utils as C
 from models.depth_range import initial_range_from_prior
 from models.sfm import SfMConfig, generate_sparse_depth_from_sample
-from data.norm_fill import _tensor_to_uint8_hwc
+from models.norm_fill import _tensor_to_uint8_hwc
 
 import matplotlib.pyplot as plt
 import matplotlib.image as mpimg

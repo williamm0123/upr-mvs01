@@ -25,6 +25,11 @@ class DTUMVSDataset(Dataset):
         self.ndepths = ndepths
         self.nviews = nviews
         self.mode = mode
+        # 逐 (scan, ref_view, light) 排除表, 由 scripts/audit_prior_cache.py 产出。
+        # 按整个 scan 剔除太粗: 全量审计里 51 个 scan 至少有一个坏 prior, 但多数
+        # 只有 1-3%。这里做精确过滤, *_clean.txt 只负责剔掉重灾区 scan。
+        # 必须在 build_list() 之前赋值。
+        self.exclude_file = kwargs.get('exclude_file', None)
 
         self.metas = self.build_list()
         self.resize_scale = kwargs.get('resize_scale', 0.5)
@@ -67,8 +72,20 @@ class DTUMVSDataset(Dataset):
         """
         for i in range(len(self)):
             yield self[i]
+    def _load_exclude(self) -> set:
+        if not self.exclude_file or not os.path.exists(self.exclude_file):
+            return set()
+        import csv as _csv
+        with open(self.exclude_file) as fh:
+            rows = list(_csv.DictReader(fh))
+        out = {(r["scan"], int(r["view"]), int(r["light"])) for r in rows}
+        print(f"dataset {self.mode}: exclude list {self.exclude_file} -> {len(out)} 个坏 prior 样本")
+        return out
+
     def build_list(self):
         metas = []
+        excluded = self._load_exclude()
+        n_dropped = 0
         with open(self.listfile) as f:
             scans = f.readlines()
             scans = [line.rstrip() for line in scans]
@@ -85,9 +102,17 @@ class DTUMVSDataset(Dataset):
                     # light conditions 0-6
                     if self.mode == "train":
                         for light_idx in range(7):
+                            if (scan, ref_view, light_idx) in excluded:
+                                n_dropped += 1
+                                continue
                             metas.append((scan, light_idx, ref_view, src_views))
                     else:
+                        if (scan, ref_view, 3) in excluded:
+                            n_dropped += 1
+                            continue
                         metas.append((scan, 3, ref_view, src_views))
+        if n_dropped:
+            print(f"dataset {self.mode}: 剔除 {n_dropped} 个坏 prior 样本")
         print("dataset", self.mode, "metas:", len(metas))
         return metas
     def read_camera_file(self,filename):
@@ -285,6 +310,19 @@ class DTUMVSDataset(Dataset):
         depth_prior_full = self._match_hw(prior["depth_prior"], (h0, w0), is_depth=True)
         conf_prior_full = self._match_hw(prior["conf_prior"], (h0, w0), is_depth=False)
         norm_full = self._match_hw(prior["norm_depth_fill"], (h0, w0), is_depth=False)
+        # 先验标尺有效性。两个来源:
+        #   1) sfm_valid  —— pipeline_version>=2 的缓存才有 (旧缓存默认 0)
+        #   2) 物理范围检查 —— 对旧缓存也有效: 未标尺先验的中位数是 ~1 而不是
+        #      cam.txt 给出的几百 mm, 一查就出来
+        # 二者取或, 因为旧缓存的 sfm_valid=0 只代表"未知"而非"失败"。
+        _pv = float(np.asarray(prior.get("pipeline_version", 0.0)).reshape(-1)[0])
+        _sv = float(np.asarray(prior.get("sfm_valid", 0.0)).reshape(-1)[0])
+        _dp = depth_prior_full[np.isfinite(depth_prior_full) & (depth_prior_full > 0)]
+        _med = float(np.median(_dp)) if _dp.size else 0.0
+        _dmin, _dmax = float(depth_values[0]), float(depth_values[-1])
+        in_range = (_dmin * 0.3) <= _med <= (_dmax * 3.0)
+        prior_valid = np.asarray(1.0 if (in_range and (_pv < 2.0 or _sv > 0.5)) else 0.0, dtype=np.float32)
+
         # 离线 src_weights 长度 = 缓存时的 src 视角数, 可能 != 当前 nviews;
         # 默认忽略, 避免变长向量在 collate 时 stack 失败。
         src_weights = prior["src_weights"] if self.use_src_weights else None
@@ -338,6 +376,8 @@ class DTUMVSDataset(Dataset):
             "depth_prior": depth_prior_crop,
             "conf_prior": conf_prior_crop,
             "prior_corrupt_mask": corrupt_mask,
+            # 0 = 该样本的 prior 没有通过标尺校验 -> 网络禁用 local 分支
+            "prior_valid": prior_valid,
             "norm_depth_fill": norm_full[crop_y:y1, crop_x:x1],
         }
         if src_weights is not None:

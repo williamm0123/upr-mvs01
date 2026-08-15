@@ -1,4 +1,16 @@
 #!/bin/bash -l
+#SBATCH --job-name=uprmvs1g
+#SBATCH --partition=gpu-a100
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=32
+#SBATCH --mem=64G
+#SBATCH --qos=long
+#SBATCH --time=3-00:00:00
+#SBATCH --chdir=/scr/user/qinglong/projects/upr-mvs01
+#SBATCH --output=/scr/user/qinglong/projects/upr-mvs01/slurm-%x-%j.out
+#SBATCH --error=/scr/user/qinglong/projects/upr-mvs01/slurm-%x-%j.err
 
 set -euo pipefail
 
@@ -6,7 +18,7 @@ set -euo pipefail
 PROJECT_DIR=${PROJECT_DIR:-/scr/user/qinglong/projects/upr-mvs01}
 # 直接指定 uprmvs 环境的解释器，不依赖当前 shell 的 conda activate/PATH。
 PYTHON_BIN=${PYTHON_BIN:-/home/user/qinglong/.conda/envs/uprmvs/bin/python}
-TRAIN_PROFILE=${TRAIN_PROFILE:-local}   # local = 单卡档 (max_steps 20000)；要 30000 步就设 umhpc 或 STEPS=30000
+TRAIN_PROFILE=${TRAIN_PROFILE:-umhpc}  # 单卡也用正式 30000-step profile；--gpus/--ddp 会覆盖其多卡设置
 RUN_NAME=${RUN_NAME:-uprmvs_1gpu_${SLURM_JOB_ID:-manual}}
 
 # 核心训练参数（命令行会覆盖 TRAIN_PROFILE 中的同名参数）
@@ -18,13 +30,20 @@ WARMUP_STEPS=${WARMUP_STEPS:-1000}
 VAL_INTERVAL=${VAL_INTERVAL:-500} # 500 步一次 val；val 集 882 样本，约占 8% 训练时间，嫌慢设 1000
 AMP=${AMP:-on}                    # on/off；A100 建议 on
 STEPS=${STEPS:-0}                 # 0=使用 profile 默认值；测试可设 2
-SPRE=${SPRE:-on}                  # on/off：DINOv3 先验可靠度头（SPRE）
+
+# 三个已解耦的消融开关。正式默认 = all-view DINO 注入 FPN + SPRE reliability。
+# 例：纯 FPN/cached 消融：
+#   sbatch --export=ALL,DINO_MODE=off,FEED_FPN=off,RELIABILITY=cached scripts/train_umhpc_single_gpu.sh
+DINO_MODE=${DINO_MODE:-all_view}  # off / all_view / ref_only (ref_only 尚未实现时会明确报错)
+FEED_FPN=${FEED_FPN:-on}          # on / off
+RELIABILITY=${RELIABILITY:-spre}  # cached / edge / spre
+CLEAN_LISTS=${CLEAN_LISTS:-on}    # on = 使用 *_clean.txt + exclude_*.csv
 
 # RESUME: auto=从 log/model/latest.pth 续跑（SLURM 重排队要靠它）；off=从头开始。
 # ！！4 级级联重构之后（3 级 -> 4 级、假设数 48-16-8-4、DINO 进 FPN），旧
-# checkpoint 的 state_dict 完全对不上，auto 会直接报错退出。第一次训练必须
-# RESUME=off。
-RESUME=${RESUME:-auto}
+# checkpoint 的 state_dict/配置对不上。本轮是新架构 fresh run，默认 off；
+# Slurm 到时限后重提同一配置时再用 RESUME=auto。
+RESUME=${RESUME:-off}
 
 # 先验与跑通测试
 BUILD_PRIORS=${BUILD_PRIORS:-auto}
@@ -53,15 +72,95 @@ export PYTHONUNBUFFERED=1
 # 缓解显存碎片（错误信息里 "reserved but unallocated" 就是碎片）。可被外部覆盖。
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 
-# 旧 checkpoint 配 auto 必然崩，且要跑完先验构建才崩，白等很久。先拦下来。
+# 供下面的 checkpoint fingerprint 自检读取。
+export TRAIN_PROFILE BATCH_SIZE NUM_VIEWS NUM_WORKERS LEARNING_RATE WARMUP_STEPS
+export VAL_INTERVAL AMP DINO_MODE FEED_FPN RELIABILITY CLEAN_LISTS
+
+case "$DINO_MODE:$FEED_FPN:$RELIABILITY" in
+    off:*:spre)
+        echo "Invalid config: RELIABILITY=spre requires DINO_MODE=all_view/ref_only" >&2
+        exit 2
+        ;;
+    off:on:*)
+        echo "Invalid config: DINO_MODE=off requires FEED_FPN=off" >&2
+        exit 2
+        ;;
+    all_view:off:cached|all_view:off:edge)
+        echo "Invalid config: DINO is enabled but neither FPN nor SPRE consumes it" >&2
+        exit 2
+        ;;
+esac
+
+# --spre 仅表示是否实例化可训练的 SPRE head，由 reliability 自动推导，
+# 避免 edge/cached 消融在 DDP 中留下 unused parameters。
+if [[ "$RELIABILITY" == "spre" ]]; then
+    SPRE=on
+else
+    SPRE=off
+fi
+export SPRE
+
+# 旧 checkpoint 配 auto 必然崩，且要跑完先验构建才崩，白等很久。
+# 新 checkpoint 会保存 fingerprint，在这里与本次 sbatch 配置严格比较。
 if [[ "$RESUME" == "auto" && -f "log/model/latest.pth" ]]; then
-    echo "=== 注意: log/model/latest.pth 存在且 RESUME=auto ==="
-    echo "如果这份 checkpoint 早于 4 级级联重构，加载会失败。"
-    echo "从头开始:  RESUME=off bash $0"
-    echo "或先挪走:  mv log/model/latest.pth log/model/latest.pth.pre_4stage"
+    "$PYTHON_BIN" - <<'PYCHECK'
+import os
+import sys
+from dataclasses import replace
+
+import torch
+
+from base.config import build_mvs_config
+from train import _arch_fingerprint
+
+cfg = build_mvs_config(profile=os.environ["TRAIN_PROFILE"])
+cfg = replace(
+    cfg,
+    train=replace(
+        cfg.train,
+        batch_size=int(os.environ["BATCH_SIZE"]),
+        num_views=int(os.environ["NUM_VIEWS"]),
+        num_workers=int(os.environ["NUM_WORKERS"]),
+        lr=float(os.environ["LEARNING_RATE"]),
+        warmup_steps=int(os.environ["WARMUP_STEPS"]),
+        val_interval=int(os.environ["VAL_INTERVAL"]),
+        amp=os.environ["AMP"] == "on",
+    ),
+    dino=replace(
+        cfg.dino,
+        mode=os.environ["DINO_MODE"],
+        feed_fpn=os.environ["FEED_FPN"] == "on",
+    ),
+    spre=replace(
+        cfg.spre,
+        enabled=os.environ["SPRE"] == "on",
+        reliability_source=os.environ["RELIABILITY"],
+    ),
+)
+ckpt = torch.load("log/model/latest.pth", map_location="cpu", weights_only=False)
+saved = ckpt.get("fingerprint")
+current = _arch_fingerprint(cfg)
+if saved is None:
+    sys.exit(
+        "RESUME=auto but latest.pth has no architecture fingerprint. "
+        "Use RESUME=off for a fresh run or resume it with the matching old code."
+    )
+if saved != current:
+    keys = sorted(set(saved) | set(current))
+    diff = "\n".join(
+        f"  {k}: checkpoint={saved.get(k)!r} current={current.get(k)!r}"
+        for k in keys if saved.get(k) != current.get(k)
+    )
+    sys.exit("RESUME=auto configuration mismatch:\n" + diff)
+print(f"resume check: fingerprint matches (step={ckpt.get('step', '?')})")
+PYCHECK
+elif [[ "$RESUME" == "off" && -f "log/model/latest.pth" ]]; then
+    echo "WARNING: RESUME=off and log/model/latest.pth exists."
+    echo "The first checkpoint of this fresh run will overwrite latest.pth/best.pth."
 fi
 
 echo "=== job=${SLURM_JOB_ID:-manual} host=$(hostname) profile=$TRAIN_PROFILE ==="
+echo "=== submit_dir=${SLURM_SUBMIT_DIR:-manual} project=$PROJECT_DIR ==="
 nvidia-smi -L
 echo "=== python=$PYTHON_BIN ==="
 "$PYTHON_BIN" -c 'import importlib.util, sys, torch, huggingface_hub; print("python:", sys.executable); print("torch:", torch.__version__, torch.__file__); print("huggingface_hub:", huggingface_hub.__version__); print("vggt:", importlib.util.find_spec("vggt.models.vggt").origin)'
@@ -72,17 +171,26 @@ echo "=== python=$PYTHON_BIN ==="
 import sys
 from models.dinov3.vision_transformer import vit_base
 from models.spre import SVAFusion, DinoSVA  # noqa: F401
+from base.config import build_mvs_config
+from models.cost_volume import VisibilityHead
+from models.depth_range import apply_branch_prior
 from models.network import UprMVSNet
 blk = vit_base(patch_size=16, n_storage_tokens=4).blocks[0]
 if not hasattr(blk.ls1, "gamma"):
     sys.exit("DINOv3 LayerScale 仍是 nn.Identity —— 这是旧代码，git pull 后再跑")
 if UprMVSNet.fpn_stage_strides != (8, 4, 2, 1):
     sys.exit(f"级联仍是 {UprMVSNet.fpn_stage_strides} —— 这是旧代码，git pull 后再跑")
-print("code check: LayerScale ok, SVAFusion ok, 4-stage cascade ok")
+cfg = build_mvs_config(profile="umhpc")
+if (cfg.depth_range.num_global, cfg.depth_range.num_local) != (40, 8):
+    sys.exit("stage1 candidate split is not 40/8")
+if cfg.depth_range.dual_mode_stage2:
+    sys.exit("dual_mode_stage2 must remain off until the two-volume implementation is ready")
+print("code check: LayerScale/SVAFusion/VisibilityHead/branch prior/40+8 cascade ok")
 PYCHECK
 
 echo "=== batch=$BATCH_SIZE views=$NUM_VIEWS workers=$NUM_WORKERS lr=$LEARNING_RATE warmup=$WARMUP_STEPS \
-val_interval=$VAL_INTERVAL amp=$AMP steps=$STEPS spre=$SPRE resume=$RESUME build_priors=$BUILD_PRIORS smoke=$SMOKE ==="
+val_interval=$VAL_INTERVAL amp=$AMP steps=$STEPS dino=$DINO_MODE feed_fpn=$FEED_FPN \
+reliability=$RELIABILITY clean_lists=$CLEAN_LISTS resume=$RESUME build_priors=$BUILD_PRIORS smoke=$SMOKE ==="
 
 train_args=(
     --profile "$TRAIN_PROFILE"
@@ -95,9 +203,21 @@ train_args=(
     --warmup-steps "$WARMUP_STEPS"
     --val-interval "$VAL_INTERVAL"
     --amp "$AMP"
+    --dino-mode "$DINO_MODE"
+    --feed-fpn "$FEED_FPN"
+    --reliability "$RELIABILITY"
     --spre "$SPRE"
     --name "$RUN_NAME"
 )
+
+case "$CLEAN_LISTS" in
+    on|ON|1|true|TRUE|yes|YES) ;;
+    off|OFF|0|false|FALSE|no|NO) train_args+=(--no-clean-lists) ;;
+    *)
+        echo "CLEAN_LISTS must be on/off; got: $CLEAN_LISTS" >&2
+        exit 2
+        ;;
+esac
 
 case "$SMOKE" in
     1|true|TRUE|yes|YES)

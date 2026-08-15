@@ -48,7 +48,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from base.config import ProjectPaths, build_mvs_config
+from base.config import ProjectPaths, build_mvs_config, resolve_split
 from data.dtu import DTUMVSDataset
 from models.network import UprMVSNet
 from utils.geometry import unproject_depth
@@ -114,7 +114,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ply-dir", default=None,
                    help="where the fused clouds go (default cfg.paths.pred_points_path, i.e. "
                         "<project>/log/pred_points). Relative paths resolve under the project root.")
-    p.add_argument("--photo-thresh", type=float, default=0.3, help="stage-4 mode-probability threshold")
+    p.add_argument("--photo-thresh", type=float, default=0.3,
+                   help="cascade mode-probability threshold (was inert when confidence "
+                        "came from stage 4 alone — see cascade_confidence)")
+    p.add_argument("--no-clean-lists", action="store_true",
+                   help="不使用 audit 产出的 *_clean.txt / exclude_*.csv")
+    p.add_argument("--conf-window", type=int, default=1,
+                   help="+-bins around each stage's argmax for the fusion confidence")
+    p.add_argument("--conf-mode", choices=["product", "geomean", "last"], default="product",
+                   help="how to combine per-stage mode mass; 'last' reproduces the inert "
+                        "pre-fix behaviour for A/B only")
     p.add_argument("--geo-views", type=int, default=3, help="min consistent source views")
     p.add_argument("--geo-pix", type=float, default=1.0, help="max reprojection error (px)")
     p.add_argument("--geo-rel", type=float, default=0.01, help="max relative depth difference")
@@ -145,10 +154,16 @@ def _collate(samples: list[dict]) -> dict:
 
 
 def build_dataset(cfg, args) -> DTUMVSDataset:
-    listfile = args.list or (cfg.paths.val_list_file if args.split == "val" else cfg.paths.test_list_file)
+    # 走和 train.py 同一个解析器, 否则训练和评测会悄悄跑在不同的 scan 集合上。
+    if args.list:
+        listfile, exclude_file = args.list, None
+    else:
+        _base = cfg.paths.val_list_file if args.split == "val" else cfg.paths.test_list_file
+        listfile, exclude_file = resolve_split(_base, args.split, not args.no_clean_lists)
     ds = DTUMVSDataset(
         datapath=cfg.paths.dtu_train_root,
         listfile=listfile,
+        exclude_file=exclude_file,
         nviews=args.num_views or cfg.train.num_views,
         mode=args.split,
         use_src_weights=cfg.cost_volume.use_src_weights,
@@ -217,7 +232,7 @@ def _resolve_ckpt(args) -> Path:
     )
 
 
-def _align_cfg_to_ckpt(cfg, state: dict, override: str = "auto"):
+def _align_cfg_to_ckpt(cfg, state: dict, override: str = "auto", fingerprint=None):
     """Checkpoints store weights only, never the config they were trained with,
     so architecture switches must be recovered from the key set. Currently that
     means the SPRE head (``spre.*``, whose DINOv3/SVA trunk lives under
@@ -229,6 +244,32 @@ def _align_cfg_to_ckpt(cfg, state: dict, override: str = "auto"):
         cfg = replace(cfg, spre=replace(cfg.spre, enabled=want))
         src = "checkpoint" if override == "auto" else f"--spre {override}"
         print(f"[test] spre.enabled -> {want} (from {src})")
+    if not want:
+        cfg = replace(cfg, spre=replace(cfg.spre, reliability_source="cached"))
+    # 架构指纹优先于从 state_dict 猜: 40/8 vs 32/16、门控、双模态、可见性头
+    # 都不在 state_dict 里 (或只体现为几个 vis_head 的 key), 猜不出来。
+    if fingerprint:
+        print(f"[test] 按 checkpoint fingerprint 建模型: {fingerprint}")
+        cfg = replace(cfg,
+                      depth_range=replace(cfg.depth_range,
+                                          num_global=fingerprint["num_global"],
+                                          num_local=fingerprint["num_local"],
+                                          gate_local_branch=fingerprint["gate_local_branch"],
+                                          branch_prior=fingerprint["branch_prior"],
+                                          dual_mode_stage2=fingerprint["dual_mode_stage2"]),
+                      cost_volume=replace(cfg.cost_volume,
+                                          visibility_weighting=fingerprint["visibility_weighting"],
+                                          use_src_weights=fingerprint["use_src_weights"]))
+        if override == "auto":
+            cfg = replace(cfg, spre=replace(
+                cfg.spre, enabled=fingerprint["spre_enabled"],
+                reliability_source=fingerprint["reliability_source"]),
+                dino=replace(cfg.dino, mode=fingerprint["dino_mode"],
+                             feed_fpn=fingerprint["feed_fpn"]))
+    else:
+        print("[test] WARNING: checkpoint 没有 fingerprint (2026-08-14 之前存的)。"
+              " 架构开关只能用当前默认值, 与训练时可能不符 —— "
+              "log/model/best.pth 是 32/16 且无 VisibilityHead。")
     return cfg, has_spre
 
 
@@ -236,7 +277,8 @@ def load_model(cfg, args, device: torch.device) -> tuple[UprMVSNet, Path]:
     ckpt_path = _resolve_ckpt(args)
     ckpt = torch.load(ckpt_path, map_location=device)
     state = ckpt["model"]
-    cfg, has_spre = _align_cfg_to_ckpt(cfg, state, getattr(args, "spre", "auto"))
+    cfg, has_spre = _align_cfg_to_ckpt(cfg, state, getattr(args, "spre", "auto"),
+                                       fingerprint=ckpt.get("fingerprint"))
     model = UprMVSNet(cfg).to(device)
     if cfg.spre.enabled == has_spre:
         model.load_state_dict(state)
@@ -326,17 +368,63 @@ class ScanMeter:
         }
 
 
-def photometric_confidence(prob: torch.Tensor, mode_idx: torch.Tensor, window: int) -> torch.Tensor:
-    """Probability mass in +-window bins around the argmax mode ([B, H, W]).
-
-    The final stage has only 4 hypotheses, so a window of 2 already spans the
-    whole axis and the confidence saturates at 1 — clamped below accordingly.
-    """
+def _stage_mode_mass(stage: dict, window: int, target_hw) -> torch.Tensor:
+    """Posterior mass within +-``window`` bins of this stage's argmax, at ``target_hw``."""
+    prob = stage["prob"].float()
     D = prob.shape[1]
     w = min(2 * window + 1, D)
-    start = (mode_idx - (w // 2)).clamp(0, D - w)   # shift, not clamp: repeated
-    offs = torch.arange(w, device=prob.device).view(1, -1, 1, 1)  # indices would
-    return prob.gather(1, start + offs).sum(dim=1)                # double-count
+    idx = stage.get("mode_idx")
+    if idx is None:
+        idx = prob.argmax(dim=1, keepdim=True)
+    # Slide the window to stay in bounds rather than clamping indices, which
+    # would gather the edge bin repeatedly and double-count its mass.
+    start = (idx - (w // 2)).clamp(0, D - w)
+    offs = torch.arange(w, device=prob.device).view(1, -1, 1, 1)
+    mass = prob.gather(1, start + offs).sum(dim=1).clamp(0.0, 1.0)
+    if tuple(mass.shape[-2:]) != tuple(target_hw):
+        mass = F.interpolate(mass.unsqueeze(1), size=tuple(target_hw),
+                             mode="bilinear", align_corners=False).squeeze(1)
+    return mass
+
+
+def cascade_confidence(outputs: dict, window: int = 1, mode: str = "product",
+                       stages=("stage1", "stage2", "stage3", "stage4")) -> torch.Tensor:
+    """Fusion confidence combined across cascade stages (ported from test_tt.py).
+
+    Why not the final stage alone: it carries ``num_depths_stage4=4`` hypotheses,
+    so the old ``mode_window=2`` window spanned the whole axis and the mass was
+    identically 1.0 — which made ``--photo-thresh`` an inert gate and fusion ran
+    on geometric consistency alone. That is what invalidated the 2026-08-08 DTU
+    numbers (0.3944/0.2482/0.3213); see the note in that run's metrics.
+
+    Stage 1 has 48 bins and is the only level where a +-1 window is genuinely
+    selective, so a pixel is trusted when *every* stage concentrated its
+    posterior, not just the last.
+
+    ``mode``:
+      ``product``  — all stages must agree; the sharpest, and the default.
+      ``geomean``  — same ordering, rescaled so a threshold tuned on one stage
+                     count still means something.
+      ``last``     — final stage only. 注意要复现修复前的失效行为需要
+                     ``--conf-mode last --conf-window 2`` (window=2 才覆盖 4 元
+                     轴的全部); ``last`` 配 window=1 是另一回事。仅用于 A/B。
+
+    阈值不可跨 mode 迁移: 实测 product 的 min 是 0.019、geomean 的 min 是 0.372,
+    同一个 ``--photo-thresh 0.3`` 在 geomean 下仍然一个像素都不过滤。换 mode
+    必须重扫 ``--photo-thresh``。
+    """
+    hw = outputs["depth_full"].shape[-2:]
+    masses = [_stage_mode_mass(outputs[s], window, hw) for s in stages if s in outputs]
+    if not masses:
+        raise KeyError(f"none of {stages} present in outputs")
+    if mode == "last":
+        return masses[-1]
+    stacked = torch.stack(masses, dim=0)
+    if mode == "product":
+        return stacked.prod(dim=0)
+    if mode == "geomean":
+        return stacked.clamp_min(1e-8).log().mean(dim=0).exp()
+    raise ValueError(f"unknown conf mode {mode!r}")
 
 
 def depth_vis(depth: np.ndarray) -> np.ndarray:
@@ -352,6 +440,8 @@ def depth_vis(depth: np.ndarray) -> np.ndarray:
 
 @torch.no_grad()
 def run_inference(model, ds, cfg, args, device, out_root: Path) -> dict:
+    # [min, max, mean_sum, n] —— 融合置信度的饱和自检, 见下面的 WARNING
+    _conf_samples: list = []      # 融合置信度的抽样, 用于下面的阈值自检
     loader = DataLoader(ds, batch_size=1, shuffle=False,
                         num_workers=args.num_workers, collate_fn=_collate, pin_memory=True)
     use_amp = cfg.train.amp and device.type == "cuda"
@@ -366,8 +456,10 @@ def run_inference(model, ds, cfg, args, device, out_root: Path) -> dict:
         with torch.autocast(device_type=device.type, enabled=use_amp):
             outputs = model(batch)
         pred = outputs["depth_full"].float()
-        conf = photometric_confidence(outputs["stage4"]["prob"].float(),
-                                      outputs["stage4"]["mode_idx"], mw)
+        conf = cascade_confidence(outputs, window=args.conf_window, mode=args.conf_mode)
+        # 饱和自检: conf 恒为 1 意味着 --photo-thresh 门控是死的, 融合实际只跑了
+        # 几何一致性。2026-08-08 那组 DTU 数就是这么废掉的。
+        _conf_samples.append(conf.detach().flatten()[::97].float().cpu())
         if conf.shape[-2:] != pred.shape[-2:]:
             conf = F.interpolate(conf.unsqueeze(1), size=pred.shape[-2:], mode="bilinear",
                                  align_corners=False).squeeze(1)
@@ -400,6 +492,22 @@ def run_inference(model, ds, cfg, args, device, out_root: Path) -> dict:
             print(f"[test] {i + 1}/{len(ds)} ({scan} ref {ref_view})", flush=True)
 
     per_scan = {scan: meter.scan_metrics(scan) for scan in meter.sums}
+    if _conf_samples:
+        cs = torch.cat(_conf_samples).numpy()
+        import numpy as _np
+        q = _np.percentile(cs, [1, 5, 50, 95, 99])
+        keep = float((cs > args.photo_thresh).mean())
+        print(f"[test] fusion confidence (window={args.conf_window}, mode={args.conf_mode}): "
+              f"p1 {q[0]:.4f}  p5 {q[1]:.4f}  p50 {q[2]:.4f}  p95 {q[3]:.4f}  p99 {q[4]:.4f}")
+        print(f"[test] --photo-thresh {args.photo_thresh} 保留 {100*keep:.2f}% 的像素")
+        # "置信度不恒定" != "阈值有效"。真正要报警的是阈值一个像素都不筛,
+        # 或者把所有像素都筛掉。
+        if keep > 0.999 or keep < 0.001:
+            print(f"[test] WARNING: --photo-thresh 保留率 {100*keep:.2f}% —— 这个门"
+                  f"实际上没有起作用, 融合等于只跑几何一致性 (或全被筛掉)。"
+                  f"这正是 2026-08-08 那组 DTU 数作废的原因。请按上面的分位数"
+                  f"重新选阈值; 注意 product / geomean 的阈值不可互换。")
+
     return {"overall": meter.overall(), "per_scan": per_scan}
 
 

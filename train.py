@@ -49,6 +49,7 @@ keys are produced automatically by the offline precompute (models/pre_prior.py).
 
 from __future__ import annotations
 
+from pathlib import Path
 import argparse
 import math
 import os
@@ -61,7 +62,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from base.config import ProjectPaths, build_mvs_config
+from base.config import resolve_split, ProjectPaths, build_mvs_config
 from losses import MVSLoss
 from models.network import UprMVSNet
 
@@ -281,9 +282,10 @@ class TrainLogger:
     def _tag(cls, name: str) -> str:
         return f"{cls.TAG_PREFIX}/{name}"
 
-    def __init__(self, run_name: str, enabled: bool) -> None:
+    def __init__(self, run_name: str, enabled: bool, cfg=None) -> None:
         self.enabled = enabled
         self.best_metric = float("inf")
+        self.cfg = cfg          # 存进 checkpoint, 见 save()
         if not enabled:
             return
         log_root = ProjectPaths().project_path / "log"
@@ -364,6 +366,13 @@ class TrainLogger:
             "model": state,
             "optimizer": optimizer.state_dict(),
             "best_metric": self.best_metric,
+            # 完整配置 + 指纹。以下开关都无法从 state_dict 反推:
+            # 40/8 还是 32/16、branch prior/hard gate、dual-mode、reliability
+            # source、stage weights。少了它, 同一个 ckpt 用当前默认配置推理会
+            # 静默改变语义 (log/model/best.pth 就是 32/16 训的)。
+            "config": _config_snapshot(self.cfg) if getattr(self, "cfg", None) is not None else None,
+            "fingerprint": _arch_fingerprint(self.cfg) if getattr(self, "cfg", None) is not None else None,
+            "git": _git_state(),
         }
         torch.save(ckpt, self.model_dir / "latest.pth")
         if is_best:
@@ -461,7 +470,21 @@ def main_worker(
         cfg = replace(cfg, prior=replace(cfg.prior, **prior_overrides))
 
     if args.spre is not None:
-        cfg = replace(cfg, spre=replace(cfg.spre, enabled=(args.spre == "on")))
+        on = args.spre == "on"
+        cfg = replace(cfg, spre=replace(cfg.spre, enabled=on))
+        # --spre off 就是"没有 SPRE": 在这里显式翻译成 cached, 免得后面
+        # 靠模型内部降级。--reliability 若也给了, 下面会覆盖它。
+        if not on:
+            cfg = replace(cfg, spre=replace(cfg.spre, reliability_source="cached"))
+    # DINO matching 与 SPRE reliability 解耦: 从前 spre.enabled 一个开关同时
+    # 控制"是否加载 DINO / 是否跑 SVA / 是否喂 FPN / 用不用 SPRE 替换缓存
+    # confidence", 任何收益都无法归因。
+    if args.dino_mode is not None:
+        cfg = replace(cfg, dino=replace(cfg.dino, mode=args.dino_mode))
+    if args.feed_fpn is not None:
+        cfg = replace(cfg, dino=replace(cfg.dino, feed_fpn=(args.feed_fpn == "on")))
+    if args.reliability is not None:
+        cfg = replace(cfg, spre=replace(cfg.spre, reliability_source=args.reliability))
 
     is_ddp = world_size > 1
     is_main = rank == 0
@@ -523,7 +546,7 @@ def main_worker(
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     run_name = args.name + ("_smoke" if args.smoke else "")
-    logger = TrainLogger(run_name, enabled=is_main)
+    logger = TrainLogger(run_name, enabled=is_main, cfg=cfg)
 
     # Resume from latest.pth so a walltime-killed job continues where it left
     # off (model + optimizer + step + best val metric). Every rank loads the
@@ -674,6 +697,56 @@ class _EpochShuffleSampler(torch.utils.data.Sampler):
         return len(self.order)
 
 
+def _config_snapshot(cfg) -> dict:
+    """MVSConfig -> 纯 python 容器 (Path 转 str), 可无依赖反序列化。"""
+    from dataclasses import asdict, is_dataclass
+
+    def conv(o):
+        if is_dataclass(o) and not isinstance(o, type):
+            return {k: conv(v) for k, v in asdict(o).items()}
+        if isinstance(o, dict):
+            return {k: conv(v) for k, v in o.items()}
+        if isinstance(o, (list, tuple)):
+            return type(o)(conv(v) for v in o)
+        if isinstance(o, Path):
+            return str(o)
+        return o
+    return conv(cfg)
+
+
+def _arch_fingerprint(cfg) -> dict:
+    """决定 state_dict 是否可加载 / 推理语义是否一致的那些开关。"""
+    return {
+        "num_global": cfg.depth_range.num_global,
+        "num_local": cfg.depth_range.num_local,
+        "num_depths": [cfg.cost_volume.num_depths_stage1, cfg.cost_volume.num_depths_stage2,
+                       cfg.cost_volume.num_depths_stage3, cfg.cost_volume.num_depths_stage4],
+        "gate_local_branch": cfg.depth_range.gate_local_branch,
+        "branch_prior": cfg.depth_range.branch_prior,
+        "dual_mode_stage2": cfg.depth_range.dual_mode_stage2,
+        "visibility_weighting": cfg.cost_volume.visibility_weighting,
+        "use_src_weights": cfg.cost_volume.use_src_weights,
+        "dino_mode": getattr(cfg.dino, "mode", "all_view"),
+        "feed_fpn": cfg.dino.feed_fpn,
+        "reliability_source": getattr(cfg.spre, "reliability_source", "spre"),
+        "spre_enabled": cfg.spre.enabled,
+        "mode_window": cfg.depth_range.mode_window,
+    }
+
+
+def _git_state() -> dict:
+    import subprocess
+    def run(*a):
+        try:
+            return subprocess.run(a, capture_output=True, text=True, timeout=5).stdout.strip()
+        except Exception:
+            return ""
+    return {"commit": run("git", "rev-parse", "HEAD"),
+            "dirty": bool(run("git", "status", "--porcelain"))}
+
+
+
+
 def _run_training(model, loss_fn, optimizer, scaler, cfg, device, args, world_size, rank, is_ddp, logger, is_main, start_step=0):
     from torch.utils.data import DataLoader
     from torch.utils.data.distributed import DistributedSampler
@@ -681,9 +754,12 @@ def _run_training(model, loss_fn, optimizer, scaler, cfg, device, args, world_si
     from data.augment import PhotometricAug
     from data.dtu import DTUMVSDataset
 
+    _use_clean = not getattr(args, "no_clean_lists", False)
+    _tr_list, _tr_excl = resolve_split(cfg.paths.train_list_file, "train", _use_clean)
     dataset = DTUMVSDataset(
         datapath=cfg.paths.dtu_train_root,
-        listfile=cfg.paths.train_list_file,
+        listfile=_tr_list,
+        exclude_file=_tr_excl,
         nviews=cfg.train.num_views,
         mode="train",
         prior_corruption_prob=cfg.train.prior_corruption_prob,
@@ -699,7 +775,7 @@ def _run_training(model, loss_fn, optimizer, scaler, cfg, device, args, world_si
         resize_range=cfg.augment.resize_range,
     )
     if len(dataset) == 0:
-        raise RuntimeError(f"training dataset is empty — check {cfg.paths.train_list_file}")
+        raise RuntimeError(f"training dataset is empty — check {_tr_list}")
     # A sampler on both paths (not shuffle=True) so the epoch's draw order can be
     # read before the loader consumes it — multi-scale needs to bucket that exact
     # order into per-batch resolutions.
@@ -721,9 +797,11 @@ def _run_training(model, loss_fn, optimizer, scaler, cfg, device, args, world_si
 
     # Validation: deterministic split (center crop, one light condition); used
     # to select best.pth. Never overlaps the training scans.
+    _va_list, _va_excl = resolve_split(cfg.paths.val_list_file, "val", _use_clean)
     val_dataset = DTUMVSDataset(
         datapath=cfg.paths.dtu_train_root,
-        listfile=cfg.paths.val_list_file,
+        listfile=_va_list,
+        exclude_file=_va_excl,
         nviews=cfg.train.num_views,
         mode="val",
         use_src_weights=cfg.cost_volume.use_src_weights,
@@ -731,7 +809,7 @@ def _run_training(model, loss_fn, optimizer, scaler, cfg, device, args, world_si
     # A silently-empty val split poisons best.pth (val abs_err computes to 0.0
     # at the first validation and can never be beaten). Fail loudly instead.
     if len(val_dataset) == 0:
-        raise RuntimeError(f"validation dataset is empty — check {cfg.paths.val_list_file}")
+        raise RuntimeError(f"validation dataset is empty — check {_va_list}")
     val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False, drop_last=False) if is_ddp else None
     val_loader = DataLoader(
         val_dataset,
@@ -877,6 +955,14 @@ def main() -> None:
                         help="auto: precompute missing priors; force: recompute all; "
                              "skip: assume cached; only: build missing priors then exit; "
                              "DDP launches must use skip")
+    parser.add_argument("--no-clean-lists", action="store_true",
+                        help="不使用 audit 产出的 *_clean.txt / exclude_*.csv (默认自动使用)")
+    parser.add_argument("--dino-mode", choices=["off", "all_view", "ref_only"], default=None,
+                        help="DINO 路径: off / all_view (当前) / ref_only (MonoMVSNet 式)")
+    parser.add_argument("--feed-fpn", choices=["on", "off"], default=None,
+                        help="DINO 特征是否注入 FPN (与 SPRE 可靠度解耦)")
+    parser.add_argument("--reliability", choices=["cached", "edge", "spre"], default=None,
+                        help="prior 可靠度来源, 与 DINO matching 解耦")
     parser.add_argument("--spre", choices=["on", "off"], default=None,
                         help="enable/disable the SPRE DINOv3 prior-reliability head (default: config value)")
     parser.add_argument("--smoke", action="store_true", help="run synthetic steps to validate the pipeline")

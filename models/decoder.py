@@ -72,8 +72,13 @@ class DepthDecoder(nn.Module):
         self,
         cost_volume: torch.Tensor,
         depth_hypos: torch.Tensor,
+        branch_prior=None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         logits = self.unet(cost_volume)
+        # 分支先验: P(d) = q P(d|local) + (1-q) P(d|global)。必须在各分支内部
+        # 先归一化再乘先验 —— 见 depth_range.apply_branch_prior 的推导。
+        if branch_prior is not None:
+            logits = branch_prior(logits)
         # max-shift keeps softmax finite under AMP; log_softmax downstream is
         # shift-invariant so the loss sees the same distribution.
         logits = logits - logits.amax(dim=1, keepdim=True).detach()

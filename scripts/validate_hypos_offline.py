@@ -73,10 +73,13 @@ def main() -> None:
     args = ap.parse_args()
 
     cfg = build_mvs_config()
-    listfile = cfg.paths.val_list_file if args.split == "val" else cfg.paths.train_list_file
+    from base.config import resolve_split
+    listfile, exclude_file = resolve_split(
+        cfg.paths.val_list_file if args.split == "val" else cfg.paths.train_list_file, args.split)
     ds = DTUMVSDataset(
         datapath=cfg.paths.dtu_train_root,
         listfile=listfile,
+        exclude_file=exclude_file,
         nviews=cfg.train.num_views,
         mode=args.split,
     )

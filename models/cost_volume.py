@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from utils.geometry import homography_warp_features
 
@@ -23,6 +25,43 @@ def group_wise_correlation(ref: torch.Tensor, warped: torch.Tensor, num_groups: 
     # the full-res stage, producing inf -> NaN downstream. Casting after .mean() is
     # too late; the overflow happens in the elementwise product.
     return (ref_g.float() * warp_g.float()).mean(dim=2)
+
+
+class VisibilityHead(nn.Module):
+    """Per-(source, pixel) 可见性权重, 由该 source 自己的相关体统计量预测。
+
+    动机 (experiments/out/coloc_val_*.log): stage1 尾巴里 58.9% 是 global 分支
+    赢了却选错平面 —— 而聚合原本是所有 source 的等权平均, 一个被遮挡的 source
+    和一个完全可见的 source 权重相同。遮挡是逐像素的, per-view 标量表达不了。
+
+    输入三个与 D 无关的统计量, 所以参数量和深度假设数无关:
+      peak  相关性在深度维上的最大值   (匹配到没有)
+      ent   深度维 softmax 的归一化熵  (峰是否尖锐)
+      mean  深度维均值                 (整体相关强度基线)
+    """
+
+    def __init__(self, hidden: int = 16) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(3, hidden, 1), nn.ReLU(inplace=True),
+            nn.Conv2d(hidden, hidden, 3, padding=1), nn.ReLU(inplace=True),
+            nn.Conv2d(hidden, 1, 1),
+        )
+
+    def forward(self, cv_s: torch.Tensor) -> torch.Tensor:
+        """``cv_s`` [B,G,D,H,W] -> 未归一化的 logits [B,1,H,W]。
+
+        调用方在收齐所有 source 之后在 source 维做 softmax —— 每个 source 独立
+        sigmoid 不构成竞争, 无法表达"这块区域该信谁"。
+        """
+        c = cv_s.mean(dim=1)                                   # [B,D,H,W]
+        peak = c.amax(dim=1, keepdim=True)
+        mean = c.mean(dim=1, keepdim=True)
+        p = F.softmax(c.float(), dim=1).clamp_min(1e-8)
+        D = c.shape[1]
+        ent = (-(p * p.log()).sum(dim=1, keepdim=True) / max(torch.log(torch.tensor(float(D))).item(), 1e-6))
+        x = torch.cat([peak, mean, ent.to(peak.dtype)], dim=1)
+        return self.net(x)                                      # [B,1,H,W] logits
 
 
 class CostVolumeBuilder(nn.Module):
@@ -47,6 +86,7 @@ class CostVolumeBuilder(nn.Module):
         warp_channels: int,
         num_groups: int = 8,
         use_half: bool = True,
+        visibility_weighting: bool = False,
     ) -> None:
         super().__init__()
         if warp_channels % num_groups != 0:
@@ -56,6 +96,7 @@ class CostVolumeBuilder(nn.Module):
         self.proj = nn.Conv2d(in_channels, warp_channels, kernel_size=1, bias=False)
         self.warp_channels = warp_channels
         self.num_groups = num_groups
+        self.vis_head = VisibilityHead() if visibility_weighting else None
         self.use_half = use_half
 
     def _sample_dtype(self, ref: torch.Tensor) -> torch.dtype:
@@ -87,8 +128,16 @@ class CostVolumeBuilder(nn.Module):
         
         ref_p = self.proj(ref_feat).to(sample_dtype)
 
+        # 缓存的 src_weights 可能比当前 source 数短 (见 config 注释) —— 与其
+        # 让它在中途 IndexError, 不如显式忽略。
+        if src_weights is not None and src_weights.shape[1] != S:
+            # 必须严格等长: 更长也不能用, 那是按另一组视角算出来的权重。
+            src_weights = None
         agg = ref_feat.new_zeros(B, self.num_groups, D, H, W, dtype=torch.float32)
         weight_sum = ref_feat.new_zeros(B, 1, 1, 1, 1, dtype=torch.float32)
+        # 两遍: 先收齐每个 source 的相关体和可见性 logits, 再在 source 维竞争
+        # 归一化。一遍式的 per-source sigmoid 不构成竞争。
+        cvs, vlogits = [], []
         for s in range(S):
             src_p = self.proj(src_feats[:, s]).to(sample_dtype)
             warped = homography_warp_features(
@@ -101,11 +150,34 @@ class CostVolumeBuilder(nn.Module):
                 feature_stride,
             )
             cv_s = group_wise_correlation(ref_p, warped, self.num_groups).float()
+            cvs.append(cv_s)
+            if self.vis_head is not None:
+                vlogits.append(self.vis_head(cv_s))
+        self.last_vis_stats = None
+        if self.vis_head is not None:
+            pi = torch.softmax(torch.stack(vlogits, dim=0).float(), dim=0)   # [S,B,1,H,W]
+            vis = pi * S                                                     # 均值恒为 1
+            with torch.no_grad():
+                # 记 mean 没有信息 (softmax*S 的 source 维均值按构造就是 1)。
+                # 有信息的是这个分布有多集中:
+                p_ = pi.squeeze(2).clamp_min(1e-8)                           # [S,B,H,W]
+                ent = (-(p_ * p_.log()).sum(0)) / max(float(np.log(S)), 1e-6)  # 归一化熵
+                mx = p_.amax(0)
+                self.last_vis_stats = {
+                    "ent": float(ent.mean()),          # 1 = 完全均匀, 0 = 只信一个源视
+                    "max_w": float(mx.mean()),
+                    "eff_src": float(torch.exp(-(p_ * p_.log()).sum(0)).mean()),
+                    "concentrated": float((mx > 0.7).float().mean()),
+                    "num_src": float(S),
+                }
+        for s, cv_s in enumerate(cvs):
             w = (
                 src_weights[:, s].view(B, 1, 1, 1, 1).float()
                 if src_weights is not None
                 else ref_feat.new_ones(B, 1, 1, 1, 1, dtype=torch.float32)
             )
+            if self.vis_head is not None:
+                w = w * vis[s].unsqueeze(2)          # [B,1,1,H,W]
             agg = agg + cv_s * w
             weight_sum = weight_sum + w
         return agg / weight_sum.clamp(min=1e-6)

@@ -10,7 +10,10 @@ from models.decoder import DepthDecoder
 from models.depth_range import (
     Stage1Hypotheses,
     build_stage1_hypotheses,
+    apply_branch_prior,
+    merge_dual_mode,
     refine_range_from_posterior,
+    second_mode,
 )
 from models.fpn import MultiViewFPN
 
@@ -78,8 +81,11 @@ class UprMVSNet(nn.Module):
         warp_chs = (cv_cfg.warp_channels_stage1, cv_cfg.warp_channels_stage2,
                     cv_cfg.warp_channels_stage3, cv_cfg.warp_channels_stage4)
         self.cost_builders = nn.ModuleList([
-            CostVolumeBuilder(fpn_c, wc, cv_cfg.num_groups, cv_cfg.warp_use_half)
-            for wc in warp_chs
+            # 只在 stage1 启用: 全分辨率 stage4 只有 4 个候选, 深度维统计量
+            # (peak/entropy) 在那里几乎没有信息量。
+            CostVolumeBuilder(fpn_c, wc, cv_cfg.num_groups, cv_cfg.warp_use_half,
+                              visibility_weighting=(cv_cfg.visibility_weighting and i == 0))
+            for i, wc in enumerate(warp_chs)
         ])
         # Per-stage 3D-UNet decoders. Stage 1 additionally sees the hypothesis
         # metadata channels (its axis is irregular); stages 2-4 use uniform
@@ -101,15 +107,50 @@ class UprMVSNet(nn.Module):
         # consumers: the FPN bottleneck (per-view matching features) and the
         # SPRE reliability head (reference view). Off by default; when off the
         # network is byte-for-byte the previous model and DINOv3 never loads.
-        self.spre_enabled = bool(self.cfg.spre.enabled)
-        self.feed_fpn = self.spre_enabled and bool(self.cfg.dino.feed_fpn)
-        if self.spre_enabled:
+        # 三个正交开关 (从前全被 spre.enabled 一个开关捆住, 收益无法归因):
+        #   dino.mode              off / all_view / ref_only —— 跑不跑 DINO, 跑几个视角
+        #   dino.feed_fpn          DINO 特征喂不喂 FPN (matching 路径)
+        #   spre.reliability_source cached / edge / spre —— 可靠度从哪来
+        self.dino_mode = str(getattr(self.cfg.dino, "mode", "all_view"))
+        self.reliability_source = str(getattr(self.cfg.spre, "reliability_source", "spre"))
+        if self.dino_mode == "ref_only":
+            raise NotImplementedError(
+                "dino_mode='ref_only' 需要 MonoMVSNet 式异构融合 (source 用 CNN/FPN "
+                "做 query 去查 reference DINO), 而当前 SVA 与 prior_view_consistency "
+                "都依赖 source DINO token。见 models/spre.py:106 与 :246。"
+            )
+        # 三个开关真正正交, 非法组合直接报错而不是静默降级。
+        # spre.enabled 是总闸: 它为 False 时无论 reliability_source 写什么都不会
+        # 有 SPRE —— 但这个降级会打印出来, 不是静默的。从前这里完全没读
+        # cfg.spre.enabled, 于是 `--spre off` 关不掉 SPRE, 而默认配置
+        # (enabled=False + reliability_source="spre") 反而会加载 DINO+SPRE。
+        if not self.cfg.spre.enabled and self.reliability_source == "spre":
+            print("[net] spre.enabled=False -> reliability_source 由 'spre' 降级为 'cached'")
+            self.reliability_source = "cached"
+        need_spre = self.reliability_source == "spre"
+        self.feed_fpn = self.dino_mode != "off" and bool(self.cfg.dino.feed_fpn)
+        self.dino_enabled = self.dino_mode != "off" and (self.feed_fpn or need_spre)
+        self.spre_enabled = need_spre
+        if need_spre and self.dino_mode == "off":
+            raise ValueError(
+                "reliability_source='spre' 需要 DINO (SPRE 建在 DinoSVA 的 reference "
+                "stream 上), 但 dino_mode='off'。要纯 FPN 消融请同时设 "
+                "--reliability cached。"
+            )
+        if self.dino_mode != "off" and not self.feed_fpn and not need_spre:
+            raise ValueError(
+                "dino_mode != 'off' 但 feed_fpn=False 且 reliability_source != 'spre' "
+                "—— DINO 会被加载却无人使用。请设 dino_mode='off'。"
+            )
+        if self.dino_enabled:
             from models.spre import SPRE, DinoSVA
             self.dino_sva = DinoSVA(
                 self.cfg.spre, self.cfg.dino, self.cfg.paths.dinov3_weights_file,
                 fpn_channels=fpn_c if self.feed_fpn else None,
             )
-            self.spre = SPRE(self.cfg.spre, self.dino_sva.out_dim)
+            # 只在真的要用时实例化: 多卡 DDP 用 find_unused_parameters=False,
+            # 建了却不 forward 的参数会在 reduction 时报错。
+            self.spre = SPRE(self.cfg.spre, self.dino_sva.out_dim) if self.spre_enabled else None
 
     def _resolve_depth_bounds(self, batch: dict) -> tuple[torch.Tensor, torch.Tensor]:
         if "depth_min" in batch and "depth_max" in batch:
@@ -156,6 +197,7 @@ class UprMVSNet(nn.Module):
         feature_stride: int,
         src_weights: torch.Tensor | None,
         meta: torch.Tensor | None = None,
+        branch_prior=None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         cost = self.cost_builders[stage_idx](
             feats_stage[:, 0],
@@ -170,7 +212,7 @@ class UprMVSNet(nn.Module):
         )
         if meta is not None:
             cost = torch.cat([cost, meta.to(cost.dtype)], dim=1)
-        return self.decoders[stage_idx](cost, depth_hypos)
+        return self.decoders[stage_idx](cost, depth_hypos, branch_prior=branch_prior)
 
     @staticmethod
     def _upsample_hypos(hypos: torch.Tensor, target_hw: tuple[int, int]) -> torch.Tensor:
@@ -204,7 +246,7 @@ class UprMVSNet(nn.Module):
         # DINOv3 + SVA runs before the FPN so its per-view features can be
         # injected at the 1/8 bottleneck and propagate down the top-down path.
         fused = raw_tokens = grid = None
-        if self.spre_enabled:
+        if self.dino_enabled:
             fused, raw_tokens, grid = self.dino_sva(images)   # [B, V, N, dim], [B, V, N, 768]
 
         dino_fpn = (self.dino_sva.fpn_feature(fused, grid, coarse_hw)
@@ -227,6 +269,13 @@ class UprMVSNet(nn.Module):
             spre_logits = self.spre(fused[:, 0], grid, depth_prior,
                                     target_hw=feat1.shape[-2:], consistency=consistency)
             conf_used = torch.sigmoid(spre_logits)
+        elif self.reliability_source == "edge":
+            # 手工门控对照组 (MonoMVSNet 的 edge gate): 可靠度 = 1 - edge
+            spre_logits = None
+            from models.depth_range import edge_map_from_prior
+            _v = torch.isfinite(depth_prior) & (depth_prior > 0)
+            conf_used = (1.0 - edge_map_from_prior(
+                depth_prior, _v, self.range_cfg.edge_grad_rel)).clamp(0.0, 1.0)
         else:
             spre_logits = None
             conf_used = conf_prior
@@ -237,11 +286,22 @@ class UprMVSNet(nn.Module):
             depth_max,
             self.range_cfg,
             target_hw=feat1.shape[-2:],
+            prior_valid=batch.get("prior_valid"),
         )
         global_interval = (s1.global_hi - s1.global_lo) / max(self.range_cfg.num_global - 1, 1)  # [B]
         meta1 = self._stage1_meta(s1, global_interval)
+        # 分支先验用 *可微的* conf_used 构造 —— hypothesis 几何仍在 no_grad 里,
+        # 但 q 必须带梯度, 否则 branch loss 只训练 decoder 抵消常数, 传不回 SPRE。
+        if self.range_cfg.branch_prior:
+            q1 = self._resize_map(conf_used, feat1.shape[-2:])
+            bp = lambda lg: apply_branch_prior(
+                lg, s1.global_idx, s1.local_idx, q1, s1.branch_active,
+                self.range_cfg.branch_q_min)
+        else:
+            q1, bp = None, None
         depth1, sigma1, prob1, logits1, mode_idx1 = self._run_stage(
-            0, feat1, K, E, s1.hypos, s1_stride, src_weights, meta=meta1
+            0, feat1, K, E, s1.hypos, s1_stride, src_weights, meta=meta1,
+            branch_prior=bp,
         )
 
         stage_out = {
@@ -258,6 +318,8 @@ class UprMVSNet(nn.Module):
                 "local_lo": s1.local_lo, "local_hi": s1.local_hi,
                 "prior": s1.prior, "conf": s1.conf, "edge": s1.edge,
                 "global_interval": global_interval,
+                "branch_active": s1.branch_active,
+                "branch_q": q1,
             },
         }
 
@@ -265,9 +327,15 @@ class UprMVSNet(nn.Module):
         # winner's sampling interval decides how much correction room the next
         # stage keeps: local win -> narrow, global win -> wide.
         winner_interval = s1.interval.gather(1, mode_idx1).squeeze(1)
+        # 第二模态: 把 winner 邻域屏蔽后的次峰。stage1 一旦选错, 正确的候选
+        # 即使存在也会被 winner-centered 窗口永久丢弃 (实测 100% 的尾巴都是
+        # 选择失败, 轴上一直有 <20mm 的候选)。
+        second_depth, second_mass = second_mode(
+            prob1, s1.hypos, mode_idx1, self.range_cfg.second_mode_guard)
         prev = {
             "depth": depth1, "prob": prob1, "winner_interval": winner_interval,
             "edge": s1.edge, "hw": feat1.shape[-2:],
+            "second_depth": second_depth, "second_mass": second_mass,
         }
         for k in (1, 2, 3):
             feat_k = feats[strides[k]]
@@ -283,6 +351,11 @@ class UprMVSNet(nn.Module):
                 depth_max=depth_max,
                 stage_idx=k - 1,
             )
+            # stage2 双模态: 一半候选留给次峰, 仅在分支分歧/高熵像素上启用
+            if k == 1 and self.range_cfg.dual_mode_stage2 and prev.get("second_depth") is not None:
+                hypos_k = merge_dual_mode(
+                    hypos_k, prev["second_depth"], prev["second_mass"],
+                    prev["winner_interval"], self.range_cfg)
             hypos_k = self._upsample_hypos(hypos_k, feat_k.shape[-2:])
             depth_k, sigma_k, prob_k, logits_k, mode_idx_k = self._run_stage(
                 k, feat_k, K, E, hypos_k, strides[k], src_weights
@@ -297,7 +370,7 @@ class UprMVSNet(nn.Module):
             interval_k = (hypos_k[:, -1] - hypos_k[:, 0]) / max(self.num_depths[k] - 1, 1)
             prev = {
                 "depth": depth_k, "prob": prob_k, "winner_interval": interval_k,
-                "edge": edge_k, "hw": feat_k.shape[-2:],
+                "edge": edge_k, "hw": feat_k.shape[-2:], "second_depth": None,
             }
 
         depth_last = stage_out[f"stage{len(strides)}"]["depth"]
@@ -310,4 +383,7 @@ class UprMVSNet(nn.Module):
                 "logits": spre_logits, "r": conf_used, "hw": tuple(feat1.shape[-2:]),
             }
 
+        vs = getattr(self.cost_builders[0], "last_vis_stats", None)
+        if vs is not None:
+            stage_out["vis"] = vs
         return {"depth_full": depth_full, **stage_out}

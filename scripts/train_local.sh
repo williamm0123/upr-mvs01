@@ -9,6 +9,9 @@ RUN_NAME=${RUN_NAME:-uprmvs_local}
 
 # RTX 5060 Ti 16GB 的保守默认值。需要时都可以在命令前用环境变量覆盖。
 BATCH_SIZE=${BATCH_SIZE:-1}
+# 3 -> 5: 必须和 prior 缓存的 num_views 一致, 否则缓存签名判定过期会触发
+# 一次 21 小时的重建。UMHPC 脚本是 5, 缓存也按 5 建。
+# 显存实测: batch=1 + 5 视角 + SPRE on -> peak 7.84 GiB, 16GB 卡够用。
 NUM_VIEWS=${NUM_VIEWS:-3}
 NUM_WORKERS=${NUM_WORKERS:-4}
 LEARNING_RATE=${LEARNING_RATE:-1e-4}

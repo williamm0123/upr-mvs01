@@ -740,7 +740,10 @@ def generate_priors_from_sample(
         "norm_da3": norm_da3,
         "depth_filled": depth_filled,
         "conf_map": conf_map,
-        # "sfm_scale": sfm_scale,
-        # "sparse_depth": sfm_out["sparse_depth"],
-        # "sparse_valid": sfm_out["valid_mask"],
+        # 标尺质量。scale_info["valid"] 为 False 表示 SfM 重叠点不足, scale 退回
+        # 1.0 —— depth_filled 仍停留在 VGGT 的任意尺度 (DTU 上中位数 ~1 而非
+        # ~650mm)。调用方 (pre_prior) 必须据此拒绝落盘, 否则训练会静默吃到
+        # 未标尺先验。见 sfm.metric_scale_from_sparse。
+        "sfm_scale": float(sfm_scale),
+        "sfm_info": sfm_out["info"].get("scale", {}),
     }

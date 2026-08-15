@@ -23,6 +23,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import os
+
 import numpy as np
 import torch
 
@@ -30,6 +32,54 @@ from base.config import ProjectPaths
 import models.norm_fill as norm_fill
 # Keys stored in every prior cache file (and expected by the network/loss).
 PRIOR_KEYS = ("depth_prior", "conf_prior", "norm_depth_fill", "src_weights")
+# 标尺质量元数据。旧缓存没有这些键, load_prior 会补默认值 —— 但默认是
+# ``sfm_valid=0``(未知), 这样"没有元数据"和"标尺失败"都会走保守路径。
+META_KEYS = ("sfm_valid", "sfm_scale", "sfm_num_pairs", "pipeline_version",
+             "num_views", "target_w", "target_h", "prior_h", "prior_w")
+PIPELINE_VERSION = 3
+
+
+def cache_signature(prior: dict) -> dict:
+    """从缓存里读出它是"怎么生成的"。
+
+    ``auto`` 模式过去只判断文件是否存在, 于是旧缓存被当成完整的。实测现有
+    train/val 缓存全部是 ``pipeline_version=0`` 且 ``src_weights`` 形状 (2,)
+    —— 它们是用 1 ref + 2 source 生成的, 而现在训练喂 1 ref + 4 source。
+    VGGT 是多视图模型, 视角集变了先验就不是同一个东西; SfM 标尺也因为可
+    三角化的点更少而更容易失败 (这多半就是 8% 未标尺的来源)。
+    """
+    def g(k, d=0.0):
+        v = prior.get(k, d)
+        return float(np.asarray(v).reshape(-1)[0]) if np.size(v) else d
+    return {
+        "pipeline_version": int(g("pipeline_version")),
+        "num_views": int(g("num_views")),
+        "target_w": int(g("target_w")),
+        "target_h": int(g("target_h")),
+    }
+
+
+def cache_is_current(prior: dict, num_views: int, target_wh: tuple[int, int]) -> bool:
+    """缓存是否需要重建。
+
+    **只看 pipeline_version 和 target_wh。**
+
+    ``num_views`` 是*出处*信息, 不是兼容性判据: 缓存的键是 (scan, ref_view,
+    light), 存的是参考视角的一张深度图; 训练时 FPN / cost volume / 位姿全部
+    用 dataloader 的图像现算, ``depth_prior`` 只是被读进来当 stage1 的候选
+    中心。所以"生成先验时用了几个 source"只影响这张先验的*质量*, 不影响它
+    能不能被 V=3 或 V=5 的训练使用。
+
+    (曾经把 num_views 当判据, 那会让本地 3 视角建的缓存在 5 视角的集群上被
+    判定过期, 触发一次毫无必要的 25 小时重建。)
+
+    ``target_wh`` 则是真的判据 —— 它决定 VGGT/DA3 实际跑的分辨率, 也就是
+    先验的真实细节量, ``_match_hw`` 的重采样造不出来。
+    """
+    sig = cache_signature(prior)
+    return (sig["pipeline_version"] >= PIPELINE_VERSION
+            and sig["target_w"] == int(target_wh[0])
+            and sig["target_h"] == int(target_wh[1]))
 
 
 # --------------------------------------------------------------------------- #
@@ -38,7 +88,16 @@ PRIOR_KEYS = ("depth_prior", "conf_prior", "norm_depth_fill", "src_weights")
 def save_prior(path: str | Path, prior: dict) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(path, **{k: np.asarray(prior[k], dtype=np.float32) for k in PRIOR_KEYS})
+    out = {k: np.asarray(prior[k], dtype=np.float32) for k in PRIOR_KEYS}
+    for k in META_KEYS:
+        out[k] = np.asarray(prior.get(k, 0.0), dtype=np.float32)
+    # 临时文件 + os.replace: 中途崩溃不会留下半个 npz 被后续当成有效缓存。
+    # 注意必须传*文件句柄*: np.savez_compressed 收到不以 .npz 结尾的*路径*时
+    # 会自己追加 .npz, 于是 "a.npz.tmp" 变成 "a.npz.tmp.npz", os.replace 找不到。
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "wb") as fh:
+        np.savez_compressed(fh, **out)
+    os.replace(tmp, path)
 
 
 def load_prior(path: str | Path) -> dict:
@@ -49,7 +108,10 @@ def load_prior(path: str | Path) -> dict:
             f"(train.py does this automatically unless --build-priors skip)."
         )
     with np.load(path) as data:
-        return {k: data[k] for k in PRIOR_KEYS}
+        out = {k: data[k] for k in PRIOR_KEYS}
+        for k in META_KEYS:
+            out[k] = data[k] if k in data.files else np.float32(0.0)
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -97,11 +159,21 @@ class PriorPrecomputer:
             vggt_model=self.vggt_model,
             da3_model=self.da3_model,
         )
+        info = priors.get("sfm_info", {}) or {}
         return {
             "depth_prior": np.asarray(priors["depth_filled"], np.float32),
             "conf_prior": np.asarray(priors["conf_map"], np.float32),
             "norm_depth_fill": np.asarray(priors["normal"], np.float32),
             "src_weights": np.asarray(sfm_out["source_weights"], np.float32),
+            "sfm_valid": float(bool(info.get("valid", False))),
+            "sfm_scale": float(priors.get("sfm_scale", 1.0)),
+            "sfm_num_pairs": float(info.get("num_pairs", 0)),
+            "pipeline_version": float(PIPELINE_VERSION),
+            "num_views": float(len(precrop_sample["images"])),
+            "target_w": float(self.image_target_wh[0]),
+            "target_h": float(self.image_target_wh[1]),
+            "prior_h": float(priors["depth_filled"].shape[0]),
+            "prior_w": float(priors["depth_filled"].shape[1]),
         }
 
 
@@ -126,6 +198,7 @@ def build_prior_cache(
     overwrite: bool = False,
     verbose: bool = True,
     image_target_wh: tuple[int, int] = (518, 420),
+    fail_open: bool = False,
 ) -> int:
     """Populate the prior cache for every meta in ``dataset`` (run once, main process).
 
@@ -137,7 +210,39 @@ def build_prior_cache(
     _check_target_wh(image_target_wh)
     n = len(dataset)
     # skip loading the heavy models entirely if everything is already cached
-    pending = [i for i in range(n) if overwrite or not Path(dataset.prior_cache_path_for(i)).exists()]
+    def _stale(i: int) -> bool:
+        f = Path(dataset.prior_cache_path_for(i))
+        if not f.exists():
+            return True
+        try:
+            return not cache_is_current(load_prior(f), dataset.nviews, image_target_wh)
+        except Exception:
+            return True
+
+    pending = [i for i in range(n) if overwrite or _stale(i)]
+    if pending and not overwrite and verbose:
+        print(f"[pre_prior] {len(pending)}/{n} 需要重建 (缺失, 或 pipeline_version/"
+              f"num_views/target_wh 与当前不符)")
+        # 视角数不符是最常见也最贵的误触发: 本地脚本和集群脚本的 NUM_VIEWS
+        # 曾经一个 3 一个 5, 缓存按其中一个建、训练按另一个跑, 就会闷头重建
+        # 24206 个样本 (约 21 小时)。这里大声报出来。
+        mism = {}
+        for i in pending[:200]:
+            f = Path(dataset.prior_cache_path_for(i))
+            if not f.exists():
+                continue
+            try:
+                v = cache_signature(load_prior(f))["num_views"]
+                if v and v != dataset.nviews:
+                    mism[v] = mism.get(v, 0) + 1
+            except Exception:
+                pass
+        if mism:
+            print(f"[pre_prior] 提示: 部分缓存的 num_views={mism}, 当前训练 "
+                  f"nviews={dataset.nviews}。这*不会*触发重建 —— 先验只是参考"
+                  f"视角的一张深度图, 与训练的 source 数无关。视角数只影响先验"
+                  f"质量 (source 越多 SfM 三角化点越多、标尺越容易成功), 跨代"
+                  f"比较实验时需要知道这一点。")
     if not pending:
         if verbose:
             print(f"[pre_prior] cache already complete: {n} priors")
@@ -147,14 +252,37 @@ def build_prior_cache(
         print(f"[pre_prior] building {len(pending)}/{n} priors at target_wh={image_target_wh} "
               f"(loading VGGT + DA3 once) ...")
     precomputer = PriorPrecomputer(device, image_target_wh=image_target_wh)
-    built = 0
+    built = failed = 0
+    quarantine_log = []
     for idx in pending:
         pc = dataset.precrop_inputs(idx)
         prior = precomputer.compute(pc)
-        save_prior(dataset.prior_cache_path_for(idx), prior)
+        dst = Path(dataset.prior_cache_path_for(idx))
+        # fail-closed: 标尺无效时**照样写主缓存**, 但 sfm_valid=0。
+        # 不删文件的三个理由:
+        #   1. 删了 dataloader 会 FileNotFoundError —— 除非同时更新 exclude 表,
+        #      而那是 audit 脚本的事, 两者不同步就炸。
+        #   2. build_prior_cache 的 pending 判据是"文件不存在", 删了会导致每次
+        #      auto 都重跑同一批失败样本 (VGGT+DA3 白算)。
+        #   3. data/dtu.py 读到 sfm_valid=0 会把 prior_valid 置 0, 网络自动退回
+        #      global-only —— 这恰好是"先验失败时 guard 分支兜底"这一主张的
+        #      真实检验, 比把样本删掉更有研究价值。
+        # 同时在 *_quarantine/ 留一份副本供审计。
+        if not (fail_open or prior["sfm_valid"] > 0.5):
+            qdst = dst.parent.parent.with_name(dst.parent.parent.name + "_quarantine") / dst.parent.name / dst.name
+            save_prior(qdst, prior)
+            save_prior(dst, prior)          # sfm_valid=0, 网络会自己绕开
+            quarantine_log.append((str(dst.relative_to(dst.parent.parent)),
+                                   int(prior["sfm_num_pairs"])))
+            failed += 1
+            continue
+        save_prior(dst, prior)
         built += 1
-        if verbose and built % 20 == 0:
-            print(f"[pre_prior]   {built}/{len(pending)} done")
+        if verbose and (built + failed) % 20 == 0:
+            print(f"[pre_prior]   {built + failed}/{len(pending)} done ({failed} quarantined)")
     if verbose:
-        print(f"[pre_prior] cache ready: {built} newly built, {n} total")
+        print(f"[pre_prior] cache ready: {built} newly built, {failed} 标尺无效 "
+              f"(已写主缓存但 sfm_valid=0, 副本在 *_quarantine/), {n} total")
+        for name, npairs in quarantine_log[:10]:
+            print(f"[pre_prior]   quarantined {name}  num_pairs={npairs}")
     return built

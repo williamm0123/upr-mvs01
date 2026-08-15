@@ -124,6 +124,37 @@ class MVSLoss:
         l_ce16 = soft_label_cross_entropy(logits16, hypos16, gt1, sup16) if cfg.use_cross_entropy \
             else logits.new_zeros(())
 
+        # --- 分支校准 (branch calibration) ---
+        # 目标不是 "GT 是否落在 local 跨度内", 而是 "哪个分支的最优候选更接近
+        # GT"。共位测试显示 local 获胜的像素里只有 8.5% 的 GT 真在 local 跨度
+        # 内 —— 用 in-span 当标签会让分支判定学到一个偏得很厉害的目标。
+        #
+        # 直接监督 q (= conf_used, 来自 SPRE 且可微), 不是监督 decoder 的 logits:
+        # 分支先验是乘在 logits 上的常数, 只训 decoder 等于让它去抵消这个常数,
+        # 梯度传不回 SPRE。
+        with torch.no_grad():
+            d48 = (hypos.gather(1, s1["global_idx"]) - gt1.unsqueeze(1)).abs().amin(1)
+            d16 = (hypos.gather(1, s1["local_idx"]) - gt1.unsqueeze(1)).abs().amin(1)
+            gi_t = s1["global_interval"].view(B, 1, 1).clamp_min(1e-4)
+            # 软标签: 两个分支 oracle 误差接近时不应该给 0/1 硬标签
+            branch_tgt = torch.sigmoid((d48 - d16) / (cfg.branch_tau_gi * gi_t))
+            # 只监督差距明显的像素, 且 local 分支必须真的携带先验候选
+            margin = (d48 - d16).abs() > cfg.branch_margin_gi * gi_t
+        q = s1.get("branch_q")
+        m_br = valid1 & margin & s1["branch_active"]
+        if q is not None and m_br.any():
+            # 手写 BCE 而不是 F.binary_cross_entropy: 后者在 autocast 下被禁用,
+            # 而 q 已经过了 sigmoid (来源可能是 SPRE / cached conf / edge), 拿不到
+            # 统一的 pre-sigmoid logits。在 float32 里算, 数值上也更稳。
+            qc = q.float().clamp(1e-4, 1.0 - 1e-4)
+            t = branch_tgt.float()
+            bce = -(t * qc.log() + (1.0 - t) * (1.0 - qc).log())
+            l_branch = bce[m_br].mean()
+            branch_pred = qc
+        else:
+            l_branch = logits.new_zeros(())
+            branch_pred = torch.zeros_like(branch_tgt)
+
         gi1 = s1["global_interval"].view(B, 1, 1).expand_as(gt1)
         l_reg1 = normalized_huber_loss(s1["depth"], gt1, valid1, gi1, weight=w_edge1)
 
@@ -131,15 +162,46 @@ class MVSLoss:
             cfg.w_ce * l_ce64
             + cfg.w_global_aux * l_ce48
             + cfg.w_local_aux * l_ce16
+            + cfg.w_branch * l_branch
             + cfg.w_reg * l_reg1
         )
 
         # stage-1 diagnostics
         with torch.no_grad():
             winner_local = s1["is_local"].gather(1, s1["mode_idx"]).squeeze(1)
+            if isinstance(outputs.get("vis"), dict):
+                for k, v in outputs["vis"].items():
+                    logs[f"vis/{k}"] = float(v)
             logs["stage1/ce"] = float(l_ce64.detach())
             logs["stage1/ce_global_aux"] = float(l_ce48.detach())
             logs["stage1/ce_local_aux"] = float(l_ce16.detach())
+            logs["stage1/branch_ce"] = float(l_branch.detach())
+            logs["stage1/branch_active_frac"] = float(s1["branch_active"][valid1].float().mean()) if valid1.any() else 0.0
+            logs["stage1/branch_sup_frac"] = float(m_br[valid1].float().mean()) if valid1.any() else 0.0
+            # 条件关门率 —— 全图的 branch_active_frac 说明不了门关得对不对。
+            # 要看的是: 在 local 分支确实更差的地方, 门有没有关。
+            gate_off = (~s1["branch_active"]) & valid1
+            lb = (branch_tgt > 0.5) & valid1        # local 分支 oracle 更好
+            gb = (branch_tgt <= 0.5) & valid1       # global 分支更好 -> 该关门
+            if gb.any():
+                logs["stage1/gate_off_given_global_better"] = float(gate_off[gb].float().mean())
+            if lb.any():
+                logs["stage1/gate_off_given_local_better"] = float(gate_off[lb].float().mean())
+            if "prior_corrupt_mask" in batch:
+                cm1 = self._to_stage_res(
+                    batch["prior_corrupt_mask"].to(gt1.device).float(), gt1.shape[-2:]) > 0.5
+                if (cm1 & valid1).any():
+                    logs["stage1/gate_off_given_corrupted"] = float(gate_off[cm1 & valid1].float().mean())
+            # 两分支 oracle 误差差距的分位数 -> 用来定 branch_margin_gi,
+            # 而不是拍一个 0.5 然后发现只监督了 11% 的像素
+            dd = ((d48 - d16).abs() / gi_t)[valid1]
+            if dd.numel():
+                for q_, nm in ((0.25, "p25"), (0.50, "p50"), (0.75, "p75")):
+                    logs[f"stage1/branch_gap_{nm}"] = float(dd.float().quantile(q_))
+            if m_br.any():
+                logs["stage1/branch_local_better"] = float((branch_tgt[m_br] > 0.5).float().mean())
+                logs["stage1/branch_acc"] = float(
+                    ((branch_pred[m_br] > 0.5) == (branch_tgt[m_br] > 0.5)).float().mean())
             logs["stage1/reg"] = float(l_reg1.detach())
             logs["stage1/in_range"] = float(g_in_range[valid1].float().mean()) if valid1.any() else 1.0
             logs["stage1/global_in_range"] = logs["stage1/in_range"]
@@ -269,7 +331,20 @@ class MVSLoss:
         target = 1.0 - cm
         m_bce = prior_valid.float()
         bce = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
-        l_bce = (bce * m_bce).sum() / m_bce.sum().clamp_min(1.0)
+        # 类别平衡: 腐蚀只覆盖一小部分像素, 按全体平均的话大多数目标都是 1,
+        # 网络只要普遍输出高 q 就能拿到低损失 —— 实测 r_clean=0.753 vs
+        # r_corrupt=0.708, 只差 0.045, 而腐蚀是合成的、本该很好分。
+        #   L = 1/2 mean_clean(l) + 1/2 mean_corrupt(l)
+        if self.cfg.spre_balance_corrupt:
+            w_c = (m_bce * cm)
+            w_k = (m_bce * (1.0 - cm))
+            n_c, n_k = w_c.sum(), w_k.sum()
+            if n_c > 0 and n_k > 0:
+                l_bce = 0.5 * (bce * w_c).sum() / n_c + 0.5 * (bce * w_k).sum() / n_k
+            else:
+                l_bce = (bce * m_bce).sum() / m_bce.sum().clamp_min(1.0)
+        else:
+            l_bce = (bce * m_bce).sum() / m_bce.sum().clamp_min(1.0)
 
         # (2) prior-error soft target
         tau = float(self.cfg.spre_soft_tau_mm)
@@ -279,6 +354,14 @@ class MVSLoss:
 
         with torch.no_grad():
             logs["spre/bce"] = float(l_bce.detach())
+            # 腐蚀像素比例 —— 不记这个就无法判断类别不平衡有多严重
+            logs["spre/corrupt_frac"] = float((cm * m_bce).sum() / m_bce.sum().clamp_min(1.0))
+            # q 的分位数: 决定 gate_hard_conf 该定在哪, 比拍一个 0.45 靠谱
+            rv = r[prior_valid]
+            if rv.numel():
+                for q_, nm in ((0.01, "p01"), (0.05, "p05"), (0.10, "p10"),
+                               (0.25, "p25"), (0.50, "p50"), (0.90, "p90")):
+                    logs[f"spre/q_{nm}"] = float(rv.float().quantile(q_))
             logs["spre/soft"] = float(l_soft.detach())
             corrupt = (cm > 0.5) & prior_valid
             clean = (cm <= 0.5) & prior_valid

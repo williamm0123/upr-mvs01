@@ -146,12 +146,32 @@ class FPNConfig:
 @dataclass(frozen=True)
 class DepthRangeConfig:
 
-    num_global: int = 32
-    num_local: int = 16
+    # 32/16 -> 40/8: 共位测试 (experiments/out/coloc_val_*.log) 显示 stage1 尾巴上
+    # global 分支 100% 含 <20mm 候选、81% 含 <8mm, 而 local 分支只有 47.8%/37.9%。
+    # 把预算从命中率低的分支挪走。总数仍须 == num_depths_stage1。
+    num_global: int = 40
+    num_local: int = 8
     global_quantile_lo: float = 0.002
     global_quantile_hi: float = 0.998
     global_margin_ratio: float = 0.12
     global_min_span_frac: float = 1.0
+    # --- local 分支门控 (P2) ---
+    gate_local_branch: bool = True   # conf < gate_hard_conf -> 整条 local 分支退化为 guard 网格
+    gate_hard_conf: float = 0.25
+    branch_prior: bool = True        # stage1 logits 加 log q / log(1-q)
+    branch_q_min: float = 0.02       # q 的下限, 防 log(0)
+    # --- stage2 双模态 (P4) ---
+    # 默认关闭。当前实现把 winner-centered 轴的"低深度一半"当成 winner 侧
+    # (winner 在轴中心, 所以上半边全丢), 而且拼出来的是非均匀轴, 而 stage2 的
+    # 3D UNet / interval loss / 下一级 range 都假设均匀。正式实现应该建两个
+    # 独立的均匀 8-bin cost volume 共享 regularizer, 而不是拼一条轴。
+    # 启用前先统计最终尾巴上正确候选的 posterior rank —— 只有它通常是 rank 2
+    # 时 top-2 才真的有用。
+    dual_mode_stage2: bool = False
+    second_mode_guard: float = 2.0   # 屏蔽 winner ± guard 个 bin 后再找次峰
+    # 注意: second_mode 返回的是 winner 邻域*之外*的总质量, 不是次峰本身的质量,
+    # 平坦分布也容易超过这个阈值。真正实现时应改成次峰邻域质量。
+    dual_mode_min_mass: float = 0.10
     inverse_depth_global: bool = True
     spike_k: float = 4.0
     spike_min_mad_rel: float = 0.002  # MAD floor as a fraction of local depth
@@ -214,7 +234,14 @@ class CostVolumeConfig:
     warp_channels_stage3: int = 32
     warp_channels_stage4: int = 16
     warp_use_half: bool = True
+    # 保持关闭。缓存里的 src_weights 长度 = 建缓存时的 src 视角数, 与当前
+    # nviews 不一致 (实测缓存 S=2, 现在需要 S=4), 而且那批权重本身就是按旧
+    # 视角集算的, 形状对得上也是错的。逐像素可见性头 (下一行) 完全取代它,
+    # 且不依赖任何缓存。要重新启用必须先重建 prior cache。
     use_src_weights: bool = False
+    # per-(source, pixel) 可见性权重: stage1 尾巴里 58.9% 是 global 赢了但选错
+    # 平面, 而聚合原本是所有 source 等权平均, 表达不了局部遮挡。
+    visibility_weighting: bool = True
 
 
 @dataclass(frozen=True)
@@ -242,6 +269,8 @@ class DINOConfig:
     is the patch-aligned resize for the ref image before the ViT.
 
     """
+    # off / all_view / ref_only —— 与 SPRE reliability 解耦的独立开关
+    mode: str = "all_view"
     mean: tuple[float, float, float] = (0.485, 0.456, 0.406)
     std: tuple[float, float, float] = (0.229, 0.224, 0.225)
     patch_size: int = 16
@@ -259,6 +288,8 @@ class SPREConfig:
 
 
     """
+    # cached / edge / spre —— prior 可靠度从哪来, 独立于 DINO matching
+    reliability_source: str = "spre"
     enabled: bool = False
     proj_dim: int = 64            # fused tokens -> proj_dim, concatenated with the 4 stats
     hidden: int = 64
@@ -281,6 +312,13 @@ class LossConfig:
     edge_reg_boost: float = 2.0
     use_cross_entropy: bool = True
     # SPRE supervision (only active when the network emits a 'spre' output)
+    # 分支校准: 监督"哪个分支的 oracle 候选更接近 GT", 而不是 GT 是否在
+    # local 跨度内。见 losses/composite.py 的推导。
+    w_branch: float = 0.5
+    branch_tau_gi: float = 0.5    # 软标签温度, 单位是 global_interval
+    branch_margin_gi: float = 0.5 # 两分支 oracle 误差差距小于它就不监督
+    # corruption BCE 按 clean/corrupt 两类平衡平均, 而不是按全体像素平均
+    spre_balance_corrupt: bool = True
     w_spre: float = 0.5           # corruption-BCE weight (corrupted prior -> 0, clean -> 1)
     w_spre_soft: float = 0.5      # prior-error soft-target weight
     spre_soft_tau_mm: float = 10.8 # exp(-(|prior-gt|/tau)^2) scale, in the depth unit (mm)
@@ -288,7 +326,9 @@ class LossConfig:
 
 @dataclass(frozen=True)
 class StageWeights:
-    stage1: float = 0.5
+    # 0.5 -> 1.5: 100% 的最终尾巴都源自 stage1 的选择失败, 而候选放置是
+    # detach 的 (depth_range.py:328), 后续 stage 的 loss 传不回来纠正它。
+    stage1: float = 1.5
     stage2: float = 1.0
     stage3: float = 1.5
     stage4: float = 2.0
@@ -425,3 +465,28 @@ def build_mvs_config(profile: str | None = None) -> MVSConfig:
     if profile is not None and profile != cfg.train.profile:
         cfg = MVSConfig(train=get_train_config(profile))
     return cfg
+
+
+def resolve_split(list_file, name: str, use_clean: bool = True) -> tuple[str, str | None]:
+    """把 ``lists/dtu/<name>.txt`` 解析成 (实际列表, 排除表)。
+
+    审计 (scripts/audit_prior_cache.py) 发现 8.05% 的 prior 缓存未完成标尺校准。
+    重灾区整 scan 由 ``<name>_clean.txt`` 剔除, 幸存 scan 里的零散坏样本由
+    ``exclude_<name>.csv`` 逐 (scan, view, light) 剔除。两个文件都是可选的,
+    不存在就原样返回。
+
+    ``cfg.paths.*_list_file`` 故意保持指向原始列表 —— 切换发生在这里, 所以
+    "跑的是哪个列表" 是一个可以在日志里看到的运行期决定, 而不是藏在配置里。
+    所有入口 (train / test / 诊断脚本) 都该走这个函数, 否则训练和评测会悄悄
+    跑在不同的 scan 集合上。
+    """
+    p = Path(list_file)
+    if not use_clean:
+        return str(p), None
+    clean = p.with_name(f"{name}_clean.txt")
+    excl = p.with_name(f"exclude_{name}.csv")
+    lf = str(clean) if clean.exists() else str(p)
+    ef = str(excl) if excl.exists() else None
+    if lf != str(p) or ef:
+        print(f"[data] {name}: list={Path(lf).name} exclude={Path(ef).name if ef else '-'}")
+    return lf, ef
