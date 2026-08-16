@@ -7,7 +7,7 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=64G
 #SBATCH --qos=long
-#SBATCH --time=3-00:00:00
+#SBATCH --time=1-23:00:00
 #SBATCH --chdir=/scr/user/qinglong/projects/upr-mvs01
 #SBATCH --output=slurm-%x-%j.out
 #SBATCH --error=slurm-%x-%j.err
