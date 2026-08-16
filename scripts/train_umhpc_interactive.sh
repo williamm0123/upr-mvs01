@@ -24,9 +24,15 @@ STEPS=${STEPS:-0}                       # 0 = 使用 umhpc profile 默认训练�
 DINO_MODE=${DINO_MODE:-all_view}        # off / all_view / ref_only
 FEED_FPN=${FEED_FPN:-on}                # on / off
 RELIABILITY=${RELIABILITY:-spre}        # cached / edge / spre
-CLEAN_LISTS=${CLEAN_LISTS:-on}
+# 2026-08-16: prior 缓存已全部标尺 (29302 个, 未标尺 0, 尺度离群 0),
+# *_clean.txt / exclude_*.csv 是当初为了绕开 8.35% 未标尺样本做的剔除表,
+# 现在留着只会白少 10 个 train scan (79->69) 和 294 个样本。除非要复现旧
+# 实验, 否则保持 off。
+CLEAN_LISTS=${CLEAN_LISTS:-off}
 
 RESUME=${RESUME:-off}                   # auto = 从 log/model/latest.pth 续训
+# 缓存已完整; auto 只是核验一遍 (models/pre_prior.py 提速后约 5 秒,
+# 若集群上还是旧版会读满 98GB/9 分钟, 那就用 skip)。
 BUILD_PRIORS=${BUILD_PRIORS:-auto}       # auto / force / skip / only
 SMOKE=${SMOKE:-0}
 SMOKE_STEPS=${SMOKE_STEPS:-2}

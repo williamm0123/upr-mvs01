@@ -35,7 +35,17 @@ PRIOR_KEYS = ("depth_prior", "conf_prior", "norm_depth_fill", "src_weights")
 # 标尺质量元数据。旧缓存没有这些键, load_prior 会补默认值 —— 但默认是
 # ``sfm_valid=0``(未知), 这样"没有元数据"和"标尺失败"都会走保守路径。
 META_KEYS = ("sfm_valid", "sfm_scale", "sfm_num_pairs", "pipeline_version",
-             "num_views", "target_w", "target_h", "prior_h", "prior_w")
+             "num_views", "target_w", "target_h", "prior_h", "prior_w",
+             # 尺度的来源, 由 scripts/build_prior_cache_all.py 的回退链写入:
+             #   0 = 本样本自己的 SfM (默认, 旧缓存读到的也是 0)
+             #   1 = 同视角换了光照重跑 SfM (几何没变, 稀疏点更多; 尺度仍是精确的
+             #       —— 它是拿*本样本自己的*稠密深度和那批稀疏点求的比值中位数)
+             #   2 = 借了同 scan 相邻视角的尺度 (近似, 实测邻视角之间差 ~5%)
+             # scale_light / scale_ref_view 记下尺度是从哪个光照/视角来的。
+             # 只在 source>0 时有意义。**不 bump PIPELINE_VERSION**: 这几个键是
+             # 增量的, 旧缓存缺了按 0.0 读 = "自有尺度", 语义正确; bump 会让全部
+             # 28k 个缓存被判过期, 触发一次没必要的整轮重建。
+             "scale_source", "scale_light", "scale_ref_view")
 PIPELINE_VERSION = 3
 
 

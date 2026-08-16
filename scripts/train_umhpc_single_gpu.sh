@@ -37,7 +37,11 @@ STEPS=${STEPS:-0}                 # 0=使用 profile 默认值；测试可设 2
 DINO_MODE=${DINO_MODE:-all_view}  # off / all_view / ref_only (ref_only 尚未实现时会明确报错)
 FEED_FPN=${FEED_FPN:-on}          # on / off
 RELIABILITY=${RELIABILITY:-spre}  # cached / edge / spre
-CLEAN_LISTS=${CLEAN_LISTS:-on}    # on = 使用 *_clean.txt + exclude_*.csv
+# 2026-08-16: prior 缓存已全部标尺 (29302 个, 未标尺 0, 尺度离群 0),
+# *_clean.txt / exclude_*.csv 是当初为了绕开 8.35% 未标尺样本做的剔除表,
+# 现在留着只会白少 10 个 train scan (79->69) 和 294 个样本。除非要复现旧
+# 实验, 否则保持 off。
+CLEAN_LISTS=${CLEAN_LISTS:-off}
 
 # RESUME: auto=从 log/model/latest.pth 续跑（SLURM 重排队要靠它）；off=从头开始。
 # ！！4 级级联重构之后（3 级 -> 4 级、假设数 48-16-8-4、DINO 进 FPN），旧
@@ -46,6 +50,8 @@ CLEAN_LISTS=${CLEAN_LISTS:-on}    # on = 使用 *_clean.txt + exclude_*.csv
 RESUME=${RESUME:-off}
 
 # 先验与跑通测试
+# 缓存已完整; auto 只是核验一遍 (models/pre_prior.py 提速后约 5 秒,
+# 若集群上还是旧版会读满 98GB/9 分钟, 那就用 skip)。
 BUILD_PRIORS=${BUILD_PRIORS:-auto}
 # BUILD_PRIORS: auto=补齐缺失先验，force=全部重算，skip=要求缓存已存在，
 #               only=只构建先验然后退出（换 val 列表后先跑一次这个）
