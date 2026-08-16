@@ -543,7 +543,7 @@ def main_worker(
         lr=cfg.train.lr, weight_decay=cfg.train.weight_decay,
     )
     use_amp = cfg.train.amp and device.type == "cuda"
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    scaler = torch.amp.GradScaler(device.type, enabled=use_amp)
 
     run_name = args.name + ("_smoke" if args.smoke else "")
     logger = TrainLogger(run_name, enabled=is_main, cfg=cfg)

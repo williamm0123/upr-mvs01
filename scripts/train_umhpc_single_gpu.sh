@@ -19,12 +19,11 @@ set -e
 source ~/.bashrc
 conda activate uprmvs
 
-export PYTHONPATH="$PWD:$PWD/models:$PWD/models/Depth-Anything-3/src"
-
-exec python train.py \
+exec python -u train.py \
     --profile umhpc \
     --gpus 1 \
     --ddp off \
+    --num-workers 16 \
     --spre on \
     --no-clean-lists \
     --resume off

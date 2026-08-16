@@ -29,7 +29,6 @@ import numpy as np
 import torch
 
 from base.config import ProjectPaths
-import models.norm_fill as norm_fill
 # Keys stored in every prior cache file (and expected by the network/loss).
 PRIOR_KEYS = ("depth_prior", "conf_prior", "norm_depth_fill", "src_weights")
 # 标尺质量元数据。旧缓存没有这些键, load_prior 会补默认值 —— 但默认是
@@ -167,6 +166,13 @@ class PriorPrecomputer:
         image_target_wh: tuple[int, int] = (518, 420),
     ) -> None:
 
+
+        # 懒加载: models.norm_fill 顶层 import 了 vggt 和 depth_anything_3, 放在模块
+        # 顶层会让**训练进程**也把这两个栈拖进来 (train.py -> data.dtu -> pre_prior),
+        # 于是启动脚本必须替它们设 PYTHONPATH。训练只读缓存, 从不现算先验 —— 只有
+        # 真要建缓存时才会走到这里。放在这里, 顶层就回到了 docstring 声称的
+        # "import-light (numpy only)"。
+        import models.norm_fill as norm_fill
 
         self._nf = norm_fill
         self.device = device if isinstance(device, torch.device) else torch.device(device)

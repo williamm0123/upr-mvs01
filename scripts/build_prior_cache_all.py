@@ -88,7 +88,13 @@ from pathlib import Path
 import numpy as np
 import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+_ROOT = Path(__file__).resolve().parent.parent
+# 建先验要 import vggt (models/ 下的顶层包) 和 depth_anything_3, 自己把路径补上,
+# 调用方就不用设 PYTHONPATH 了 —— 训练脚本因此可以完全不碰环境变量 (训练侧
+# models/pre_prior.py 已改成懒加载, 根本不 import 这两个栈)。
+for _p in (_ROOT, _ROOT / "models", _ROOT / "models" / "Depth-Anything-3" / "src"):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
 
 import models.sfm as S
 from base.config import ProjectPaths, build_mvs_config
