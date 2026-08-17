@@ -28,6 +28,11 @@ env/
 .agents/
 
 
+# Slurm 作业产物 —— 它们跟代码无关, 不该让工作树变脏
+slurm-*.out
+slurm-*.err
+/logs/
+
 # Training runs, generated caches, and evaluation outputs
 /log/
 /outputs/
