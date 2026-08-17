@@ -29,9 +29,9 @@ to direct ``python`` launches and turns DDP on iff the selected GPU count > 1.
 Artifacts (under <project>/log/):
     log/prior_cache/   precomputed {depth_prior, conf_prior, norm_depth_fill, src_weights}
     log/tensorboard/   TensorBoard event files (loss / lr / depth metrics / images)
-    log/model/         latest.pth (every ckpt/val interval) and best.pth (best val abs_err)
+    log/experiments/<run>/model/       latest.pth + best.pth (每个 arm 独立)
 
-Resume: ``--resume auto`` (default) continues from log/model/latest.pth when it
+Resume: ``--resume auto`` (default) continues from log/experiments/<run>/model/latest.pth when it
 exists (model + optimizer + step + best metric), so a walltime-killed job can
 simply be resubmitted. Pass ``--resume off`` to start fresh.
 
@@ -58,6 +58,7 @@ from datetime import datetime
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -267,6 +268,12 @@ class WindowedMeter:
         return metrics, avg_logs
 
 
+def run_paths(run_name: str) -> dict:
+    """``log/experiments/<run_name>/{model,tensorboard}`` —— 每个消融 arm 一套。"""
+    root = ProjectPaths().project_path / "log" / "experiments" / run_name
+    return {"root": root, "model": root / "model", "tensorboard": root / "tensorboard"}
+
+
 class TrainLogger:
     """TensorBoard scalars/images (MVSFormer++-style) + latest/best checkpoints.
 
@@ -288,13 +295,13 @@ class TrainLogger:
         self.cfg = cfg          # 存进 checkpoint, 见 save()
         if not enabled:
             return
-        log_root = ProjectPaths().project_path / "log"
-        self.model_dir = log_root / "model"
+        # 每个 run 一套目录。以前所有实验共用 log/model/latest.pth, 并行提交
+        # 多个 arm 会互相覆盖 checkpoint, --resume auto 还可能捡到别的 arm 的权重。
+        self.model_dir = run_paths(run_name)["model"]
         self.model_dir.mkdir(parents=True, exist_ok=True)
-        # Timestamp the run subdir so repeated runs with the same --name land in
-        # distinct TensorBoard directories instead of piling onto one another.
-        run_dir = f"{run_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        tb_dir = log_root / "tensorboard" / run_dir
+        # tensorboard 再按启动时间分子目录: 同一个 run 被 slurm 重排队后新开一份
+        # 事件文件, 但 model 目录不变, 所以 resume 仍能接上。
+        tb_dir = run_paths(run_name)["tensorboard"] / datetime.now().strftime('%Y%m%d_%H%M%S')
         self.tb = SummaryWriter(str(tb_dir)) if SummaryWriter else None
         if self.tb is not None:
             print(f"[tensorboard] logging to {tb_dir}")
@@ -461,6 +468,42 @@ def main_worker(
     if train_overrides:
         cfg = replace(cfg, train=replace(cfg.train, **train_overrides))
 
+    if args.seed is not None:
+        train_overrides["seed"] = args.seed
+        cfg = replace(cfg, train=replace(cfg.train, seed=args.seed))
+
+    # --- 消融开关 -> 配置 ---
+    dr_over = {}
+    if args.num_global is not None:
+        dr_over["num_global"] = args.num_global
+    if args.num_local is not None:
+        dr_over["num_local"] = args.num_local
+    if args.gate_local is not None:
+        dr_over["gate_local_branch"] = args.gate_local == "on"
+    if args.branch_prior is not None:
+        dr_over["branch_prior"] = args.branch_prior == "on"
+    if dr_over:
+        cfg = replace(cfg, depth_range=replace(cfg.depth_range, **dr_over))
+    # num_depths_stage1 必须恒等于 num_global + num_local (network.py 会断言),
+    # 所以它跟着分支预算走, 不单独暴露成开关。
+    nd1 = cfg.depth_range.num_global + cfg.depth_range.num_local
+    cv_over = {}
+    if nd1 != cfg.cost_volume.num_depths_stage1:
+        cv_over["num_depths_stage1"] = nd1
+    if args.visibility is not None:
+        cv_over["visibility_weighting"] = args.visibility == "on"
+    if cv_over:
+        cfg = replace(cfg, cost_volume=replace(cfg.cost_volume, **cv_over))
+    if args.stage1_weight is not None:
+        cfg = replace(cfg, stage_weights=replace(cfg.stage_weights, stage1=args.stage1_weight))
+    loss_over = {}
+    if args.w_branch is not None:
+        loss_over["w_branch"] = args.w_branch
+    if args.spre_balance_corrupt is not None:
+        loss_over["spre_balance_corrupt"] = args.spre_balance_corrupt == "on"
+    if loss_over:
+        cfg = replace(cfg, loss=replace(cfg.loss, **loss_over))
+
     prior_overrides = {}
     if args.prior_target_w is not None:
         prior_overrides["target_w"] = args.prior_target_w
@@ -519,7 +562,23 @@ def main_worker(
     else:
         device = torch.device("cpu")
 
-    torch.manual_seed(cfg.train.seed + rank)
+    _seed_everything(cfg.train.seed, rank, deterministic=args.deterministic)
+
+    # 代码版本闸门: slurm 只保存 sbatch 脚本文本, 不保存 python 项目快照。排队
+    # 期间主工作树被改过, 任务启动时读到的就是新代码 —— 提交时记下 SHA, 这里
+    # 不符就退出, 免得跑出一份不知道对应哪版代码的结果。
+    if args.expect_sha:
+        _g = _git_state()
+        cur = _g.get("commit", "")
+        if not cur.startswith(args.expect_sha) and not args.expect_sha.startswith(cur[:len(args.expect_sha)]):
+            raise SystemExit(
+                f"git SHA mismatch: expected {args.expect_sha}, running {cur[:12]}. "
+                f"用 git worktree 给实验单独开一份代码, 或重新提交任务。"
+            )
+        if _g.get("dirty"):
+            raise SystemExit("工作树 dirty —— 实验必须跑在干净 commit 上")
+        if is_main:
+            print(f"[git] verified {cur[:12]} clean")
 
     # Build the prior cache once (rank 0), before the training model is on GPU so
     # VGGT/DA3 are freed first. DDP jobs are required to use the prebuilt cache.
@@ -554,7 +613,7 @@ def main_worker(
     # needs restoring.
     start_step = 0
     if not args.smoke and args.resume == "auto":
-        ckpt_path = ProjectPaths().project_path / "log" / "model" / "latest.pth"
+        ckpt_path = run_paths(run_name)["model"] / "latest.pth"
         if ckpt_path.exists():
             ckpt = torch.load(ckpt_path, map_location=device)
             try:
@@ -628,6 +687,15 @@ def _run_smoke(model, loss_fn, optimizer, scaler, cfg, device, args, logger, is_
 
 
 @torch.no_grad()
+def _fmt_val(m: dict) -> str:
+    """主指标一行, 深度分桶的 abs_err 再跟一行 —— 全部打出来是 28 个键, slurm
+    日志会被淹掉, 而分桶数据在 tensorboard 里都有。"""
+    main = " ".join(f"{k}={m[k]:.4f}" for k in
+                    ("abs_err", "acc_2mm", "acc_8mm", "tail_frac_8mm") if k in m)
+    q = " ".join(f"q{b}={m[f'q{b}_abs_err']:.3f}" for b in range(4) if f"q{b}_abs_err" in m)
+    return main + (f" | depth-buckets {q}" if q else "")
+
+
 def _run_validation(model, loader, device, use_amp, is_ddp) -> dict[str, float]:
     """Masked depth metrics over the val split.
 
@@ -638,10 +706,19 @@ def _run_validation(model, loader, device, use_amp, is_ddp) -> dict[str, float]:
     # [abs_err_sum, pixel_count, hits<2mm, hits<4mm, hits<8mm,
     #  body2_err_sum, body4_err_sum, body8_err_sum]  (see WindowedMeter for why)
     stats = torch.zeros(8, device=device, dtype=torch.float64)
+    # 按归一化场景深度 (gt - dmin)/(dmax - dmin) 分 4 桶。
+    # 逆深度采样、d^2 的三角测量分辨率、先验误差随深度的分布 —— 这些争论都只能
+    # 靠"误差是否集中在远端"来定。整体 abs_err 把它平均掉了。
+    #   bq: [err_sum, n, hit<2mm, err>=8mm]           每桶
+    #   sq: [in_range_sum, n]                          每桶 x stage(2,3,4)
+    bq = torch.zeros(4, 4, device=device, dtype=torch.float64)
+    sq = torch.zeros(4, 3, 2, device=device, dtype=torch.float64)
+    # model.eval() 不关梯度: 没有 no_grad 的话每个 batch 的激活都被 stats 里的
+    # 累加项通过计算图引用着, 整个 val 集 (882 样本) 的图会一直挂到循环结束。
     for batch in loader:
         batch = {k: (v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v)
                  for k, v in batch.items()}
-        with torch.autocast(device_type=device.type, enabled=use_amp):
+        with torch.no_grad(), torch.autocast(device_type=device.type, enabled=use_amp):
             outputs = model(batch)
         pred = outputs["depth_full"].float()
         gt = batch["depth_gt"].float()
@@ -657,8 +734,39 @@ def _run_validation(model, loader, device, use_amp, is_ddp) -> dict[str, float]:
                 hit = err < t
                 stats[2 + i] += hit.sum()
                 stats[5 + i] += err[hit].sum()
+        if m.any() and "depth_values" in batch:
+            lo = dv.amin(dim=1).view(-1, 1, 1)
+            hi = dv.amax(dim=1).view(-1, 1, 1)
+            t01 = ((gt - lo) / (hi - lo).clamp(min=1e-6)).clamp(0.0, 1.0)
+            bidx = (t01 * 4.0).long().clamp(0, 3)
+            for b in range(4):
+                mb = m & (bidx == b)
+                if not mb.any():
+                    continue
+                eb = (pred[mb] - gt[mb]).abs()
+                bq[b, 0] += eb.sum()
+                bq[b, 1] += mb.sum()
+                bq[b, 2] += (eb < 2.0).sum()
+                bq[b, 3] += (eb >= 8.0).sum()
+            for si, nm in enumerate(("stage2", "stage3", "stage4")):
+                st = outputs.get(nm)
+                if not isinstance(st, dict) or "depth_hypos" not in st:
+                    continue
+                hy = st["depth_hypos"].float()
+                hw = tuple(hy.shape[-2:])
+                g_ = F.interpolate(gt.unsqueeze(1), size=hw, mode="nearest").squeeze(1)
+                m_ = F.interpolate(m.float().unsqueeze(1), size=hw, mode="nearest").squeeze(1) > 0.5
+                b_ = F.interpolate(bidx.float().unsqueeze(1), size=hw, mode="nearest").squeeze(1).long()
+                ir = (g_ >= hy[:, 0]) & (g_ <= hy[:, -1])
+                for b in range(4):
+                    mb = m_ & (b_ == b)
+                    if mb.any():
+                        sq[b, si, 0] += ir[mb].sum()
+                        sq[b, si, 1] += mb.sum()
     if is_ddp:
         dist.all_reduce(stats)
+        dist.all_reduce(bq)
+        dist.all_reduce(sq)
     model.train()
     if stats[1].item() == 0:
         raise RuntimeError(
@@ -666,7 +774,21 @@ def _run_validation(model, loader, device, use_amp, is_ddp) -> dict[str, float]:
             "misconfigured (empty list, missing GT, or all-zero masks)"
         )
     n = stats[1]
+    extra = {}
+    for b in range(4):
+        nb = bq[b, 1]
+        if nb <= 0:
+            continue
+        extra[f"q{b}_abs_err"] = float(bq[b, 0] / nb)
+        extra[f"q{b}_acc_2mm"] = float(bq[b, 2] / nb)
+        extra[f"q{b}_tail_frac_8mm"] = float(bq[b, 3] / nb)
+        extra[f"q{b}_pixel_frac"] = float(nb / n)
+        for si, nm in enumerate(("s2", "s3", "s4")):
+            ns = sq[b, si, 1]
+            if ns > 0:
+                extra[f"q{b}_{nm}_in_range"] = float(sq[b, si, 0] / ns)
     return {
+        **extra,
         "abs_err": float(stats[0] / n),
         "acc_2mm": float(stats[2] / n),
         "acc_4mm": float(stats[3] / n),
@@ -695,6 +817,28 @@ class _EpochShuffleSampler(torch.utils.data.Sampler):
 
     def __len__(self) -> int:
         return len(self.order)
+
+
+def _seed_everything(seed: int, rank: int, deterministic: bool = False) -> None:
+    """固定 python / numpy / torch / cuda 的随机源。
+
+    数据增广那一侧不靠全局状态: data/dtu.py 用 SeedSequence([seed, epoch, idx])
+    给每个样本独立播种, 所以 worker 数变化不会改变增广序列。这里管的是模型
+    初始化、dropout 之类的全局流。
+
+    ``deterministic`` 只动 cudnn 的两个开关, 不调
+    ``torch.use_deterministic_algorithms``: 后者会让 grid_sample 的反向直接抛
+    异常 (没有确定性实现), 而单应 warp 全靠它。
+    """
+    import random as _random
+    _random.seed(seed + rank)
+    np.random.seed((seed + rank) % (2 ** 32))
+    torch.manual_seed(seed + rank)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed + rank)
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
 
 def _config_snapshot(cfg) -> dict:
@@ -731,7 +875,40 @@ def _arch_fingerprint(cfg) -> dict:
         "reliability_source": getattr(cfg.spre, "reliability_source", "spre"),
         "spre_enabled": cfg.spre.enabled,
         "mode_window": cfg.depth_range.mode_window,
+        # 以下都不改 state_dict 的形状, 但都会改变结果。少了它们, 两个
+        # checkpoint 看起来"可互换"其实跑的是不同实验。
+        "lr": cfg.train.lr,
+        "warmup_steps": cfg.train.warmup_steps,
+        "max_steps": cfg.train.max_steps,
+        "batch_size": cfg.train.batch_size,
+        "num_views": cfg.train.num_views,
+        "seed": cfg.train.seed,
+        "stage_weights": [cfg.stage_weights.stage1, cfg.stage_weights.stage2,
+                          cfg.stage_weights.stage3, cfg.stage_weights.stage4],
+        "w_branch": cfg.loss.w_branch,
+        "w_spre": cfg.loss.w_spre,
+        "spre_balance_corrupt": cfg.loss.spre_balance_corrupt,
+        "range_k": list(cfg.depth_range.range_k),
+        "range_min_gi": list(cfg.depth_range.range_min_gi),
+        "range_max_gi": cfg.depth_range.range_max_gi,
+        "local_half_gi": [cfg.depth_range.local_half_min_gi, cfg.depth_range.local_half_max_gi],
+        "gate_hard_conf": cfg.depth_range.gate_hard_conf,
+        "prior_corruption_prob": cfg.train.prior_corruption_prob,
+        "prior_cache_version": _prior_cache_version(),
     }
+
+
+def _prior_cache_version() -> float:
+    """缓存里 pipeline_version 的取值 (抽一个样本)。先验重建过就会变, 而它
+    完全不体现在权重里 —— 8.16 那次回退里先验缓存正好也换了一版。"""
+    try:
+        import glob
+        f = sorted(glob.glob(str(ProjectPaths().prior_cache_path / "*" / "*.npz")))
+        if not f:
+            return -1.0
+        return float(np.asarray(np.load(f[0])["pipeline_version"]).reshape(-1)[0])
+    except Exception:
+        return -1.0
 
 
 def _git_state() -> dict:
@@ -763,6 +940,7 @@ def _run_training(model, loss_fn, optimizer, scaler, cfg, device, args, world_si
         nviews=cfg.train.num_views,
         mode="train",
         prior_corruption_prob=cfg.train.prior_corruption_prob,
+        seed=cfg.train.seed,
         use_src_weights=cfg.cost_volume.use_src_weights,
         # Augmentation is train-only: val must stay deterministic or best.pth
         # gets selected on a moving target.
@@ -783,6 +961,8 @@ def _run_training(model, loss_fn, optimizer, scaler, cfg, device, args, world_si
         DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True, drop_last=True)
         if is_ddp else _EpochShuffleSampler(len(dataset), cfg.train.seed)
     )
+    _gen = torch.Generator()
+    _gen.manual_seed(cfg.train.seed + rank)
     loader = DataLoader(
         dataset,
         batch_size=cfg.train.batch_size,
@@ -791,6 +971,7 @@ def _run_training(model, loss_fn, optimizer, scaler, cfg, device, args, world_si
         num_workers=cfg.train.num_workers,
         collate_fn=_collate,
         worker_init_fn=_worker_init,
+        generator=_gen,
         pin_memory=True,
         drop_last=True,
     )
@@ -811,9 +992,10 @@ def _run_training(model, loss_fn, optimizer, scaler, cfg, device, args, world_si
     if len(val_dataset) == 0:
         raise RuntimeError(f"validation dataset is empty — check {_va_list}")
     val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False, drop_last=False) if is_ddp else None
+    val_bs = getattr(args, "val_batch_size", None) or cfg.train.batch_size
     val_loader = DataLoader(
         val_dataset,
-        batch_size=cfg.train.batch_size,
+        batch_size=val_bs,
         shuffle=False,
         sampler=val_sampler,
         num_workers=cfg.train.num_workers,
@@ -831,6 +1013,8 @@ def _run_training(model, loss_fn, optimizer, scaler, cfg, device, args, world_si
     epoch = start_step // max(len(loader), 1)
     while step < max_steps:
         sampler.set_epoch(epoch)
+        # 逐样本增广的种子含 epoch, 所以每个 epoch 是一组新的、但可复现的增广。
+        dataset.set_epoch(epoch)
         # Multi-scale: bucket this epoch's sampling order so every batch shares
         # one resolution (collate cannot stack mixed H x W). Must run AFTER
         # set_epoch — the order it buckets is the order the loader will draw —
@@ -881,7 +1065,7 @@ def _run_training(model, loss_fn, optimizer, scaler, cfg, device, args, world_si
                 if is_main:
                     logger.log_val(val_metrics, step)
                     logger.save(model, optimizer, step, val_metric=val_metrics["abs_err"])
-                    print(f"[val step {step}] " + " ".join(f"{k}={v:.4f}" for k, v in val_metrics.items()))
+                    print(f"[val step {step}] " + _fmt_val(val_metrics))
             elif is_main and step > 0 and step % cfg.train.ckpt_interval == 0:
                 logger.save(model, optimizer, step)
             step += 1
@@ -892,7 +1076,7 @@ def _run_training(model, loss_fn, optimizer, scaler, cfg, device, args, world_si
     if is_main:
         logger.log_val(val_metrics, step)
         logger.save(model, optimizer, step, val_metric=val_metrics["abs_err"])
-        print(f"[val final step {step}] " + " ".join(f"{k}={v:.4f}" for k, v in val_metrics.items()))
+        print(f"[val final step {step}] " + _fmt_val(val_metrics))
 
 
 def _worker_init(worker_id: int) -> None:
@@ -905,9 +1089,16 @@ def _worker_init(worker_id: int) -> None:
     会卡在梯度 all-reduce 上被 NCCL watchdog (默认 10 分钟) 判定超时并杀掉作业。
     """
     import cv2
+    import random as _random
 
     cv2.setNumThreads(0)
     torch.set_num_threads(1)
+    # torch 已经给每个 worker 派了不同的 base seed; numpy / random 不会自动跟随。
+    # 数据增广本身已改成逐样本 SeedSequence 播种, 不依赖这里 —— 这道只是兜底,
+    # 保证以后有人在 dataset 里加了 np.random.* 也不会重新引入不可复现。
+    _s = torch.initial_seed() % (2 ** 32)
+    np.random.seed(_s)
+    _random.seed(_s)
 
 
 def _collate(samples: list[dict]) -> dict:
@@ -936,6 +1127,10 @@ def main() -> None:
     parser.add_argument("--devices", type=str, default="", help="explicit CUDA ids, e.g. '0,1,2,3'")
     parser.add_argument("--steps", type=int, default=0, help="override max training steps (0 = config default)")
     parser.add_argument("--batch-size", type=int, default=None, help="per-GPU batch size override")
+    parser.add_argument("--val-batch-size", type=int, default=None,
+                        help="验证用的 batch (默认跟训练一致)。验证只做前向且在 no_grad 下, "
+                             "显存远小于训练峰值, 而按像素加权的指标与 batch 无关 —— "
+                             "调大它纯粹是省时间, 不会改变任何数字。")
     parser.add_argument("--num-workers", type=int, default=None, help="DataLoader worker count override")
     parser.add_argument("--num-views", type=int, default=None, help="number of MVS input views override")
     parser.add_argument("--lr", type=float, default=None, help="learning-rate override")
@@ -950,7 +1145,7 @@ def main() -> None:
                         help="VGGT/DA3 prior height override (default 420; must be a multiple of 14)")
     parser.add_argument("--master-port", type=str, default="29500")
     parser.add_argument("--resume", choices=["auto", "off"], default="auto",
-                        help="auto: continue from log/model/latest.pth if present; off: always start fresh")
+                        help="auto: continue from log/experiments/<run>/model/latest.pth; off: always start fresh")
     parser.add_argument("--build-priors", choices=["auto", "force", "skip", "only"], default="auto",
                         help="auto: precompute missing priors; force: recompute all; "
                              "skip: assume cached; only: build missing priors then exit; "
@@ -965,6 +1160,31 @@ def main() -> None:
                         help="prior 可靠度来源, 与 DINO matching 解耦")
     parser.add_argument("--spre", choices=["on", "off"], default=None,
                         help="enable/disable the SPRE DINOv3 prior-reliability head (default: config value)")
+    # --- 消融开关: 全部走 CLI, 这样同一份 commit 可以并行提交多组实验 ---
+    parser.add_argument("--num-global", type=int, default=None,
+                        help="stage1 全局分支候选数 (num_depths_stage1 自动跟随 = global+local)")
+    parser.add_argument("--num-local", type=int, default=None,
+                        help="stage1 局部分支候选数")
+    parser.add_argument("--gate-local", choices=["on", "off"], default=None,
+                        help="conf < gate_hard_conf 时把 local 分支降级为 guard 网格")
+    parser.add_argument("--branch-prior", choices=["on", "off"], default=None,
+                        help="stage1 logits 上叠 log q / log(1-q) 的分支先验")
+    parser.add_argument("--visibility", choices=["on", "off"], default=None,
+                        help="逐 (source, pixel) 可见性加权 (仅 stage1)")
+    parser.add_argument("--stage1-weight", type=float, default=None,
+                        help="stage1 的 loss 权重")
+    parser.add_argument("--w-branch", type=float, default=None,
+                        help="分支校准 loss 权重 (0 = 关闭)")
+    parser.add_argument("--spre-balance-corrupt", choices=["on", "off"], default=None,
+                        help="SPRE corruption BCE 是否按 clean/corrupt 两类平衡")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="全局随机种子 (模型初始化 + 采样顺序 + 逐样本增广)")
+    parser.add_argument("--deterministic", action="store_true",
+                        help="cudnn.deterministic=True, benchmark=False。约慢 5-10%%, "
+                             "但同 seed 两次跑的曲线才真的可比")
+    parser.add_argument("--expect-sha", type=str, default="",
+                        help="提交任务时的 git SHA; 与运行时不符直接退出。"
+                             "排队期间主工作树被改动过就会被这道闸门挡下")
     parser.add_argument("--smoke", action="store_true", help="run synthetic steps to validate the pipeline")
     parser.add_argument("--smoke-steps", type=int, default=3)
     args = parser.parse_args()

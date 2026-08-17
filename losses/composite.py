@@ -202,6 +202,39 @@ class MVSLoss:
                 logs["stage1/branch_local_better"] = float((branch_tgt[m_br] > 0.5).float().mean())
                 logs["stage1/branch_acc"] = float(
                     ((branch_pred[m_br] > 0.5) == (branch_tgt[m_br] > 0.5)).float().mean())
+
+            # --- 分支先验 前/后 对比 (bp_*) ---
+            # apply_branch_prior 在各分支内部 logsumexp 归一化后再乘 q, 结果是
+            # 两个分支的概率总质量被硬指派成 (1-q, q) —— cost volume 学到的
+            # "该信哪个分支" 被整段替换成一个 SPRE 标量。这组诊断直接回答它是
+            # 帮忙还是添乱: bp_post_abs_err < bp_raw_abs_err 才说明它有正贡献。
+            # 注意 raw logits 是在 post-prior 的损失下训练出来的, 所以这只能证明
+            # "当前模型里先验是否即时伤害预测"; 结果接近时仍需消融训练确认。
+            lr_ = s1.get("logits_raw")
+            if lr_ is not None and valid1.any():
+                idx_raw = lr_.detach().float().argmax(dim=1, keepdim=True)
+                idx_post = s1["mode_idx"]
+                d_raw = hypos.gather(1, idx_raw).squeeze(1)
+                d_post = hypos.gather(1, idx_post).squeeze(1)
+                e_raw = (d_raw - gt1).abs()
+                e_post = (d_post - gt1).abs()
+                logs["stage1/bp_raw_abs_err"] = float(e_raw[valid1].mean())
+                logs["stage1/bp_post_abs_err"] = float(e_post[valid1].mean())
+                flip = (idx_raw != idx_post).squeeze(1) & valid1
+                logs["stage1/bp_flip_frac"] = float(flip.float()[valid1].mean())
+                if flip.any():
+                    logs["stage1/bp_flip_help"] = float((e_post[flip] < e_raw[flip]).float().mean())
+                    logs["stage1/bp_flip_hurt"] = float((e_post[flip] > e_raw[flip]).float().mean())
+                p_raw = F.softmax(lr_.detach().float(), dim=1)
+                gtb_ = (hypos - gt1.unsqueeze(1)).abs().argmin(dim=1, keepdim=True)
+                logs["stage1/bp_raw_p_at_gt"] = float(p_raw.gather(1, gtb_).squeeze(1)[valid1].mean())
+                # 落在哪个分支 vs 哪个分支的 oracle 候选更好
+                loc_raw = s1["is_local"].gather(1, idx_raw).squeeze(1) > 0.5
+                loc_post = s1["is_local"].gather(1, idx_post).squeeze(1) > 0.5
+                tgt_loc = branch_tgt > 0.5
+                if m_br.any():
+                    logs["stage1/bp_raw_branch_acc"] = float((loc_raw[m_br] == tgt_loc[m_br]).float().mean())
+                    logs["stage1/bp_post_branch_acc"] = float((loc_post[m_br] == tgt_loc[m_br]).float().mean())
             logs["stage1/reg"] = float(l_reg1.detach())
             logs["stage1/in_range"] = float(g_in_range[valid1].float().mean()) if valid1.any() else 1.0
             logs["stage1/global_in_range"] = logs["stage1/in_range"]
@@ -296,6 +329,14 @@ class MVSLoss:
                 pm = self._to_stage_res(p_max_px, hw)[oor]
                 logs[f"{name}/p_at_gt_oor"] = float(pg.mean())
                 logs[f"{name}/oor_recoverable"] = float((pg >= 0.1 * pm).float().mean())
+
+        # 窗宽归因 (models/depth_range.refine_range_from_posterior)
+        rd = outputs.get("range_diag")
+        if isinstance(rd, dict):
+            with torch.no_grad():
+                for sname, st in rd.items():
+                    for k_, v_ in st.items():
+                        logs[f"{sname}/{k_}"] = float(v_)
 
         # ------------------------- SPRE reliability head ------------------------- #
         if "spre" in outputs:

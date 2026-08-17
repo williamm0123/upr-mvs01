@@ -334,6 +334,9 @@ def refine_range_from_posterior(
 
     All geometry is detached: hypothesis placement carries no gradient, each
     stage is trained by its own losses.
+
+    Returns ``(hypos, stats)``; ``stats`` records which of the three width terms
+    actually决定了窗宽 (见函数末尾的注释)。
     """
     with torch.no_grad():
         D = prob.shape[1]
@@ -345,15 +348,33 @@ def refine_range_from_posterior(
             1.0 + config.range_entropy_a * entropy + config.range_edge_b * edge
         )
         gi = global_interval.view(-1, 1, 1)
-        half = torch.maximum(half, config.range_min_gi[stage_idx] * gi)
-        half = torch.minimum(half, config.range_max_gi * gi)
+        half_raw = half
+        floor = config.range_min_gi[stage_idx] * gi
+        ceil = config.range_max_gi * gi
+        half = torch.maximum(half_raw, floor)
+        half = torch.minimum(half, ceil)
         steps = torch.linspace(-1.0, 1.0, num_depths, device=center.device, dtype=center.dtype)
         hypos = center.detach().unsqueeze(1) + half.unsqueeze(1) * steps.view(1, num_depths, 1, 1)
+        clamped = (hypos < depth_min.view(-1, 1, 1, 1)) | (hypos > depth_max.view(-1, 1, 1, 1))
         hypos = hypos.clamp(
             min=depth_min.view(-1, 1, 1, 1),
             max=depth_max.view(-1, 1, 1, 1),
         )
-    return hypos
+        # 窗宽归因诊断: "stage2-4 窗口缩了 21%" 到底是 floor 主导还是
+        # range_k*winner_interval 主导, 只有这三个比例能定。half_raw 低于 floor
+        # 的比例高 = floor 说了算 = 窗宽由 global_interval 决定 (于是改 num_global
+        # 会整体缩放级联); 反之则由 winner_interval 决定。
+        stats = {
+            "half_raw_mm": float(half_raw.mean()),
+            "half_mm": float(half.mean()),
+            "floor_binding": float((half_raw < floor).float().mean()),
+            "cap_binding": float((half_raw > ceil).float().mean()),
+            "bound_clamp_frac": float(clamped.float().mean()),
+            "wint_p10": float(winner_interval.float().quantile(0.10)),
+            "wint_p50": float(winner_interval.float().quantile(0.50)),
+            "wint_p90": float(winner_interval.float().quantile(0.90)),
+        }
+    return hypos, stats
 
 
 

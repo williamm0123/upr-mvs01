@@ -198,7 +198,7 @@ class UprMVSNet(nn.Module):
         src_weights: torch.Tensor | None,
         meta: torch.Tensor | None = None,
         branch_prior=None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, ...]:
         cost = self.cost_builders[stage_idx](
             feats_stage[:, 0],
             feats_stage[:, 1:],
@@ -299,7 +299,7 @@ class UprMVSNet(nn.Module):
                 self.range_cfg.branch_q_min)
         else:
             q1, bp = None, None
-        depth1, sigma1, prob1, logits1, mode_idx1 = self._run_stage(
+        depth1, sigma1, prob1, logits1, mode_idx1, logits1_raw = self._run_stage(
             0, feat1, K, E, s1.hypos, s1_stride, src_weights, meta=meta1,
             branch_prior=bp,
         )
@@ -307,7 +307,7 @@ class UprMVSNet(nn.Module):
         stage_out = {
             "stage1": {
                 "depth": depth1, "sigma": sigma1, "prob": prob1,
-                "logits": logits1, "depth_hypos": s1.hypos,
+                "logits": logits1, "logits_raw": logits1_raw, "depth_hypos": s1.hypos,
                 "mode_idx": mode_idx1,
                 # branch bookkeeping for the loss / diagnostics
                 "is_local": s1.is_local,
@@ -332,6 +332,7 @@ class UprMVSNet(nn.Module):
         # 选择失败, 轴上一直有 <20mm 的候选)。
         second_depth, second_mass = second_mode(
             prob1, s1.hypos, mode_idx1, self.range_cfg.second_mode_guard)
+        range_diag: dict[str, dict] = {}
         prev = {
             "depth": depth1, "prob": prob1, "winner_interval": winner_interval,
             "edge": s1.edge, "hw": feat1.shape[-2:],
@@ -339,7 +340,7 @@ class UprMVSNet(nn.Module):
         }
         for k in (1, 2, 3):
             feat_k = feats[strides[k]]
-            hypos_k = refine_range_from_posterior(
+            hypos_k, range_stats = refine_range_from_posterior(
                 center=prev["depth"],
                 winner_interval=prev["winner_interval"],
                 prob=prev["prob"],
@@ -357,9 +358,10 @@ class UprMVSNet(nn.Module):
                     hypos_k, prev["second_depth"], prev["second_mass"],
                     prev["winner_interval"], self.range_cfg)
             hypos_k = self._upsample_hypos(hypos_k, feat_k.shape[-2:])
-            depth_k, sigma_k, prob_k, logits_k, mode_idx_k = self._run_stage(
+            depth_k, sigma_k, prob_k, logits_k, mode_idx_k, _ = self._run_stage(
                 k, feat_k, K, E, hypos_k, strides[k], src_weights
             )
+            range_diag[f"stage{k + 1}"] = range_stats
             edge_k = self._resize_map(s1.edge, feat_k.shape[-2:])
             stage_out[f"stage{k + 1}"] = {
                 "depth": depth_k, "sigma": sigma_k, "prob": prob_k,
@@ -386,4 +388,5 @@ class UprMVSNet(nn.Module):
         vs = getattr(self.cost_builders[0], "last_vis_stats", None)
         if vs is not None:
             stage_out["vis"] = vs
+        stage_out["range_diag"] = range_diag
         return {"depth_full": depth_full, **stage_out}

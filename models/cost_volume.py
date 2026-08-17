@@ -96,7 +96,18 @@ class CostVolumeBuilder(nn.Module):
         self.proj = nn.Conv2d(in_channels, warp_channels, kernel_size=1, bias=False)
         self.warp_channels = warp_channels
         self.num_groups = num_groups
-        self.vis_head = VisibilityHead() if visibility_weighting else None
+        # 无条件构造, 只用 use_vis 开关它是否参与前向。
+        # 条件构造 (``VisibilityHead() if visibility_weighting else None``) 会改变
+        # 之后每个模块从全局 RNG 取到的随机数, 于是 "只关掉可见性头" 的消融实际上
+        # 连 decoder 的初始权重都换了一套, 不是配对实验。这里始终建、始终消耗同样
+        # 的 RNG, 关掉时它只是不参与前向也不产生梯度。
+        self.vis_head = VisibilityHead()
+        self.use_vis = bool(visibility_weighting)
+        if not self.use_vis:
+            # 关掉时冻结: 它拿不到梯度, 不冻结的话 DDP (find_unused_parameters=False)
+            # 会因为"有梯度需求却没收到梯度"报错, 优化器也会白白为它建 state。
+            # 权重仍在 state_dict 里, 所以两种配置的 checkpoint 互相可加载。
+            self.vis_head.requires_grad_(False)
         self.use_half = use_half
 
     def _sample_dtype(self, ref: torch.Tensor) -> torch.dtype:
@@ -151,10 +162,10 @@ class CostVolumeBuilder(nn.Module):
             )
             cv_s = group_wise_correlation(ref_p, warped, self.num_groups).float()
             cvs.append(cv_s)
-            if self.vis_head is not None:
+            if self.use_vis:
                 vlogits.append(self.vis_head(cv_s))
         self.last_vis_stats = None
-        if self.vis_head is not None:
+        if self.use_vis:
             pi = torch.softmax(torch.stack(vlogits, dim=0).float(), dim=0)   # [S,B,1,H,W]
             vis = pi * S                                                     # 均值恒为 1
             with torch.no_grad():
@@ -176,7 +187,7 @@ class CostVolumeBuilder(nn.Module):
                 if src_weights is not None
                 else ref_feat.new_ones(B, 1, 1, 1, 1, dtype=torch.float32)
             )
-            if self.vis_head is not None:
+            if self.use_vis:
                 w = w * vis[s].unsqueeze(2)          # [B,1,1,H,W]
             agg = agg + cv_s * w
             weight_sum = weight_sum + w

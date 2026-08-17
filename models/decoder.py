@@ -73,12 +73,15 @@ class DepthDecoder(nn.Module):
         cost_volume: torch.Tensor,
         depth_hypos: torch.Tensor,
         branch_prior=None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        logits = self.unet(cost_volume)
+    ) -> tuple[torch.Tensor, ...]:
+        logits_raw = self.unet(cost_volume)
         # 分支先验: P(d) = q P(d|local) + (1-q) P(d|global)。必须在各分支内部
         # 先归一化再乘先验 —— 见 depth_range.apply_branch_prior 的推导。
-        if branch_prior is not None:
-            logits = branch_prior(logits)
+        # logits_raw 是加先验之前的纯 matching evidence, 原样返回给 loss 做
+        # "加先验前/后哪个 argmax 更接近 GT" 的诊断。分支先验会把两个分支的总
+        # 概率质量硬指派成 (1-q, q), cost volume 学到的跨分支证据被整段抹掉,
+        # 这个诊断是判断它有没有害的唯一直接证据。
+        logits = branch_prior(logits_raw) if branch_prior is not None else logits_raw
         # max-shift keeps softmax finite under AMP; log_softmax downstream is
         # shift-invariant so the loss sees the same distribution.
         logits = logits - logits.amax(dim=1, keepdim=True).detach()
@@ -87,4 +90,4 @@ class DepthDecoder(nn.Module):
         # bimodal posterior (wrong local peak + correct global peak) the global
         # expectation lands between the peaks, on no real surface.
         depth, sigma, mode_idx = mode_centered_regression(prob, depth_hypos.float(), self.mode_window)
-        return depth, sigma, prob, logits, mode_idx
+        return depth, sigma, prob, logits, mode_idx, logits_raw

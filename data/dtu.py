@@ -48,6 +48,15 @@ class DTUMVSDataset(Dataset):
         # 也默认 False), 需要时显式打开并保证缓存 view 数一致。
         self.use_src_weights = bool(kwargs.get('use_src_weights', False))
 
+        # --- 逐样本确定性随机 ---
+        # 增强、多尺度 resize、随机裁剪、prior 腐蚀原本各自调 np.random / 无种子
+        # default_rng(), 于是同一份配置跑两次的增广序列不同。实测同配置两次跑的
+        # val abs_err 单点差异达 0.109mm, 而消融要分辨的效应就是 0.17mm 量级 ——
+        # 不播种就无法做单变量比较。这里用 SeedSequence([seed, epoch, idx]) 给每个
+        # 样本生成独立且可复现的 Generator, 四个随机入口共用它。
+        self.base_seed = int(kwargs.get('seed', 20260526))
+        self.epoch = 0
+
         # --- 训练增强 (仅 train; val/test 必须确定性, 否则 best.pth 不可比) ---
         # aug: data.augment.PhotometricAug 或 None
         # scales / resize_range: 多尺度; 空 scales = 关闭, 固定 height x width
@@ -178,7 +187,16 @@ class DTUMVSDataset(Dataset):
             return
         self._barrel = {int(sid): i // max(batch_size, 1) for i, sid in enumerate(order)}
 
-    def sample_geometry(self, idx):
+    def set_epoch(self, epoch: int) -> None:
+        """每个 epoch 换一组样本级种子; 不调用则所有 epoch 复用同一组增广。"""
+        self.epoch = int(epoch)
+
+    def _rng(self, idx) -> np.random.Generator:
+        return np.random.default_rng(
+            np.random.SeedSequence([self.base_seed, self.epoch, int(idx)])
+        )
+
+    def sample_geometry(self, idx, rng: np.random.Generator | None = None):
         """该样本的 (crop_h, crop_w, resize_scale)。
 
         无多尺度时退化为固定的 self.height/width/resize_scale。
@@ -187,17 +205,20 @@ class DTUMVSDataset(Dataset):
             return self.height, self.width, self.resize_scale
         crop_h, crop_w = self.scales[self._barrel.get(int(idx), int(idx)) % len(self.scales)]
         lo, hi = self.resize_range
-        enlarge = lo + float(np.random.rand()) * (hi - lo)
+        draw = rng.random() if rng is not None else np.random.rand()
+        enlarge = lo + float(draw) * (hi - lo)
         # DTU Rectified_raw 恒为 1200x1600
         return crop_h, crop_w, resize_scale_for_crop(crop_h, crop_w, 1200, 1600, enlarge)
 
-    def pick_crop_origin(self, h, w, crop_h=None, crop_w=None):
+    def pick_crop_origin(self, h, w, crop_h=None, crop_w=None, rng: np.random.Generator | None = None):
         """选裁剪左上角 (x0, y0): 训练随机, 其余居中。同一 sample 内只调用一次,
         让 ref/src/depth/sfm_depth/mask 共用同一窗口。"""
         crop_h = self.height if crop_h is None else crop_h
         crop_w = self.width if crop_w is None else crop_w
         max_y, max_x = max(h - crop_h, 0), max(w - crop_w, 0)
         if self.random_crop:
+            if rng is not None:
+                return int(rng.integers(0, max_x + 1)), int(rng.integers(0, max_y + 1))
             return int(np.random.randint(0, max_x + 1)), int(np.random.randint(0, max_y + 1))
         return max_x // 2, max_y // 2
 
@@ -284,8 +305,9 @@ class DTUMVSDataset(Dataset):
         return cv2.resize(arr, (w, h), interpolation=interp)
 
     def __getitem__(self, idx):
-        crop_h, crop_w, resize_scale = self.sample_geometry(idx)
-        aug_params = self.aug.draw(np.random.default_rng()) if self.aug is not None else None
+        rng = self._rng(idx)
+        crop_h, crop_w, resize_scale = self.sample_geometry(idx, rng)
+        aug_params = self.aug.draw(rng) if self.aug is not None else None
         pc = self.precrop_inputs(idx, resize_scale=resize_scale, aug_params=aug_params)
         resized_imgs = pc["views_np"]
         resized_intrinsics = pc["intrinsics"]
@@ -328,7 +350,7 @@ class DTUMVSDataset(Dataset):
         src_weights = prior["src_weights"] if self.use_src_weights else None
 
         # --- 裁剪到 (crop_w x crop_h): 所有视角/深度/prior 共用同一窗口 ---
-        crop_x, crop_y = self.pick_crop_origin(h0, w0, crop_h, crop_w)
+        crop_x, crop_y = self.pick_crop_origin(h0, w0, crop_h, crop_w, rng=rng)
         y1, x1 = crop_y + crop_h, crop_x + crop_w
 
         images, intrinsics, projection_matrices = [], [], []
@@ -358,7 +380,7 @@ class DTUMVSDataset(Dataset):
         # 分别统计 corrupted / clean 像素误差 (global 分支救回率的直接度量)。
         if self.prior_corruption_prob > 0.0:
             depth_prior_crop, conf_prior_crop, corrupt_mask = corrupt_prior(
-                depth_prior_crop, conf_prior_crop, self.prior_corruption_prob
+                depth_prior_crop, conf_prior_crop, self.prior_corruption_prob, rng=rng
             )
         else:
             corrupt_mask = np.zeros(depth_prior_crop.shape, dtype=bool)
