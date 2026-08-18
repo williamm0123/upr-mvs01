@@ -289,10 +289,11 @@ class TrainLogger:
     def _tag(cls, name: str) -> str:
         return f"{cls.TAG_PREFIX}/{name}"
 
-    def __init__(self, run_name: str, enabled: bool, cfg=None) -> None:
+    def __init__(self, run_name: str, enabled: bool, cfg=None, scaler=None) -> None:
         self.enabled = enabled
         self.best_metric = float("inf")
         self.cfg = cfg          # 存进 checkpoint, 见 save()
+        self.scaler = scaler    # GradScaler 的 scale 也是训练状态, 必须一起存
         if not enabled:
             return
         # 每个 run 一套目录。以前所有实验共用 log/model/latest.pth, 并行提交
@@ -364,15 +365,32 @@ class TrainLogger:
         the *validation* abs_err, never the (noisy single-batch) train loss."""
         if not self.enabled:
             return
+        state = (model.module if isinstance(model, DDP) else model).state_dict()
+        # 非有限权重绝不落盘。latest.pth 是 resume 的唯一入口, 一旦被坏状态覆盖,
+        # 这个 run 就再也回不到好点了 (arm L 的 latest 就是这么没的)。注意这里
+        # 扫的是整个 state_dict, 包含 BN 的 running_mean/var —— 它们在 forward
+        # 里无条件更新, 不受 GradScaler 跳步保护, 恰恰是最先被污染的那一批。
+        bad = [k for k, v in state.items()
+               if isinstance(v, torch.Tensor) and v.is_floating_point()
+               and not bool(torch.isfinite(v).all())]
+        if bad:
+            print(f"[ckpt] 拒绝写入: state_dict 里有 {len(bad)} 个张量含非有限值 "
+                  f"(例如 {bad[:3]})。latest.pth / best.pth 保持在上一个好状态。")
+            return
         is_best = val_metric is not None and val_metric < self.best_metric
         if is_best:
             self.best_metric = float(val_metric)
-        state = (model.module if isinstance(model, DDP) else model).state_dict()
         ckpt = {
             "step": step,
             "model": state,
             "optimizer": optimizer.state_dict(),
             "best_metric": self.best_metric,
+            # 续训完整性: 少了这两样, "接着跑"其实是换了一条随机流从头凑 ——
+            # scaler 的 scale 要重新爬回去 (前几十步全被跳过), RNG 归零则 dropout
+            # / 初始化侧的序列跟不中断的那次对不上。样本位置不用存: 它是
+            # step % len(loader) 的确定性函数, resume 时重新算 (见 _run_training)。
+            "scaler": self.scaler.state_dict() if self.scaler is not None else None,
+            "rng": _rng_state(),
             # 完整配置 + 指纹。以下开关都无法从 state_dict 反推:
             # 40/8 还是 32/16、branch prior/hard gate、dual-mode、reliability
             # source、stage weights。少了它, 同一个 ckpt 用当前默认配置推理会
@@ -465,6 +483,8 @@ def main_worker(
         train_overrides["val_interval"] = args.val_interval
     if args.amp is not None:
         train_overrides["amp"] = args.amp == "on"
+    if args.nan_watchdog is not None:
+        train_overrides["nan_watchdog"] = args.nan_watchdog == "on"
     if train_overrides:
         cfg = replace(cfg, train=replace(cfg.train, **train_overrides))
 
@@ -605,7 +625,7 @@ def main_worker(
     scaler = torch.amp.GradScaler(device.type, enabled=use_amp)
 
     run_name = args.name + ("_smoke" if args.smoke else "")
-    logger = TrainLogger(run_name, enabled=is_main, cfg=cfg)
+    logger = TrainLogger(run_name, enabled=is_main, cfg=cfg, scaler=scaler)
 
     # Resume from latest.pth so a walltime-killed job continues where it left
     # off (model + optimizer + step + best val metric). Every rank loads the
@@ -629,12 +649,33 @@ def main_worker(
                     "or check out the commit the checkpoint came from.\n"
                     f"original error: {exc}"
                 ) from exc
+            # 指纹闸门。存了却不校验等于没存: 8.16 那次回退里先验缓存换了一版,
+            # 权重看起来完全可加载, 但跑的已经是另一个实验。lr / stage weights /
+            # num_global / prior_cache_version 全在指纹里, 对不上就停。
+            diff = _fingerprint_diff(ckpt.get("fingerprint"), _arch_fingerprint(cfg))
+            if diff and not args.allow_fingerprint_mismatch:
+                detail = "\n".join(f"    {k:<24s} checkpoint={s!r}  当前={c!r}"
+                                   for k, (s, c) in diff.items())
+                raise RuntimeError(
+                    f"{ckpt_path} 的指纹与当前配置不符, 续训会静默变成另一个实验:\n"
+                    f"{detail}\n"
+                    "  想接着跑就先对齐配置; 确认无害 (例如只是重建过先验缓存) "
+                    "再加 --allow-fingerprint-mismatch。"
+                )
+            if diff:
+                print(f"[resume] 指纹有 {len(diff)} 处不符, 但 --allow-fingerprint-mismatch "
+                      f"已放行: {sorted(diff)}")
             optimizer.load_state_dict(ckpt["optimizer"])
+            if ckpt.get("scaler") is not None:
+                scaler.load_state_dict(ckpt["scaler"])
+            rng_ok = _restore_rng(ckpt.get("rng"))
             start_step = int(ckpt.get("step", -1)) + 1
             logger.best_metric = float(ckpt.get("best_metric", float("inf")))
             if is_main:
                 print(f"[resume] loaded {ckpt_path} -> continuing from step {start_step} "
-                      f"(best val abs_err so far: {logger.best_metric:.4f})")
+                      f"(best val abs_err so far: {logger.best_metric:.4f}; "
+                      f"scaler={'restored' if ckpt.get('scaler') is not None else 'reset'}, "
+                      f"rng={'restored' if rng_ok else 'reset'})")
 
     if is_main:
         n_params = sum(p.numel() for p in model.parameters()) / 1e6
@@ -644,27 +685,142 @@ def main_worker(
               f"workers={cfg.train.num_workers} lr={cfg.train.lr:g} "
               f"warmup={cfg.train.warmup_steps} amp={cfg.train.amp}")
 
-    if args.smoke:
-        _run_smoke(model, loss_fn, optimizer, scaler, cfg, device, args, logger, is_main)
-    else:
-        _run_training(model, loss_fn, optimizer, scaler, cfg, device, args, world_size, rank, is_ddp, logger, is_main, start_step)
-
-    logger.close()
+    # finally: 看门狗是靠抛异常终止的, 没有这层 tensorboard 的最后一批事件
+    # (含事故前几步的 grad norm) 会留在缓冲区里丢掉 —— 正是最该看的那几个点。
+    try:
+        if args.smoke:
+            _run_smoke(model, loss_fn, optimizer, scaler, cfg, device, args, logger, is_main)
+        else:
+            _run_training(model, loss_fn, optimizer, scaler, cfg, device, args, world_size, rank, is_ddp, logger, is_main, start_step)
+    finally:
+        logger.close()
     if is_ddp:
         dist.barrier()
         dist.destroy_process_group()
 
 
-def _train_step(model, loss_fn, optimizer, scaler, batch, cfg, device, step, use_amp):
+class NonFiniteError(RuntimeError):
+    """训练里出现第一个非有限张量 —— 立即终止, 不再往下跑。
+
+    不终止的后果是实测过的 (arm L, 2026-08-18): GradScaler 发现 inf/nan 就把
+    整步跳过, 权重原地不动, 下一步同样的前向再溢出、再跳过。日志上看是 loss 恒
+    为 nan 而 step 照涨, 实际优化器一步没走 —— 12000 步里烧掉了 9050 步。同时
+    BN 的 running stats 在 forward 里无条件更新, 不受跳步保护, 会被逐层污染,
+    于是 val 从 acc_2mm=0.38 一路烂到 0。这也是为什么 save() 必须同时拒绝把
+    这种状态写进 latest.pth: 否则连回退点都没有了。
+    """
+
+
+def _finite_stat(t: torch.Tensor) -> tuple[float, float]:
+    """(有限值占比, 有限值中的 max|x|)。纯诊断路径, 不进计算图。"""
+    x = t.detach().float()
+    if x.numel() == 0:
+        return 1.0, 0.0
+    fin = torch.isfinite(x)
+    n_fin = int(fin.sum())
+    return n_fin / x.numel(), (float(x[fin].abs().max()) if n_fin else float("nan"))
+
+
+def _sample_ids(batch: dict) -> str:
+    """出事的是哪几个样本 —— 离线复现只能靠它定位。"""
+    out = []
+    for k in ("scan", "ref_view", "light_idx"):
+        v = batch.get(k)
+        if v is not None:
+            out.append(f"{k}={[str(x) for x in v] if isinstance(v, list) else v}")
+    return "  ".join(out) if out else "<batch 内没有 scan/ref_view/light_idx>"
+
+
+def _nonfinite_report(where, step, lr, scaler, batch, probes, extra_lines=()) -> str:
+    try:
+        scale = float(scaler.get_scale()) if scaler.is_enabled() else float("nan")
+    except Exception:
+        scale = float("nan")
+    lines = [
+        "", "=" * 78,
+        f"[watchdog] 首个非有限值: {where}",
+        "=" * 78,
+        f"  step        = {step}",
+        f"  lr          = {lr:.6e}",
+        f"  amp scale   = {scale:g}",
+        f"  batch       = {_sample_ids(batch)}",
+        *extra_lines,
+        "  张量                          finite_frac          max|x|",
+    ]
+    for name, t in probes.items():
+        if isinstance(t, torch.Tensor):
+            frac, mx = _finite_stat(t)
+            lines.append(f"    {name:<28s} {frac:11.6f} {mx:15.6g}{'   <<<' if frac < 1.0 else ''}")
+    lines += [
+        "=" * 78,
+        "  已终止。latest.pth 仍是最后一个全有限的状态, 可以直接 resume。",
+        "  梯度范数的走势看 tensorboard 的 train/diag_grad_norm_unclipped。",
+        "=" * 78, "",
+    ]
+    return "\n".join(lines)
+
+
+def _train_step(model, loss_fn, optimizer, scaler, batch, cfg, device, step, use_amp,
+                lr: float = float("nan")):
+    watch = getattr(cfg.train, "nan_watchdog", True)
     optimizer.zero_grad(set_to_none=True)
     with torch.autocast(device_type=device.type, enabled=use_amp):
         outputs = model(batch, step=step)
         loss, logs = loss_fn(outputs, batch, step=step)
+
+    # 关口 1 —— 前向。放在 backward 之前是有意的: 此刻还能看出是哪个 loss 分量
+    # 先坏的; 一旦 backward 跑完, 梯度已经被污染成一片 nan, 源头就找不回来了。
+    if watch:
+        bad = sorted(k for k, v in logs.items()
+                     if isinstance(v, (int, float)) and not math.isfinite(float(v)))
+        if bad or not bool(torch.isfinite(loss)):
+            probes = {"loss": loss}
+            probes.update({f"out.{k}": v for k, v in outputs.items() if isinstance(v, torch.Tensor)})
+            probes.update({f"in.{k}": v for k, v in batch.items()
+                           if isinstance(v, torch.Tensor) and v.is_floating_point()})
+            raise NonFiniteError(_nonfinite_report(
+                "forward — loss 或 loss 分量", step, lr, scaler, batch, probes,
+                extra_lines=[f"  非有限的 loss 分量: {bad}" if bad
+                             else "  loss 本身非有限 (各分量倒都是有限的)"],
+            ))
+
     scaler.scale(loss).backward()
     scaler.unscale_(optimizer)
-    torch.nn.utils.clip_grad_norm_(
-        [p for p in model.parameters() if p.requires_grad], cfg.train.grad_clip
-    )
+
+    named = [(n, p) for n, p in (model.module if isinstance(model, DDP) else model).named_parameters()
+             if p.requires_grad and p.grad is not None]
+    params = [p for _, p in named]
+    grads = [p.grad for p in params]
+
+    # 关口 2 —— 反向。逐参数 isfinite 是几百次 kernel launch, 每步都做太贵, 所以
+    # 先用一次融合的 _foreach_norm 拿到 unclipped total norm; 只有它非有限时才
+    # 回头逐参数定位。这一步必须在 clip_grad_norm_ 之前: total_norm 一旦是 nan,
+    # clip 会把每个梯度都乘成 nan, 那时再扫就分不出谁是源头。
+    if grads:
+        try:
+            per_norm = torch._foreach_norm(grads)
+        except Exception:                      # 私有 API 的兜底
+            per_norm = [g.detach().float().norm() for g in grads]
+        total_norm = torch.linalg.vector_norm(torch.stack(per_norm))
+    else:
+        per_norm, total_norm = [], torch.zeros((), device=device)
+
+    if watch and per_norm and not bool(torch.isfinite(total_norm)):
+        ok = torch.isfinite(torch.stack(per_norm)).tolist()
+        bad_names = [named[i][0] for i, good in enumerate(ok) if not good]
+        probes = {f"grad.{named[i][0]}": grads[i] for i, good in enumerate(ok) if not good}
+        raise NonFiniteError(_nonfinite_report(
+            "backward — 梯度", step, lr, scaler, batch, dict(list(probes.items())[:12]),
+            extra_lines=[
+                f"  unclipped grad norm = {float(total_norm):g}",
+                f"  非有限梯度的参数: {len(bad_names)}/{len(named)} 个",
+                f"  最靠前的几个: {bad_names[:6]}",
+            ],
+        ))
+
+    torch.nn.utils.clip_grad_norm_(params, cfg.train.grad_clip, error_if_nonfinite=watch)
+    # 这条曲线是提前量: L 那次事故之前梯度范数其实已经在涨, 只是没人记录。
+    logs["grad/norm_unclipped"] = float(total_norm)
     scaler.step(optimizer)
     scaler.update()
     return logs, outputs
@@ -841,6 +997,45 @@ def _seed_everything(seed: int, rank: int, deterministic: bool = False) -> None:
         torch.backends.cudnn.benchmark = False
 
 
+def _rng_state() -> dict:
+    """四条随机流的现场。数据增广不靠它们 (data/dtu.py 用 SeedSequence
+    [seed, epoch, idx] 逐样本播种), 但模型侧的 dropout / 采样仍然走全局流。"""
+    import random as _random
+    return {
+        "python": _random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+        "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+    }
+
+
+def _restore_rng(state: dict | None) -> bool:
+    if not state:
+        return False
+    import random as _random
+    try:
+        _random.setstate(state["python"])
+        np.random.set_state(state["numpy"])
+        torch.set_rng_state(state["torch"].cpu() if torch.is_tensor(state["torch"]) else state["torch"])
+        if state.get("cuda") is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all([s.cpu() if torch.is_tensor(s) else s for s in state["cuda"]])
+        return True
+    except Exception as exc:                   # 老 checkpoint 里没有 / 格式对不上
+        print(f"[resume] RNG 状态无法恢复 ({exc}) —— 继续, 但这一次不是精确续训")
+        return False
+
+
+def _fingerprint_diff(saved: dict | None, current: dict) -> dict:
+    """checkpoint 的指纹 vs 当前配置。返回 {key: (存的, 现在的)}。"""
+    if not saved:
+        return {}
+    def norm(v):                               # torch.save 会把 tuple 原样带回来
+        return list(v) if isinstance(v, (list, tuple)) else v
+    return {k: (saved.get(k), current.get(k))
+            for k in sorted(set(saved) | set(current))
+            if norm(saved.get(k)) != norm(current.get(k))}
+
+
 def _config_snapshot(cfg) -> dict:
     """MVSConfig -> 纯 python 容器 (Path 转 str), 可无依赖反序列化。"""
     from dataclasses import asdict, is_dataclass
@@ -1011,6 +1206,12 @@ def _run_training(model, loss_fn, optimizer, scaler, cfg, device, args, world_si
     meter = WindowedMeter(device, is_ddp)
     step = start_step
     epoch = start_step // max(len(loader), 1)
+    # 续训位置。以前 resume 只恢复 epoch, 然后从 epoch 开头重新迭代 —— 本 epoch
+    # 里已经训过的那些 batch 会被再训一遍, 样本顺序跟不中断的那次对不上。位置是
+    # step % len(loader) 的确定性函数 (采样顺序由 sampler.set_epoch(epoch) 决定),
+    # 所以不必存进 checkpoint, 这里重新算出来跳过即可。跳过仍要走一遍 DataLoader
+    # (拿不到"直接 seek 到第 k 个 batch"的接口), 代价是几分钟 IO, 换的是顺序精确。
+    skip_in_epoch = start_step % max(len(loader), 1)
     while step < max_steps:
         sampler.set_epoch(epoch)
         # 逐样本增广的种子含 epoch, 所以每个 epoch 是一组新的、但可复现的增广。
@@ -1020,14 +1221,20 @@ def _run_training(model, loss_fn, optimizer, scaler, cfg, device, args, world_si
         # set_epoch — the order it buckets is the order the loader will draw —
         # and before iterating, so forked workers inherit the plan.
         dataset.reset_scale_plan(list(sampler), cfg.train.batch_size)
-        for batch in loader:
+        if skip_in_epoch and is_main:
+            print(f"[resume] 跳过本 epoch 已消费的前 {skip_in_epoch} 个 batch, "
+                  f"从 epoch {epoch} 的第 {skip_in_epoch} 个 batch 接上")
+        for i, batch in enumerate(loader):
+            if i < skip_in_epoch:
+                continue
             if step >= max_steps:
                 break
             batch = {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
             lr = _lr_at(cfg, step, max_steps)
             for g in optimizer.param_groups:
                 g["lr"] = lr
-            logs, outputs = _train_step(model, loss_fn, optimizer, scaler, batch, cfg, device, step, use_amp)
+            logs, outputs = _train_step(model, loss_fn, optimizer, scaler, batch, cfg,
+                                        device, step, use_amp, lr=lr)
 
             # every rank feeds the window; flush is a collective at log steps.
             # GT beyond the scene's physical depth range is unreachable by any
@@ -1069,6 +1276,7 @@ def _run_training(model, loss_fn, optimizer, scaler, cfg, device, args, world_si
             elif is_main and step > 0 and step % cfg.train.ckpt_interval == 0:
                 logger.save(model, optimizer, step)
             step += 1
+        skip_in_epoch = 0            # 只对 resume 后的第一个 epoch 生效
         epoch += 1
 
     # Final validation so the last weights are also considered for best.pth.
@@ -1185,6 +1393,12 @@ def main() -> None:
     parser.add_argument("--expect-sha", type=str, default="",
                         help="提交任务时的 git SHA; 与运行时不符直接退出。"
                              "排队期间主工作树被改动过就会被这道闸门挡下")
+    parser.add_argument("--nan-watchdog", choices=["on", "off"], default=None,
+                        help="出现第一个非有限 loss/梯度就终止 (默认 on)。off 只用于"
+                             "复现历史事故 —— 关掉它 GradScaler 会一路跳步空转")
+    parser.add_argument("--allow-fingerprint-mismatch", action="store_true",
+                        help="resume 时即使 checkpoint 指纹与当前配置不符也继续。"
+                             "只在确认无害时用 (例如仅重建过先验缓存)")
     parser.add_argument("--smoke", action="store_true", help="run synthetic steps to validate the pipeline")
     parser.add_argument("--smoke-steps", type=int, default=3)
     args = parser.parse_args()

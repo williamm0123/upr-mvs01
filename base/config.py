@@ -371,6 +371,9 @@ class TrainConfig:
     warmup_steps: int = 1000
     grad_clip: float = 1.0
     amp: bool = True
+    # 出现第一个非有限 loss/梯度就终止, 而不是让 GradScaler 一路跳步空转。
+    # 关掉只该用于复现历史事故 —— 正常训练没有理由带着 nan 继续跑。
+    nan_watchdog: bool = True
     seed: int = 20260526
     log_interval: int = 50
     vis_interval: int = 100
