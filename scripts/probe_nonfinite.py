@@ -21,6 +21,8 @@ autocast 下跑 fp16); 若是 ``warped`` 或 ``cv_s``, 源头在投影/采样那
 from __future__ import annotations
 
 import argparse
+import glob
+import os
 import sys
 from pathlib import Path
 
@@ -40,8 +42,46 @@ import train as T
 DTYPES = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": None}
 
 
+def resolve_ckpt(spec: str) -> str:
+    """把 --ckpt 解析成一个真实文件。
+
+    接受三种写法, 因为最容易踩的就是路径:
+      * 直接给文件            log/experiments/R/model/latest.pth
+      * 给 run 目录或 run 名  log/experiments/R   /   R
+      * 给 glob               'log/experiments/R*'  (shell 没匹配上时会把字面量
+                              原样传进来, 所以这里自己再展开一次)
+    多个匹配时取最新修改的那个。
+    """
+    if not spec:
+        return ""
+    cands = sorted(glob.glob(spec)) or []
+    if not cands and not os.path.isabs(spec) and "/" not in spec:
+        cands = sorted(glob.glob(str(_ROOT / "log" / "experiments" / spec)))
+    if not cands:
+        cands = [spec]
+    out = []
+    for c in cands:
+        if os.path.isdir(c):
+            out += sorted(glob.glob(os.path.join(c, "**", "latest.pth"), recursive=True))
+        elif os.path.exists(c):
+            out.append(c)
+    if not out:
+        avail = sorted(os.path.basename(d) for d in
+                       glob.glob(str(_ROOT / "log" / "experiments" / "*")) if os.path.isdir(d))
+        raise SystemExit(f"找不到 checkpoint: {spec}\n"
+                         f"log/experiments 下现有的 run: {', '.join(avail) or '(空)'}\n"
+                         f"用法示例: --ckpt R_vis   或   --ckpt log/experiments/R/model/latest.pth")
+    out.sort(key=os.path.getmtime)
+    if len(out) > 1:
+        print(f"[ckpt] 匹配到 {len(out)} 个, 取最新: {out[-1]}")
+    return out[-1]
+
+
 def build(args):
     cfg = build_mvs_config(profile=args.profile)
+    args.ckpt = resolve_ckpt(args.ckpt)
+    if args.ckpt:
+        print(f"[ckpt] {args.ckpt}")
     ck = torch.load(args.ckpt, map_location="cpu") if args.ckpt else None
     if ck is not None and ck.get("config"):
         fp = ck.get("fingerprint") or {}
