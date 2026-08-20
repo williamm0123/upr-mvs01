@@ -663,6 +663,7 @@ def generate_priors_from_sample(
     sfm_config: "S.SfMConfig | None" = None,
     vggt_model=None,
     da3_model=None,
+    scale_mode: str = "scale",
 ):
     paths = ProjectPaths()
     # Preloaded models can be passed in (offline precompute loads them once);
@@ -728,8 +729,15 @@ def generate_priors_from_sample(
 
     # 用 SfM 公制稀疏深度给 (归一化尺度的) depth_filled 标定绝对尺度.
     # 此处 depth_filled 已还原到 sample 原分辨率, 与 SfM sparse_depth 同尺寸.
+    # scale_mode="affine" 时先试逆深度域 scale+shift, 守卫不过自动退回 scale-only。
+    # 默认 "scale" —— 不显式打开时与旧缓存逐字节一致。打开必须同时换 cache path,
+    # 因为缓存文件名不编码标定方式 (见 base/config.py 对 prior_cache_path 的注释)。
+    _dv = sample.get("depth_values") if hasattr(sample, "get") else None
+    _dmin = float(np.asarray(_dv).reshape(-1)[0]) if _dv is not None and len(np.asarray(_dv).reshape(-1)) else None
+    _dmax = float(np.asarray(_dv).reshape(-1)[-1]) if _dv is not None and len(np.asarray(_dv).reshape(-1)) else None
     depth_filled, sfm_scale, sfm_out = S.calibrate_depth_to_metric(
-        sample, depth_filled, ref_idx=0, config=sfm_config)
+        sample, depth_filled, ref_idx=0, config=sfm_config,
+        mode=str(scale_mode), depth_min=_dmin, depth_max=_dmax)
     # print("sfm metric scale", sfm_scale, sfm_out["info"]["scale"])
 
     return {

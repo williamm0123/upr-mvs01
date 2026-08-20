@@ -6,6 +6,7 @@ import torch.nn.functional as F
 
 from base.config import MVSConfig
 from models.cost_volume import CostVolumeBuilder
+from models.probe import Probe
 from models.decoder import DepthDecoder
 from models.depth_range import (
     Stage1Hypotheses,
@@ -100,6 +101,12 @@ class UprMVSNet(nn.Module):
                             depth=dec_cfg.unet_depth, mode_window=mw) for _ in range(3)]
         )
 
+        # 给探针标记归属, 否则记录里分不清是哪一级
+        for i, m in enumerate(self.cost_builders):
+            m.tag = f"stage{i + 1}"
+        for i, m in enumerate(self.decoders):
+            m.tag = f"stage{i + 1}"
+
         self.num_depths = (cv_cfg.num_depths_stage1, cv_cfg.num_depths_stage2,
                            cv_cfg.num_depths_stage3, cv_cfg.num_depths_stage4)
 
@@ -111,6 +118,7 @@ class UprMVSNet(nn.Module):
         #   dino.mode              off / all_view / ref_only —— 跑不跑 DINO, 跑几个视角
         #   dino.feed_fpn          DINO 特征喂不喂 FPN (matching 路径)
         #   spre.reliability_source cached / edge / spre —— 可靠度从哪来
+        self.prior_mode = str(getattr(self.cfg.prior, "mode", "on")).lower()
         self.dino_mode = str(getattr(self.cfg.dino, "mode", "all_view"))
         self.reliability_source = str(getattr(self.cfg.spre, "reliability_source", "spre"))
         if self.dino_mode == "ref_only":
@@ -168,7 +176,8 @@ class UprMVSNet(nn.Module):
         return src_weights.float().clamp(min=0.1)
 
     @staticmethod
-    def _stage1_meta(s1: Stage1Hypotheses, global_interval: torch.Tensor) -> torch.Tensor:
+    def _stage1_meta(s1: Stage1Hypotheses, global_interval: torch.Tensor,
+                     prior_off: bool = False) -> torch.Tensor:
         """[B, 6, D, H, W] hypothesis descriptors for the stage-1 regularizer.
 
         All detached by construction (the whole bundle is built under no_grad).
@@ -183,6 +192,13 @@ class UprMVSNet(nn.Module):
         dist_prior = ((s1.hypos - s1.prior.unsqueeze(1)) / gi).clamp(-8.0, 8.0) / 8.0
         conf = s1.conf.unsqueeze(1).expand(B, D, H, W)
         edge = s1.edge.unsqueeze(1).expand(B, D, H, W)
+        if prior_off:
+            # 光把 prior 置零不够: dist_prior = (hypos - 0)/gi 就变成了归一化深度的
+            # 另一种写法, 仍是一路有信息的输入。这三通道必须显式中性化, 否则
+            # "无先验"对照里还残留着先验位置带来的结构。
+            dist_prior = torch.zeros_like(dist_prior)
+            conf = torch.zeros_like(conf)
+            edge = torch.zeros_like(edge)
         return torch.stack(
             [norm_depth, norm_interval, s1.is_local, dist_prior, conf, edge], dim=1
         ).float()
@@ -236,6 +252,16 @@ class UprMVSNet(nn.Module):
         E = batch["extrinsics"].float()
         depth_prior = batch["depth_prior"].float()
         conf_prior = batch["conf_prior"].float()
+        prior_valid = batch.get("prior_valid")
+        # prior_mode="off": 严格的无先验对照。置零之后 build_stage1_hypotheses 里
+        # `valid = isfinite & >0` 全 False, local 分支退化成 guard 范围内的半偏移
+        # 均匀网格 —— 也就是一条不含先验的 48 候选轴。模块**照常构造**, 所以
+        # RNG 流与 prior_mode="on" 完全一致, 两者是配对实验。
+        prior_off = self.prior_mode == "off"
+        if prior_off:
+            depth_prior = torch.zeros_like(depth_prior)
+            conf_prior = torch.zeros_like(conf_prior)
+            prior_valid = torch.zeros(depth_prior.shape[0], device=depth_prior.device)
         depth_min, depth_max = self._resolve_depth_bounds(batch)
         src_weights = self._resolve_src_weights(batch)
 
@@ -258,7 +284,7 @@ class UprMVSNet(nn.Module):
         # SPRE: learned reliability from the fused reference tokens + online
         # prior stats replaces the cached conf (which is degenerate). Computed at
         # the stage-1 resolution so the hypothesis builder's resize is a no-op.
-        if self.spre_enabled:
+        if self.spre_enabled and not prior_off:
             # Cross-view evidence: reproject the prior into every source view and
             # measure agreement. SPRE runs before the cost volume, so this is its
             # only multi-view signal.
@@ -286,19 +312,29 @@ class UprMVSNet(nn.Module):
             depth_max,
             self.range_cfg,
             target_hw=feat1.shape[-2:],
-            prior_valid=batch.get("prior_valid"),
+            prior_valid=prior_valid,
         )
         global_interval = (s1.global_hi - s1.global_lo) / max(self.range_cfg.num_global - 1, 1)  # [B]
-        meta1 = self._stage1_meta(s1, global_interval)
+        meta1 = self._stage1_meta(s1, global_interval, prior_off=prior_off)
         # 分支先验用 *可微的* conf_used 构造 —— hypothesis 几何仍在 no_grad 里,
         # 但 q 必须带梯度, 否则 branch loss 只训练 decoder 抵消常数, 传不回 SPRE。
-        if self.range_cfg.branch_prior:
+        if self.range_cfg.branch_prior and not prior_off:
             q1 = self._resize_map(conf_used, feat1.shape[-2:])
+            # beta 退火: 实测 hard prior 只在 0-2k 有益 (post-raw -3.20mm),
+            # 2k 之后一路有害 (+0.42mm)。退火让它做完引导就把决定权交还给
+            # matching evidence, 而不是全程硬压。
+            _n = int(getattr(self.range_cfg, "branch_prior_anneal_steps", 0) or 0)
+            _b = float(getattr(self.range_cfg, "branch_prior_beta", 1.0))
+            if _n > 0 and step is not None:
+                _b = _b * max(0.0, 1.0 - float(step) / float(_n))
+            _mode = str(getattr(self.range_cfg, "branch_prior_mode", "hard"))
             bp = lambda lg: apply_branch_prior(
                 lg, s1.global_idx, s1.local_idx, q1, s1.branch_active,
-                self.range_cfg.branch_q_min)
+                self.range_cfg.branch_q_min, mode=_mode, beta=_b)
+            self.last_bp_beta = _b
         else:
             q1, bp = None, None
+            self.last_bp_beta = 0.0
         depth1, sigma1, prob1, logits1, mode_idx1, logits1_raw = self._run_stage(
             0, feat1, K, E, s1.hypos, s1_stride, src_weights, meta=meta1,
             branch_prior=bp,
@@ -380,7 +416,10 @@ class UprMVSNet(nn.Module):
             depth_last.unsqueeze(1), size=images.shape[-2:], mode="bilinear", align_corners=False
         ).squeeze(1)
 
-        if self.spre_enabled:
+        # spre_logits 为 None 有两种情况: reliability_source != "spre", 或者
+        # prior_mode="off" 时 SPRE 头根本没参与前向。两种都不该产出 SPRE 监督 ——
+        # 否则 loss 侧会拿 None 去取 shape, 而且无先验对照里也不该有先验可靠度损失。
+        if self.spre_enabled and spre_logits is not None:
             stage_out["spre"] = {
                 "logits": spre_logits, "r": conf_used, "hw": tuple(feat1.shape[-2:]),
             }
@@ -389,4 +428,6 @@ class UprMVSNet(nn.Module):
         if vs is not None:
             stage_out["vis"] = vs
         stage_out["range_diag"] = range_diag
+        stage_out["range_diag"]["branch"] = {"bp_beta": float(getattr(self, "last_bp_beta", 0.0))}
+        Probe.log("out", "depth_full", depth_full)
         return {"depth_full": depth_full, **stage_out}

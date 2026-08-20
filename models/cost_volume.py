@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from models.probe import Probe
 from utils.geometry import homography_warp_features
 
 
@@ -103,6 +104,7 @@ class CostVolumeBuilder(nn.Module):
         # 的 RNG, 关掉时它只是不参与前向也不产生梯度。
         self.vis_head = VisibilityHead()
         self.use_vis = bool(visibility_weighting)
+        self.tag = "stage?"          # network.py 构造后写入, 只给探针用
         if not self.use_vis:
             # 关掉时冻结: 它拿不到梯度, 不冻结的话 DDP (find_unused_parameters=False)
             # 会因为"有梯度需求却没收到梯度"报错, 优化器也会白白为它建 state。
@@ -111,7 +113,21 @@ class CostVolumeBuilder(nn.Module):
         self.use_half = use_half
 
     def _sample_dtype(self, ref: torch.Tensor) -> torch.dtype:
-        return torch.float16 if (self.use_half and ref.is_cuda) else ref.dtype
+        """warp / 相关体采样用的精度。
+
+        以前这里硬返回 torch.float16, 于是即使外层 autocast 换成 bf16, 投影特征
+        仍会被转回 fp16 —— stage4 全分辨率那条溢出路径原封不动。现在跟随当前
+        autocast 的 dtype: bf16 下就是 bf16 (指数范围同 fp32), 关掉 AMP 时退回
+        输入精度。CUDA 的 grid_sample 对 bf16 有原生支持 (已实测)。
+        """
+        if not (self.use_half and ref.is_cuda):
+            return ref.dtype
+        try:
+            if torch.is_autocast_enabled():
+                return torch.get_autocast_dtype("cuda")
+        except Exception:
+            pass
+        return torch.float16
 
     def forward(
         self,
@@ -138,6 +154,7 @@ class CostVolumeBuilder(nn.Module):
         sample_dtype = self._sample_dtype(ref_feat)
         
         ref_p = self.proj(ref_feat).to(sample_dtype)
+        Probe.log(self.tag, "ref_p", ref_p)
 
         # 缓存的 src_weights 可能比当前 source 数短 (见 config 注释) —— 与其
         # 让它在中途 IndexError, 不如显式忽略。
@@ -151,6 +168,7 @@ class CostVolumeBuilder(nn.Module):
         cvs, vlogits = [], []
         for s in range(S):
             src_p = self.proj(src_feats[:, s]).to(sample_dtype)
+            Probe.log(self.tag, "src_p", src_p, src=s)
             warped = homography_warp_features(
                 src_p,
                 K_ref,
@@ -160,7 +178,9 @@ class CostVolumeBuilder(nn.Module):
                 depth_hypos,
                 feature_stride,
             )
+            Probe.log(self.tag, "warped", warped, src=s)
             cv_s = group_wise_correlation(ref_p, warped, self.num_groups).float()
+            Probe.log(self.tag, "cv_s", cv_s, src=s)
             cvs.append(cv_s)
             if self.use_vis:
                 vlogits.append(self.vis_head(cv_s))
@@ -191,4 +211,6 @@ class CostVolumeBuilder(nn.Module):
                 w = w * vis[s].unsqueeze(2)          # [B,1,1,H,W]
             agg = agg + cv_s * w
             weight_sum = weight_sum + w
-        return agg / weight_sum.clamp(min=1e-6)
+        cost = agg / weight_sum.clamp(min=1e-6)
+        Probe.log(self.tag, "cost", cost)
+        return cost

@@ -134,6 +134,13 @@ class PriorConfig:
     @property
     def target_wh(self) -> tuple[int, int]:
         return (self.target_w, self.target_h)
+    # on / off / affine —— 严格的先验消融开关, 见 models/network.py。
+    #   off:    整条先验通路失效 (prior/conf 置零 -> local 分支退化成 guard 网格,
+    #           meta 的 dist_prior/conf/edge 置中性, branch prior 与 branch loss
+    #           关闭, SPRE 头不参与前向因而不向共享 DINO/SVA 特征回传梯度)。
+    #           模块**仍然照常构造**, 所以 RNG 流与 on 完全一致, 是配对实验。
+    #   affine: 与 on 相同, 但读逆深度仿射标定过的缓存 (换 prior_cache_path)。
+    mode: str = "on"
 
 
 @dataclass(frozen=True)
@@ -160,6 +167,18 @@ class DepthRangeConfig:
     gate_hard_conf: float = 0.25
     branch_prior: bool = True        # stage1 logits 加 log q / log(1-q)
     branch_q_min: float = 0.02       # q 的下限, 防 log(0)
+    # hard: 分支内部 logsumexp 归一化后再乘 q —— 两分支的总概率质量被**硬指派**
+    #       成 (1-q, q), cost volume 学到的跨分支证据整段作废。实测干净配对下
+    #       它在 2k 之后全面有害 (post-raw +0.42mm, 65% 的翻转让结果更坏),
+    #       只有 0-2k 有益 (-3.20mm)。
+    # soft: 计数校正的**加性**偏置, 保留 matching evidence:
+    #       logits_g += beta*[log(1-q) - log(Dg)];  logits_l += beta*[log q - log(Dl)]
+    #       flat logits 下仍能复现 (1-q, q) 的分支质量, 但有信息的 logits 可以推翻它。
+    branch_prior_mode: str = "hard"
+    branch_prior_beta: float = 1.0
+    # >0 时 beta 从 branch_prior_beta 线性退到 0, 对应"前 1-2k 引导、之后交还给
+    # matching evidence"。0 = 不退火。
+    branch_prior_anneal_steps: int = 0
     # --- stage2 双模态 (P4) ---
     # 默认关闭。当前实现把 winner-centered 轴的"低深度一半"当成 winner 侧
     # (winner 在轴中心, 所以上半边全丢), 而且拼出来的是非均匀轴, 而 stage2 的
@@ -201,6 +220,20 @@ class DepthRangeConfig:
     # the old absolute 10.83mm floor now that gi grew with num_global 48 -> 32.
     range_min_gi: tuple[float, float, float] = (0.66, 0.20, 0.05)
     range_max_gi: float = 8.0
+    # --- 深度自适应窗宽 (默认关) ---
+    # 级联窗口是常数毫米的, 而三角测量的深度分辨率 ~ d^2/(f*B)。实测覆盖率随
+    # 深度单调下降 (stage4: q0 64% / q1 65% / q2 50% / q3 31%), 正是常数窗口在
+    # 远端不够用的样子。scale(d) = clamp((d/depth_min)^2, 1, max) 只放宽远端,
+    # 近端保持不变 —— 避免为了远端把近端一起变粗。
+    # d_ref 用 depth_min (cam.txt 里就有), 推理时可得, 不依赖 GT。
+    depth_adaptive_range: bool = False
+    depth_adaptive_max: float = 4.0
+    # 施加在哪几个转移上 (s1->s2, s2->s3, s3->s4)。默认后两级: s2->s3 的 floor
+    # 主导度最高 (78%), 而 stage4 的 winner_interval 就是 stage3 轴的 span/7 ——
+    # 在 s2->s3 上施加会经 winner_interval 自动传到最后一跳。
+    depth_adaptive_stages: tuple[bool, bool, bool] = (False, True, True)
+    # floor = 只缩放下限; both = 连 range_k*winner_interval 那一项也缩放
+    depth_adaptive_apply: str = "floor"
     edge_grad_rel: float = 0.03
     sigma_max_ratio: float = 0.15
     k_sigma: float = 3.0
@@ -371,6 +404,15 @@ class TrainConfig:
     warmup_steps: int = 1000
     grad_clip: float = 1.0
     amp: bool = True
+    # fp16 / bf16。A100 原生支持 bf16, 它的指数范围与 fp32 相同, 所以 stage4
+    # 全分辨率相关体那一类"数值有限但很大"的激活不会再溢出成 inf。代价是尾数
+    # 少 3 bit。bf16 下不需要 GradScaler (没有需要缩放的下溢问题)。
+    amp_dtype: str = "fp16"
+    # LR 余弦退火的 horizon。None = 跟随实际训练步数。
+    # 必须与"停止步数"解耦: --steps 12000 时若 horizon 也是 12000, 那 12k 的
+    # 筛选跑出来是"已经退火到底的模型", 既不能外推 30k 表现, 也不能直接 resume
+    # 续训 (lr 会从退火底部跳回高位)。筛选时应设成未来正式训练的 horizon。
+    lr_schedule_steps: int | None = None
     # 出现第一个非有限 loss/梯度就终止, 而不是让 GradScaler 一路跳步空转。
     # 关掉只该用于复现历史事故 —— 正常训练没有理由带着 nan 继续跑。
     nan_watchdog: bool = True

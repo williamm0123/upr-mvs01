@@ -385,7 +385,19 @@ class DTUMVSDataset(Dataset):
         else:
             corrupt_mask = np.zeros(depth_prior_crop.shape, dtype=bool)
 
+        scan_id, light_id, ref_id, _srcs = self.metas[idx]
         sample = {
+            # --- 样本身份 ---
+            # 看门狗报"某个样本坏了"是没法离线复现的。这几个字段加上 crop/scale
+            # 就能唯一确定一次 __getitem__ 的输出 (随机部分已由 _rng(idx) 固定)。
+            # _collate 对非张量值原样收进 list, 所以字符串也能安全过 DataLoader。
+            "sample_index": int(idx),
+            "scan": str(scan_id),
+            "ref_view": int(ref_id),
+            "light_idx": int(light_id),
+            "crop_xy": np.asarray([crop_x, crop_y], dtype=np.int32),
+            "crop_hw": np.asarray([crop_h, crop_w], dtype=np.int32),
+            "resize_scale": np.asarray(resize_scale, dtype=np.float32),
             "images": imgs,
             "intrinsics": np.stack(intrinsics, axis=0),       # [V, 3, 3]
             "extrinsics": np.stack(extrinsics, axis=0),       # [V, 4, 4]

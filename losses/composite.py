@@ -225,6 +225,18 @@ class MVSLoss:
                 if flip.any():
                     logs["stage1/bp_flip_help"] = float((e_post[flip] < e_raw[flip]).float().mean())
                     logs["stage1/bp_flip_hurt"] = float((e_post[flip] > e_raw[flip]).float().mean())
+                # GT 候选在 stage1 posterior 里排第几 —— 决定双模态值不值得做。
+                # config 注释写得很清楚: 只有它通常是 rank 2 时 top-2 才真的有用,
+                # 而 oor_recoverable (>=10% 峰值质量) 比 rank 弱得多。
+                p1_ = s1["prob"].detach().float()
+                gtb_r = (hypos - gt1.unsqueeze(1)).abs().argmin(dim=1, keepdim=True)
+                p_at = p1_.gather(1, gtb_r)
+                rank = (p1_ > p_at).sum(dim=1) + 1              # 1 = 已经是 winner
+                rv = rank[valid1].float()
+                if rv.numel():
+                    for r_ in (1, 2, 3, 5):
+                        logs[f"stage1/gt_rank_le{r_}"] = float((rv <= r_).float().mean())
+                    logs["stage1/gt_rank_p50"] = float(rv.quantile(0.5))
                 p_raw = F.softmax(lr_.detach().float(), dim=1)
                 gtb_ = (hypos - gt1.unsqueeze(1)).abs().argmin(dim=1, keepdim=True)
                 logs["stage1/bp_raw_p_at_gt"] = float(p_raw.gather(1, gtb_).squeeze(1)[valid1].mean())
@@ -336,7 +348,37 @@ class MVSLoss:
             with torch.no_grad():
                 for sname, st in rd.items():
                     for k_, v_ in st.items():
+                        if k_ == "maps":
+                            continue
                         logs[f"{sname}/{k_}"] = float(v_)
+
+        # ---- 窗口需求诊断: 要覆盖 GT, stage4 的 half 实际需要多宽 ----
+        # Phase 2 要决定 range_min_gi[2] 抬到多少。直接量"|GT - center| 的分位数"
+        # 比试错快得多: 需求分位数就是覆盖率曲线的逆函数。同时按 floor 是否 binding
+        # 拆开, 才知道抬 floor 到底能救多少 —— s3→s4 只有约 1/3 像素受 floor 支配。
+        if isinstance(rd, dict) and "stage4" in rd and isinstance(rd["stage4"].get("maps"), dict):
+            with torch.no_grad():
+                mp = rd["stage4"]["maps"]
+                hw4 = tuple(mp["half"].shape[-2:])
+                gt4 = self._to_stage_res(depth_gt_full, hw4)
+                v4 = self._to_stage_res(mask_full, hw4).bool() & (gt4 > 0)
+                if v4.any():
+                    need = (gt4 - mp["center"]).abs()          # 覆盖 GT 所需的 half
+                    have = mp["half"]
+                    fb = mp["half_raw"] < mp["floor"]           # 该像素由 floor 决定
+                    nv = need[v4]
+                    for q_, nm in ((0.5, "p50"), (0.75, "p75"), (0.9, "p90"), (0.95, "p95")):
+                        logs[f"stage4/need_half_{nm}"] = float(nv.float().quantile(q_))
+                    logs["stage4/have_half_mean"] = float(have[v4].mean())
+                    # 覆盖率按 floor 是否 binding 拆开
+                    cov = (need <= have)
+                    for msk, nm in ((fb & v4, "floorbound"), ((~fb) & v4, "free")):
+                        if msk.any():
+                            logs[f"stage4/cover_{nm}"] = float(cov[msk].float().mean())
+                            logs[f"stage4/frac_{nm}"] = float(msk[v4].float().mean())
+                    # 若把 half 乘 k, 覆盖率会变成多少 —— 直接给出交换曲线
+                    for k_ in (1.5, 2.0, 3.0):
+                        logs[f"stage4/cover_x{k_:g}"] = float((need <= have * k_)[v4].float().mean())
 
         # ------------------------- SPRE reliability head ------------------------- #
         if "spre" in outputs:

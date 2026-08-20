@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import math
+
 import torch
 import torch.nn.functional as F
 
@@ -348,8 +350,19 @@ def refine_range_from_posterior(
             1.0 + config.range_entropy_a * entropy + config.range_edge_b * edge
         )
         gi = global_interval.view(-1, 1, 1)
+        # 深度自适应: 三角测量的深度分辨率 ~ d^2/(f*B), 而窗宽是常数毫米的, 于是
+        # 覆盖率随深度单调下降。scale 只放宽远端 (近端恒为 1), 上限由
+        # depth_adaptive_max 封住, 避免远端窗口大到把分辨率全吃掉。
+        # 参考深度用 depth_min —— 推理时可得, 不依赖 GT。
+        ascale = 1.0
+        if (config.depth_adaptive_range
+                and config.depth_adaptive_stages[stage_idx]):
+            dref = depth_min.view(-1, 1, 1).clamp_min(1e-3)
+            ascale = ((center.detach() / dref) ** 2).clamp(1.0, config.depth_adaptive_max)
+            if str(config.depth_adaptive_apply).lower() == "both":
+                half = half * ascale
         half_raw = half
-        floor = config.range_min_gi[stage_idx] * gi
+        floor = config.range_min_gi[stage_idx] * gi * ascale
         ceil = config.range_max_gi * gi
         half = torch.maximum(half_raw, floor)
         half = torch.minimum(half, ceil)
@@ -365,6 +378,11 @@ def refine_range_from_posterior(
         # 的比例高 = floor 说了算 = 窗宽由 global_interval 决定 (于是改 num_global
         # 会整体缩放级联); 反之则由 winner_interval 决定。
         stats = {
+            # 逐像素的 half_raw / floor / center 交给 loss 侧按 GT 深度分桶 ——
+            # 这里没有 GT, 而"窗口该开多宽"只有对着 GT 才能回答。
+            "maps": {"half_raw": half_raw, "half": half,
+                     "floor": floor.expand_as(half_raw) if floor.shape != half_raw.shape else floor,
+                     "center": center.detach()},
             "half_raw_mm": float(half_raw.mean()),
             "half_mm": float(half.mean()),
             "floor_binding": float((half_raw < floor).float().mean()),
@@ -373,6 +391,7 @@ def refine_range_from_posterior(
             "wint_p10": float(winner_interval.float().quantile(0.10)),
             "wint_p50": float(winner_interval.float().quantile(0.50)),
             "wint_p90": float(winner_interval.float().quantile(0.90)),
+            "adapt_scale": float(ascale.mean()) if torch.is_tensor(ascale) else 1.0,
         }
     return hypos, stats
 
@@ -398,9 +417,13 @@ def second_mode(
     idx = torch.arange(D, device=prob.device).view(1, D, 1, 1)
     far = (idx - mode_idx).abs() > max(int(round(guard)), 1)
     masked = torch.where(far, prob, torch.zeros_like(prob))
-    mass = masked.sum(dim=1)
     j = masked.argmax(dim=1, keepdim=True)
     depth = hypos.gather(1, j).squeeze(1)
+    # 次峰**邻域**的质量, 而不是 winner 邻域之外的总质量: 平坦分布的"其余总质量"
+    # 很容易超过任何阈值, 拿它当"存在第二个模态"的判据会一路假阳。
+    g = max(int(round(guard)), 1)
+    near_j = (idx - j).abs() <= g
+    mass = torch.where(near_j & far, prob, torch.zeros_like(prob)).sum(dim=1)
     return depth, mass
 
 
@@ -452,6 +475,8 @@ def apply_branch_prior(
     q: torch.Tensor,
     branch_active: torch.Tensor,
     q_min: float,
+    mode: str = "hard",
+    beta: float = 1.0,
 ) -> torch.Tensor:
     """把 ``P(d) = q P(d|local) + (1-q) P(d|global)`` 正确地加到 stage-1 logits 上。
 
@@ -472,8 +497,19 @@ def apply_branch_prior(
     qc = q.clamp(q_min, 1.0 - q_min).unsqueeze(1)                  # [B,1,H,W]
     lg = logits.gather(1, global_idx)
     ll = logits.gather(1, local_idx)
-    zg = lg - torch.logsumexp(lg.float(), dim=1, keepdim=True).to(lg.dtype) + (1.0 - qc).log().to(lg.dtype)
-    zl = ll - torch.logsumexp(ll.float(), dim=1, keepdim=True).to(ll.dtype) + qc.log().to(ll.dtype)
+    if str(mode).lower() == "soft":
+        # 计数校正的加性偏置, **不**做分支内归一化 —— 于是 cost volume 的跨分支
+        # 证据被保留下来, 先验只是把天平推一下。flat logits 下这个偏置仍能还原出
+        # (1-q, q) 的分支质量 (log Dg / log Dl 就是为此), 但有信息的 logits 可以
+        # 推翻它。beta=0 等价于完全不加先验。
+        Dg = float(global_idx.shape[1])
+        Dl = float(local_idx.shape[1])
+        bg = (beta * ((1.0 - qc).log() - math.log(Dg))).to(lg.dtype)
+        bl = (beta * (qc.log() - math.log(Dl))).to(ll.dtype)
+        zg, zl = lg + bg, ll + bl
+    else:
+        zg = lg - torch.logsumexp(lg.float(), dim=1, keepdim=True).to(lg.dtype) + (1.0 - qc).log().to(lg.dtype)
+        zl = ll - torch.logsumexp(ll.float(), dim=1, keepdim=True).to(ll.dtype) + qc.log().to(ll.dtype)
     out = torch.empty_like(logits)
     out.scatter_(1, global_idx, zg)
     out.scatter_(1, local_idx, zl)

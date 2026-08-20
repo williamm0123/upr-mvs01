@@ -21,8 +21,10 @@ from pathlib import Path
 import numpy as np
 from tensorboard.backend.event_processing import event_accumulator as ea
 
-# 8.16 / 7.29 两次历史实验在同一窗口的成绩，作为固定参照。
-HIST = {"7.29 (b69ee46)": 2.7688, "8.16 (c8057bc)": 3.0111}
+# 历史 30k run 的窗口均值曾经放在这里作参照, 已删除: 它们的余弦退火 horizon 是
+# 30000, 而 12k 筛选 arm 的 horizon 是 12000 —— 同一步数窗口里 lr 差一个数量级
+# (step 10000: 2.34e-4 vs 1.59e-5), 12k arm 是已退火的模型。跨 horizon 横比会
+# 系统性偏袒短 horizon 的 arm。只有 lr_schedule_steps 完全一致才可比。
 
 DIAGS = [
     ("train/diag_grad_norm_unclipped", "grad_norm"),
@@ -100,8 +102,6 @@ def main() -> None:
                                                ("  ~待定" if dv <= -0.05 else ""))
         print(f"{name:<16}{v:>9.4f}{dv:>+10.4f}{a:>9.4f}{t:>10.4f}{n:>6d}{last:>8d}{mark}")
     print("-" * len(hdr))
-    for k, v in HIST.items():
-        print(f"{k:<16}{v:>9.4f}{v - ref_v:>+10.4f}    (历史, 同窗口)")
 
     print(f"\n关键诊断 (同窗口均值)\n")
     names = list(data)
@@ -116,8 +116,10 @@ def main() -> None:
     print("  bp_post < bp_raw 才说明分支先验有正贡献; 反之应保持 branch_prior=off")
     print("  s2/s3_floor 高 = 窗宽由 range_min_gi*global_interval 决定 (改 num_global 会整体缩放)")
     print("  amp_scale 一路下滑 / nonfin_frac 非 0 = 溢出在变频繁, 是发散的提前量")
+    print("  need_half90 > have_half = 窗口不够宽; cover_x2 = 窗宽翻倍后的覆盖率")
+    print("  gt_rank<=2 高 = 正确候选常在 top-2, 双模态才值得做")
 
-    print(f"\n深度分桶 val abs_err (q0 近 -> q3 远)\n")
+    print(f"\n深度分桶: abs_err / stage4 覆盖率 / 覆盖条件下的误差 (q0 近 -> q3 远)\n")
     print(f"{'':<16}" + "".join(f"{n[:11]:>12}" for n in names))
     for b in range(4):
         vals = [window_mean(data[n].get(f"val/q{b}_abs_err"), args.lo, args.hi)[0] for n in names]
@@ -131,7 +133,17 @@ def main() -> None:
             continue
         print(f"{'q'+str(b)+'_s4_in_rng':<16}" + "".join(
             (f"{x:>12.4f}" if np.isfinite(x) else f"{'-':>12}") for x in vals))
-    print("\n  远端桶 (q3) 明显更差 = 值得做深度自适应窗宽; 四桶接近 = 瓶颈不在这里\n")
+    # 覆盖率和精度必须分开看: 抬宽窗口一定同时改变两者, 只看总 abs_err 分不出
+    # 是覆盖变好还是精度变差。
+    for suf, lbl in (("_abs_err_s4_in", "_err_in"), ("_abs_err_s4_out", "_err_out")):
+        for b in range(4):
+            vals = [window_mean(data[n].get(f"val/q{b}{suf}"), args.lo, args.hi)[0] for n in names]
+            if all(not np.isfinite(x) for x in vals):
+                continue
+            print(f"{'q' + str(b) + lbl:<16}" + "".join(
+                (f"{x:>12.4f}" if np.isfinite(x) else f"{'-':>12}") for x in vals))
+    print("\n  远端桶 (q3) 明显更差 = 值得做深度自适应窗宽; 四桶接近 = 瓶颈不在这里")
+    print("  err_in 基本不变而 in_rng 上升 = 抬宽窗口是净赚; err_in 同时变差 = 在拿精度换覆盖\n")
 
 
 if __name__ == "__main__":

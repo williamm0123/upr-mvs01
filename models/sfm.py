@@ -295,7 +295,135 @@ def metric_scale_from_sparse(depth, sparse_depth, sparse_valid=None, min_pairs: 
     return scale, {"num_pairs": num_pairs, "valid": True, "scale": scale}
 
 
-def calibrate_depth_to_metric(sample, depth, ref_idx: int = 0, config: SfMConfig | None = None):
+def metric_affine_from_sparse(depth, sparse_depth, sparse_valid=None, *,
+                              min_pairs: int = 200, holdout_frac: float = 0.3,
+                              block: int = 64, trim_mad: float = 3.0, iters: int = 3,
+                              depth_min: float | None = None, depth_max: float | None = None):
+    """在**逆深度域**拟合 ``1/z_metric = a * (1/z_prior) + b``。
+
+    为什么不是纯缩放: ``metric_scale_from_sparse`` 只拟合一个乘性 scale, 依据是
+    "VGGT depth is metric-consistent up to a single global scale"。实测这条假设
+    不完全成立 —— 先验误差对 GT 深度呈 U 形, 最低点在 ~620mm, 往两边发散, 而用
+    GT 做的 oracle 逆深度仿射能把 log-log 斜率从 1.99 压到 0.70、最远档误差从
+    9.62mm 降到 4.55mm。这正是"输出本质是仿射-in-逆深度、却只拟合了乘性 scale"
+    留下的残差形状。
+
+    守卫 (任一不满足就退回 scale-only, 由调用方处理):
+      * ``a > 0``, 且全物理深度范围内 ``a*rho + b > 0`` —— 否则映射会翻转或产生
+        负深度;
+      * 逆深度跨度和条件数足够 —— 稀疏点挤在一个深度上时 b 无法辨识;
+      * held-out 残差必须优于 scale-only —— 拟合点上的改善不算数。
+
+    fit/held-out 按**空间块**划分而不是随机像素: SfM 点在空间上高度聚集, 随机
+    划分会让同一个 track 的邻域同时进两边, held-out 就失去意义。
+
+    返回 ``(ok, params, info)``；``params = (a, b)``, ``info`` 含两侧的残差分位数。
+    """
+    depth = np.asarray(depth, np.float32)
+    sparse_depth = np.asarray(sparse_depth, np.float32)
+    if sparse_valid is None:
+        sparse_valid = sparse_depth > 0
+    m = (np.asarray(sparse_valid, bool)
+         & np.isfinite(depth) & (depth > 0)
+         & np.isfinite(sparse_depth) & (sparse_depth > 0))
+    info = {"num_pairs": int(m.sum()), "mode": "scale", "reason": ""}
+    if int(m.sum()) < min_pairs:
+        info["reason"] = f"点数不足 ({int(m.sum())} < {min_pairs})"
+        return False, (1.0, 0.0), info
+
+    ys, xs = np.nonzero(m)
+    rho_p = 1.0 / depth[m].astype(np.float64)          # 先验逆深度
+    rho_t = 1.0 / sparse_depth[m].astype(np.float64)   # 目标逆深度
+
+    span = float(rho_p.max() - rho_p.min())
+    rel_span = span / max(float(np.median(rho_p)), 1e-12)
+    info["inv_span_rel"] = rel_span
+    if rel_span < 0.05:
+        info["reason"] = f"逆深度跨度太小 ({rel_span:.4f}) —— b 无法辨识"
+        return False, (1.0, 0.0), info
+
+    # 按空间块分 fit / held-out
+    bid = (ys // block).astype(np.int64) * 100003 + (xs // block).astype(np.int64)
+    ub = np.unique(bid)
+    if ub.size < 4:
+        info["reason"] = f"空间块太少 ({ub.size})"
+        return False, (1.0, 0.0), info
+    rs = np.random.default_rng(0)
+    ho = set(rs.choice(ub, size=max(1, int(round(ub.size * holdout_frac))), replace=False).tolist())
+    is_ho = np.array([b in ho for b in bid])
+    fit, hold = ~is_ho, is_ho
+    info["blocks"] = int(ub.size)
+    info["n_fit"], info["n_hold"] = int(fit.sum()), int(hold.sum())
+    if info["n_fit"] < min_pairs // 2 or info["n_hold"] < 20:
+        info["reason"] = "分块后任一侧点数不足"
+        return False, (1.0, 0.0), info
+
+    # 迭代裁剪的最小二乘
+    x, y = rho_p[fit], rho_t[fit]
+    keep = np.ones_like(x, dtype=bool)
+    a, b = 1.0, 0.0
+    for _ in range(iters):
+        A = np.stack([x[keep], np.ones(int(keep.sum()))], axis=1)
+        cond = float(np.linalg.cond(A))
+        if not np.isfinite(cond) or cond > 1e8:
+            info["reason"] = f"条件数过大 ({cond:.3g})"
+            return False, (1.0, 0.0), info
+        a, b = np.linalg.lstsq(A, y[keep], rcond=None)[0]
+        r = y - (a * x + b)
+        med = float(np.median(r[keep]))
+        mad = float(np.median(np.abs(r[keep] - med)))
+        sig = max(1.4826 * mad, 1e-12)
+        nk = np.abs(r - med) <= trim_mad * sig
+        if int(nk.sum()) < min_pairs // 2 or int(nk.sum()) == int(keep.sum()):
+            break
+        keep = nk
+    info["cond"] = cond
+    info["a"], info["b"] = float(a), float(b)
+
+    if a <= 0:
+        info["reason"] = f"a <= 0 ({a:.4g}) —— 映射会翻转"
+        return False, (1.0, 0.0), info
+    # 全物理范围内必须映到正深度: rho in [1/dmax, 1/dmin], a>0 时最小值在 1/dmax
+    if depth_min and depth_max:
+        lo_rho = 1.0 / float(depth_max)
+        if a * lo_rho + b <= 1e-9:
+            info["reason"] = f"远端会映到非正深度 (a/dmax + b = {a * lo_rho + b:.3g})"
+            return False, (1.0, 0.0), info
+
+    # held-out 上跟 scale-only 比
+    scale = float(np.median(sparse_depth[m] / depth[m]))
+    z_aff = 1.0 / np.maximum(a * rho_p + b, 1e-9)
+    z_sca = depth[m].astype(np.float64) * scale
+    tgt = sparse_depth[m].astype(np.float64)
+    for nm, sel in (("fit", fit), ("hold", hold)):
+        for lbl, z in (("affine", z_aff), ("scale", z_sca)):
+            e = np.abs(z[sel] - tgt[sel])
+            info[f"{nm}_{lbl}_median"] = float(np.median(e))
+            info[f"{nm}_{lbl}_mean"] = float(e.mean())
+            info[f"{nm}_{lbl}_p95"] = float(np.quantile(e, 0.95))
+    better = info["hold_affine_median"] < info["hold_scale_median"]
+    info["scale_only"] = scale
+    if not better:
+        info["reason"] = (f"held-out 未改善 (affine {info['hold_affine_median']:.3f} "
+                          f"vs scale {info['hold_scale_median']:.3f})")
+        return False, (1.0, 0.0), info
+    info["mode"] = "affine"
+    return True, (float(a), float(b)), info
+
+
+def apply_affine_inverse(depth, a: float, b: float):
+    """``z -> 1 / (a/z + b)``, 非有限或非正的结果置 0 (下游按无效处理)。"""
+    d = np.asarray(depth, np.float32)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        rho = np.where(d > 0, 1.0 / d.astype(np.float64), np.nan)
+        out = 1.0 / (a * rho + b)
+    out = np.where(np.isfinite(out) & (out > 0), out, 0.0)
+    return out.astype(np.float32)
+
+
+def calibrate_depth_to_metric(sample, depth, ref_idx: int = 0, config: SfMConfig | None = None,
+                              mode: str = "scale", depth_min: float | None = None,
+                              depth_max: float | None = None):
     """Rescale ``depth`` to metric using the sample's SfM sparse depth.
 
     Prefers ``sample["sfm_depth"]`` (precomputed/cropped by the dataset) and only
@@ -313,4 +441,15 @@ def calibrate_depth_to_metric(sample, depth, ref_idx: int = 0, config: SfMConfig
 
     scale, scale_info = metric_scale_from_sparse(depth, sfm_out["sparse_depth"], sfm_out["valid_mask"])
     sfm_out["info"]["scale"] = scale_info
+
+    # mode="affine": 先尝试逆深度域 scale+shift, 任一守卫不过就静默退回 scale-only。
+    # 默认仍是 "scale", 所以不显式打开时行为与旧缓存完全一致。
+    if str(mode).lower() == "affine":
+        ok, (a, b), aff_info = metric_affine_from_sparse(
+            depth, sfm_out["sparse_depth"], sfm_out["valid_mask"],
+            depth_min=depth_min, depth_max=depth_max)
+        sfm_out["info"]["affine"] = aff_info
+        if ok:
+            return apply_affine_inverse(depth, a, b), scale, sfm_out
+
     return (np.asarray(depth, np.float32) * scale).astype(np.float32), scale, sfm_out

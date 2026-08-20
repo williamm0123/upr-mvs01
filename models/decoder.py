@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from models.depth_range import mode_centered_regression
+from models.probe import Probe
 
 
 class ConvGN3d(nn.Module):
@@ -67,6 +68,7 @@ class DepthDecoder(nn.Module):
         super().__init__()
         self.unet = CostVolumeUNet(in_channels=in_channels, base=base, depth=depth)
         self.mode_window = mode_window
+        self.tag = "stage?"          # network.py 构造后写入, 只给探针用
 
     def forward(
         self,
@@ -74,7 +76,9 @@ class DepthDecoder(nn.Module):
         depth_hypos: torch.Tensor,
         branch_prior=None,
     ) -> tuple[torch.Tensor, ...]:
+        Probe.log(self.tag, "unet_in", cost_volume)
         logits_raw = self.unet(cost_volume)
+        Probe.log(self.tag, "logits_raw", logits_raw)
         # 分支先验: P(d) = q P(d|local) + (1-q) P(d|global)。必须在各分支内部
         # 先归一化再乘先验 —— 见 depth_range.apply_branch_prior 的推导。
         # logits_raw 是加先验之前的纯 matching evidence, 原样返回给 loss 做
@@ -84,10 +88,13 @@ class DepthDecoder(nn.Module):
         logits = branch_prior(logits_raw) if branch_prior is not None else logits_raw
         # max-shift keeps softmax finite under AMP; log_softmax downstream is
         # shift-invariant so the loss sees the same distribution.
+        Probe.log(self.tag, "logits_bp", logits)
         logits = logits - logits.amax(dim=1, keepdim=True).detach()
         prob = F.softmax(logits.float(), dim=1)
+        Probe.log(self.tag, "prob", prob)
         # Mode-centered regression instead of a global soft-argmin: over a
         # bimodal posterior (wrong local peak + correct global peak) the global
         # expectation lands between the peaks, on no real surface.
         depth, sigma, mode_idx = mode_centered_regression(prob, depth_hypos.float(), self.mode_window)
+        Probe.log(self.tag, "depth", depth)
         return depth, sigma, prob, logits, mode_idx, logits_raw

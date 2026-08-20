@@ -99,13 +99,16 @@ def _use_ddp(args, world_size: int) -> bool:
 def _lr_at(cfg, step: int, max_steps: int) -> float:
     """Linear warmup then cosine decay to 5% of the base LR.
 
-    ``max_steps`` is the *effective* horizon (--steps override included), so the
-    schedule always anneals within the steps that will actually run.
+    退火 horizon 默认跟随实际训练步数, 但可以用 cfg.train.lr_schedule_steps
+    (--lr-schedule-steps) 解耦。12k 的筛选 arm 必须跑在 30k 的 horizon 上,
+    否则它是"退火到底的 12k 模型", 跟 30k run 在同一步数窗口的 lr 差一个数量级,
+    既不能横比也不能无跳变续训。
     """
     warm = cfg.train.warmup_steps
     if step < warm:
         return cfg.train.lr * (step + 1) / max(warm, 1)
-    prog = (step - warm) / max(max_steps - warm, 1)
+    horizon = getattr(cfg.train, "lr_schedule_steps", None) or max_steps
+    prog = (step - warm) / max(horizon - warm, 1)
     return cfg.train.lr * max(0.05, 0.5 * (1.0 + math.cos(math.pi * min(prog, 1.0))))
 
 
@@ -485,6 +488,10 @@ def main_worker(
         train_overrides["log_interval"] = args.log_interval
     if args.amp is not None:
         train_overrides["amp"] = args.amp == "on"
+    if args.amp_dtype is not None:
+        train_overrides["amp_dtype"] = args.amp_dtype
+    if args.lr_schedule_steps is not None:
+        train_overrides["lr_schedule_steps"] = args.lr_schedule_steps
     if args.nan_watchdog is not None:
         train_overrides["nan_watchdog"] = args.nan_watchdog == "on"
     if train_overrides:
@@ -495,7 +502,32 @@ def main_worker(
         cfg = replace(cfg, train=replace(cfg.train, seed=args.seed))
 
     # --- 消融开关 -> 配置 ---
+    if args.prior is not None:
+        cfg = replace(cfg, prior=replace(cfg.prior, mode=args.prior))
+    if args.prior_cache is not None:
+        cfg = replace(cfg, paths=replace(cfg.paths, prior_cache_path=Path(args.prior_cache)))
+
     dr_over = {}
+    if args.range_min_gi is not None:
+        v = tuple(float(x) for x in args.range_min_gi.split(","))
+        if len(v) != 3:
+            raise SystemExit("--range-min-gi 需要三个值 (s1->s2, s2->s3, s3->s4)")
+        dr_over["range_min_gi"] = v
+    if args.depth_adaptive is not None:
+        dr_over["depth_adaptive_range"] = args.depth_adaptive == "on"
+    if args.depth_adaptive_max is not None:
+        dr_over["depth_adaptive_max"] = args.depth_adaptive_max
+    if args.depth_adaptive_apply is not None:
+        dr_over["depth_adaptive_apply"] = args.depth_adaptive_apply
+    if args.depth_adaptive_stages is not None:
+        v = tuple(x.strip().lower() == "on" for x in args.depth_adaptive_stages.split(","))
+        if len(v) != 3:
+            raise SystemExit("--depth-adaptive-stages 需要三个 on/off")
+        dr_over["depth_adaptive_stages"] = v
+    if args.branch_prior_mode is not None:
+        dr_over["branch_prior_mode"] = args.branch_prior_mode
+    if args.branch_prior_anneal_steps is not None:
+        dr_over["branch_prior_anneal_steps"] = args.branch_prior_anneal_steps
     if args.num_global is not None:
         dr_over["num_global"] = args.num_global
     if args.num_local is not None:
@@ -514,6 +546,10 @@ def main_worker(
         cv_over["num_depths_stage1"] = nd1
     if args.visibility is not None:
         cv_over["visibility_weighting"] = args.visibility == "on"
+    if args.warp_channels_stage4 is not None:
+        cv_over["warp_channels_stage4"] = args.warp_channels_stage4
+    if args.num_groups is not None:
+        cv_over["num_groups"] = args.num_groups
     if cv_over:
         cfg = replace(cfg, cost_volume=replace(cfg.cost_volume, **cv_over))
     if args.stage1_weight is not None:
@@ -624,7 +660,9 @@ def main_worker(
         lr=cfg.train.lr, weight_decay=cfg.train.weight_decay,
     )
     use_amp = cfg.train.amp and device.type == "cuda"
-    scaler = torch.amp.GradScaler(device.type, enabled=use_amp)
+    # bf16 不需要 loss scaling: 它的指数范围跟 fp32 一样, 梯度不会下溢到 0,
+    # 也就没有"放大 -> 检查 inf -> 跳过"这一整套。开着反而多一层跳步逻辑。
+    scaler = torch.amp.GradScaler(device.type, enabled=use_amp and _amp_dtype(cfg) is torch.float16)
 
     run_name = args.name + ("_smoke" if args.smoke else "")
     logger = TrainLogger(run_name, enabled=is_main, cfg=cfg, scaler=scaler)
@@ -724,13 +762,43 @@ def _finite_stat(t: torch.Tensor) -> tuple[float, float]:
 
 
 def _sample_ids(batch: dict) -> str:
-    """出事的是哪几个样本 —— 离线复现只能靠它定位。"""
-    out = []
-    for k in ("scan", "ref_view", "light_idx"):
+    """出事的是哪几个样本 —— 离线复现只能靠它定位。
+
+    逐样本列出, 因为 stage4 的失效是 sample-conditioned 的: 同一个 batch 里
+    往往只有一个样本坏掉 (finite_frac 恰好 0.5)。配上 data/dtu.py 的 _rng(idx),
+    这几个字段足以离线重放出完全相同的那一个样本。
+    """
+    n = 0
+    for k in ("sample_index", "scan"):
         v = batch.get(k)
         if v is not None:
-            out.append(f"{k}={[str(x) for x in v] if isinstance(v, list) else v}")
-    return "  ".join(out) if out else "<batch 内没有 scan/ref_view/light_idx>"
+            n = max(n, len(v) if isinstance(v, (list, tuple)) else int(v.shape[0]))
+    if not n:
+        return "<batch 内没有样本身份字段 —— data/dtu.py 是否是旧版?>"
+
+    def get(k, i):
+        v = batch.get(k)
+        if v is None:
+            return None
+        try:
+            x = v[i]
+        except Exception:
+            return None
+        if hasattr(x, "tolist"):
+            x = x.tolist()
+        return x
+
+    rows = []
+    for i in range(n):
+        parts = [f"[{i}]"]
+        for k, fmt in (("scan", "{}"), ("ref_view", "view={}"), ("light_idx", "light={}"),
+                       ("sample_index", "idx={}"), ("crop_hw", "crop={}"),
+                       ("crop_xy", "at={}"), ("resize_scale", "scale={}")):
+            x = get(k, i)
+            if x is not None:
+                parts.append(fmt.format(x))
+        rows.append("  ".join(parts))
+    return "\n                ".join(rows)
 
 
 def _nonfinite_report(where, step, lr, scaler, batch, probes, extra_lines=()) -> str:
@@ -766,7 +834,7 @@ def _train_step(model, loss_fn, optimizer, scaler, batch, cfg, device, step, use
                 lr: float = float("nan")):
     watch = getattr(cfg.train, "nan_watchdog", True)
     optimizer.zero_grad(set_to_none=True)
-    with torch.autocast(device_type=device.type, enabled=use_amp):
+    with torch.autocast(device_type=device.type, dtype=_amp_dtype(cfg), enabled=use_amp):
         outputs = model(batch, step=step)
         loss, logs = loss_fn(outputs, batch, step=step)
 
@@ -780,10 +848,31 @@ def _train_step(model, loss_fn, optimizer, scaler, batch, cfg, device, step, use
             probes.update({f"out.{k}": v for k, v in outputs.items() if isinstance(v, torch.Tensor)})
             probes.update({f"in.{k}": v for k, v in batch.items()
                            if isinstance(v, torch.Tensor) and v.is_floating_point()})
+            # 同一个 batch 重放一次带探针的前向, 把链上第一处坏张量一并写进报告。
+            # 常关探针 + 出事重放, 而不是常开: 常开要在每步对二十个张量做逐样本
+            # 归约, 全分辨率下不划算。模型只有 GroupNorm、没有 dropout, 加上
+            # 逐样本播种, 重放是确定性的。
+            chain = ["", "  前向链 (重放, 逐样本 finite_frac / max|x|):"]
+            try:
+                from models.probe import Probe
+                with Probe.session():
+                    with torch.no_grad(), torch.autocast(device_type=device.type,
+                                                         dtype=_amp_dtype(cfg), enabled=use_amp):
+                        model(batch, step=step)
+                fb = Probe.first_bad()
+                if fb is not None:
+                    chain.append(f"  >> 第一处非有限: {fb['stage']}.{fb['name']}"
+                                 + (f"[s{fb['src']}]" if fb["src"] is not None else "")
+                                 + f"  dtype={fb['dtype']}")
+                else:
+                    chain.append("  >> 重放时全部有限 (非确定性来源? 检查 cudnn.benchmark)")
+                chain.append(Probe.format())
+            except Exception as exc:                       # 诊断失败不能盖住原始事故
+                chain.append(f"  (探针重放失败: {exc})")
             raise NonFiniteError(_nonfinite_report(
                 "forward — loss 或 loss 分量", step, lr, scaler, batch, probes,
                 extra_lines=[f"  非有限的 loss 分量: {bad}" if bad
-                             else "  loss 本身非有限 (各分量倒都是有限的)"],
+                             else "  loss 本身非有限 (各分量倒都是有限的)"] + chain,
             ))
 
     scaler.scale(loss).backward()
@@ -880,7 +969,7 @@ def _fmt_val(m: dict) -> str:
     return main + (f" | depth-buckets {q}" if q else "")
 
 
-def _run_validation(model, loader, device, use_amp, is_ddp) -> dict[str, float]:
+def _run_validation(model, loader, device, use_amp, is_ddp, amp_dtype=None) -> dict[str, float]:
     """Masked depth metrics over the val split.
 
     All ranks run their DistributedSampler shard and the pixel-weighted sums are
@@ -897,12 +986,17 @@ def _run_validation(model, loader, device, use_amp, is_ddp) -> dict[str, float]:
     #   sq: [in_range_sum, n]                          每桶 x stage(2,3,4)
     bq = torch.zeros(4, 4, device=device, dtype=torch.float64)
     sq = torch.zeros(4, 3, 2, device=device, dtype=torch.float64)
+    # 按桶 x {stage4 窗口内, 窗口外} 拆开的误差: [err_sum, n]。
+    # 这是把"覆盖率"和"精度"分开的唯一办法 —— 抬宽窗口一定同时改变两者,
+    # 只看总 abs_err 分不出是覆盖变好还是精度变差。
+    cq = torch.zeros(4, 2, 2, device=device, dtype=torch.float64)
     # model.eval() 不关梯度: 没有 no_grad 的话每个 batch 的激活都被 stats 里的
     # 累加项通过计算图引用着, 整个 val 集 (882 样本) 的图会一直挂到循环结束。
     for batch in loader:
         batch = {k: (v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v)
                  for k, v in batch.items()}
-        with torch.no_grad(), torch.autocast(device_type=device.type, enabled=use_amp):
+        with torch.no_grad(), torch.autocast(device_type=device.type,
+                                             dtype=amp_dtype or torch.float16, enabled=use_amp):
             outputs = model(batch)
         pred = outputs["depth_full"].float()
         gt = batch["depth_gt"].float()
@@ -947,10 +1041,21 @@ def _run_validation(model, loader, device, use_amp, is_ddp) -> dict[str, float]:
                     if mb.any():
                         sq[b, si, 0] += ir[mb].sum()
                         sq[b, si, 1] += mb.sum()
+                # stage4 是 stride 1, 与 depth_full 同分辨率, 可以直接把误差按
+                # 窗口内/外拆开
+                if nm == "stage4" and tuple(hy.shape[-2:]) == tuple(pred.shape[-2:]):
+                    e_ = (pred - gt).abs()
+                    for b in range(4):
+                        for j, sel in enumerate((ir, ~ir)):
+                            mb = m & (bidx == b) & sel
+                            if mb.any():
+                                cq[b, j, 0] += e_[mb].sum()
+                                cq[b, j, 1] += mb.sum()
     if is_ddp:
         dist.all_reduce(stats)
         dist.all_reduce(bq)
         dist.all_reduce(sq)
+        dist.all_reduce(cq)
     model.train()
     if stats[1].item() == 0:
         raise RuntimeError(
@@ -971,6 +1076,10 @@ def _run_validation(model, loader, device, use_amp, is_ddp) -> dict[str, float]:
             ns = sq[b, si, 1]
             if ns > 0:
                 extra[f"q{b}_{nm}_in_range"] = float(sq[b, si, 0] / ns)
+        for j, nm in enumerate(("in", "out")):
+            nc = cq[b, j, 1]
+            if nc > 0:
+                extra[f"q{b}_abs_err_s4_{nm}"] = float(cq[b, j, 0] / nc)
     return {
         **extra,
         "abs_err": float(stats[0] / n),
@@ -1001,6 +1110,11 @@ class _EpochShuffleSampler(torch.utils.data.Sampler):
 
     def __len__(self) -> int:
         return len(self.order)
+
+
+def _amp_dtype(cfg) -> torch.dtype:
+    return torch.bfloat16 if str(getattr(cfg.train, "amp_dtype", "fp16")).lower() == "bf16" \
+        else torch.float16
 
 
 def _seed_everything(seed: int, rank: int, deterministic: bool = False) -> None:
@@ -1106,6 +1220,19 @@ def _arch_fingerprint(cfg) -> dict:
         "batch_size": cfg.train.batch_size,
         "num_views": cfg.train.num_views,
         "seed": cfg.train.seed,
+        "amp_dtype": getattr(cfg.train, "amp_dtype", "fp16"),
+        "prior_mode": getattr(cfg.prior, "mode", "on"),
+        "prior_cache_path": str(cfg.paths.prior_cache_path),
+        "depth_adaptive": [cfg.depth_range.depth_adaptive_range,
+                           cfg.depth_range.depth_adaptive_max,
+                           cfg.depth_range.depth_adaptive_apply,
+                           list(cfg.depth_range.depth_adaptive_stages)],
+        "branch_prior_mode": cfg.depth_range.branch_prior_mode,
+        "branch_prior_anneal_steps": cfg.depth_range.branch_prior_anneal_steps,
+        "warp_channels": [cfg.cost_volume.warp_channels_stage1, cfg.cost_volume.warp_channels_stage2,
+                          cfg.cost_volume.warp_channels_stage3, cfg.cost_volume.warp_channels_stage4],
+        "num_groups": cfg.cost_volume.num_groups,
+        "lr_schedule_steps": getattr(cfg.train, "lr_schedule_steps", None),
         "stage_weights": [cfg.stage_weights.stage1, cfg.stage_weights.stage2,
                           cfg.stage_weights.stage3, cfg.stage_weights.stage4],
         "w_branch": cfg.loss.w_branch,
@@ -1311,7 +1438,7 @@ def _run_training(model, loss_fn, optimizer, scaler, cfg, device, args, world_si
             # Validation runs on ALL ranks (metrics are all-reduced); the
             # elif keeps ckpt_interval multiples of val_interval from double-saving.
             if step > 0 and cfg.train.val_interval > 0 and step % cfg.train.val_interval == 0:
-                val_metrics = _run_validation(model, val_loader, device, use_amp, is_ddp)
+                val_metrics = _run_validation(model, val_loader, device, use_amp, is_ddp, _amp_dtype(cfg))
                 if is_main:
                     logger.log_val(val_metrics, step)
                     logger.save(model, optimizer, step, val_metric=val_metrics["abs_err"])
@@ -1323,7 +1450,7 @@ def _run_training(model, loss_fn, optimizer, scaler, cfg, device, args, world_si
         epoch += 1
 
     # Final validation so the last weights are also considered for best.pth.
-    val_metrics = _run_validation(model, val_loader, device, use_amp, is_ddp)
+    val_metrics = _run_validation(model, val_loader, device, use_amp, is_ddp, _amp_dtype(cfg))
     if is_main:
         logger.log_val(val_metrics, step)
         logger.save(model, optimizer, step, val_metric=val_metrics["abs_err"])
@@ -1391,6 +1518,12 @@ def main() -> None:
                         help="每多少步往 tensorboard 刷一次窗口均值 (默认 50)。查发散时"
                              "调小到 10 —— 梯度范数的尖峰会被 50 步的均值抹平。")
     parser.add_argument("--amp", choices=["on", "off"], default=None, help="AMP override")
+    parser.add_argument("--amp-dtype", choices=["fp16", "bf16"], default=None,
+                        help="AMP 的计算精度。bf16 指数范围与 fp32 相同, 用来消除 stage4 "
+                             "全分辨率相关体的 inf 溢出; bf16 下自动关闭 GradScaler。")
+    parser.add_argument("--lr-schedule-steps", type=int, default=None,
+                        help="余弦退火 horizon (默认=实际训练步数)。12k 筛选应设 30000, "
+                             "这样选中的 checkpoint 能无 lr 跳变续训到 30k。")
     parser.add_argument("--prior-target-w", type=int, default=None,
                         help="VGGT/DA3 prior width override (default 518; must be a multiple of 14). "
                              "Raises true depth-prior resolution at VGGT compute/memory cost. "
@@ -1431,6 +1564,30 @@ def main() -> None:
                         help="分支校准 loss 权重 (0 = 关闭)")
     parser.add_argument("--spre-balance-corrupt", choices=["on", "off"], default=None,
                         help="SPRE corruption BCE 是否按 clean/corrupt 两类平衡")
+    parser.add_argument("--prior", choices=["on", "off", "affine"], default=None,
+                        help="先验通路。off = 严格无先验对照 (prior/conf 置零、meta 中性化、"
+                             "branch prior 与 branch loss 关闭、SPRE 不参与前向), 模块仍照常"
+                             "构造所以 RNG 流一致; affine = 用逆深度仿射标定过的缓存")
+    parser.add_argument("--prior-cache", type=str, default=None,
+                        help="覆盖先验缓存目录 (--prior affine 时指向仿射标定的那一份)")
+    parser.add_argument("--range-min-gi", type=str, default=None,
+                        help="三个转移的窗宽下限, 逗号分隔, 如 '0.66,0.20,0.10'")
+    parser.add_argument("--depth-adaptive", choices=["on", "off"], default=None,
+                        help="窗宽按 clamp((d/depth_min)^2, 1, max) 随深度放宽 (只放宽远端)")
+    parser.add_argument("--depth-adaptive-max", type=float, default=None)
+    parser.add_argument("--depth-adaptive-apply", choices=["floor", "both"], default=None,
+                        help="floor=只缩放下限; both=连 range_k*winner_interval 一起缩放")
+    parser.add_argument("--depth-adaptive-stages", type=str, default=None,
+                        help="施加在哪几个转移, 如 'off,on,on'")
+    parser.add_argument("--branch-prior-mode", choices=["hard", "soft"], default=None,
+                        help="hard=硬指派分支质量 (实测 2k 后有害); soft=计数校正的加性偏置")
+    parser.add_argument("--branch-prior-anneal-steps", type=int, default=None,
+                        help=">0 时 beta 线性退到 0, 对应'前 1-2k 引导、之后交还 matching'")
+    parser.add_argument("--warp-channels-stage4", type=int, default=None,
+                        help="stage4 的 warp 通道数 (16 -> 24/32 是最后的容量手段)")
+    parser.add_argument("--num-groups", type=int, default=None,
+                        help="相关体分组数。stage4 每组只有 warp_ch/groups=2 个通道做 mean, "
+                             "抑制最弱, 也是 fp16 溢出的高发点")
     parser.add_argument("--seed", type=int, default=None,
                         help="全局随机种子 (模型初始化 + 采样顺序 + 逐样本增广)")
     parser.add_argument("--deterministic", action="store_true",
