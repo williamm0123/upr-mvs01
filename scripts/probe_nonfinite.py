@@ -77,6 +77,39 @@ def resolve_ckpt(spec: str) -> str:
     return out[-1]
 
 
+def restore_cfg(cfg, snap: dict):
+    """用 checkpoint 里的配置快照**完整**重建 MVSConfig。
+
+    只挑几个字段恢复是不够的: 上一版漏了 ``spre.enabled``, 于是模型按当前默认值
+    建 (enabled=False -> reliability_source 降级为 cached), SPRE/DINO 整条支路根本
+    没构造, 加载时 16 个权重被当成 unexpected 丢掉 —— 跑的是另一个模型, 自然复现
+    不出事故。凡是"拿旧 checkpoint 复现"的工具都必须整份恢复。
+
+    ``paths`` 故意跳过: 那是写 checkpoint 那台机器的绝对路径。
+    """
+    from dataclasses import fields, replace
+    out = cfg
+    for name in ("data", "prior", "fpn", "depth_range", "cost_volume", "points_alignment",
+                 "decoder", "dino", "spre", "loss", "stage_weights", "augment", "train"):
+        sub = getattr(cfg, name, None)
+        d = snap.get(name)
+        if sub is None or not isinstance(d, dict):
+            continue
+        valid = {f.name for f in fields(sub)}
+        kw = {}
+        for k, v in d.items():
+            if k not in valid:
+                continue
+            cur = getattr(sub, k)
+            # asdict 会把 tuple 变成 list, 而 frozen dataclass 的类型要对得上
+            if isinstance(cur, tuple) and isinstance(v, list):
+                v = tuple(tuple(x) if isinstance(x, list) else x for x in v)
+            kw[k] = v
+        if kw:
+            out = replace(out, **{name: replace(sub, **kw)})
+    return out
+
+
 def build(args):
     cfg = build_mvs_config(profile=args.profile)
     args.ckpt = resolve_ckpt(args.ckpt)
@@ -89,24 +122,19 @@ def build(args):
               f"{fp.get('num_global')}/{fp.get('num_local')} "
               f"bp={fp.get('branch_prior')} vis={fp.get('visibility_weighting')} "
               f"lr={fp.get('lr')} seed={fp.get('seed')} amp={fp.get('amp_dtype','fp16')}")
-        # 用 checkpoint 里记录的开关重建配置, 否则拿当前默认值加载会静默改语义
-        from dataclasses import replace
-        c = ck["config"]
-        cfg = replace(
-            cfg,
-            depth_range=replace(cfg.depth_range, **{k: c["depth_range"][k] for k in
-                                                    ("num_global", "num_local", "gate_local_branch",
-                                                     "branch_prior") if k in c.get("depth_range", {})}),
-            cost_volume=replace(cfg.cost_volume, **{k: c["cost_volume"][k] for k in
-                                                    ("num_depths_stage1", "visibility_weighting")
-                                                    if k in c.get("cost_volume", {})}),
-        )
+        cfg = restore_cfg(cfg, ck["config"])
     dev = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     model = UprMVSNet(cfg).to(dev).eval()
     if ck is not None:
         missing, unexpected = model.load_state_dict(ck["model"], strict=False)
         if missing or unexpected:
-            print(f"[ckpt] 非严格加载: missing={len(missing)} unexpected={len(unexpected)}")
+            print(f"[ckpt] !! 非严格加载: missing={len(missing)} unexpected={len(unexpected)}")
+            print(f"        missing 前几个: {list(missing)[:4]}")
+            print(f"        unexpected 前几个: {list(unexpected)[:4]}")
+            raise SystemExit(
+                "模型结构与 checkpoint 对不上 —— 这样跑的是另一个模型, 复现不出事故。\n"
+                "多半是配置没完整恢复 (见 restore_cfg), 或者 checkpoint 早于某次结构改动。")
+        print(f"[ckpt] state_dict 严格匹配 ({len(ck['model'])} 个张量)")
     lf, ef = resolve_split(cfg.paths.val_list_file, "val", not args.no_clean_lists)
     ds = DTUMVSDataset(datapath=cfg.paths.dtu_train_root, listfile=lf, exclude_file=ef,
                        nviews=cfg.train.num_views, mode="val",
@@ -130,7 +158,9 @@ def main():
     ap.add_argument("--ckpt", default="", help="要复现的 checkpoint (留空 = 随机初始化)")
     ap.add_argument("--profile", default="umhpc")
     ap.add_argument("--dtype", choices=list(DTYPES), default="fp16")
-    ap.add_argument("--max-batches", type=int, default=200)
+    ap.add_argument("--max-batches", type=int, default=10**9,
+                    help="默认扫完整个 val 集 —— 事故是 sample-conditioned 的, "
+                         "只扫前 200 个 batch 很可能错过那一个样本")
     ap.add_argument("--batch-size", type=int, default=2)
     ap.add_argument("--sample-index", type=int, default=-1, help="只跑这一个样本")
     ap.add_argument("--compare", action="store_true", help="对同一批依次跑 fp16/bf16/fp32")
