@@ -13,13 +13,17 @@
 #SBATCH --error=slurm-%x-%j.err
 
 # =============================================================================
-# arm R: 恢复候选: lr 3e-4 + 32/16 + gate/branch_prior/visibility 全关 + stage1 0.5 + w_branch 0
+# arm R
+#
+# 恢复候选: lr 3e-4 + 32/16 + gate/branch_prior/visibility 全关 + stage1 0.5 + w_branch 0。
+# 上一轮 best val abs_err = 2.7645, 三个 arm 里最好, 且到 12k 仍在下降。
+# 注意它用的也是 3e-4 —— 所以不是学习率本身不能用, 是它跟 8.16 那套配置合不来。
 #
 #     sbatch scripts/arm_R.sh
 #
 # 单卡 A100, 12000 步, 约 3 小时。结果写 log/experiments/R/。
-# 三个 arm 的差异只有下面 "arm 配置" 那一段, 其余完全一致 —— 这是单变量
-# 比较的前提。跑完用 python scripts/compare_arms.py --ref D0 看结果。
+# 全部 arm 的差异只有下面 "arm 配置" 那一段, 其余逐字相同 —— 这是单变量比较的前提。
+# 比较: python scripts/compare_arms.py --ref D0
 # =============================================================================
 
 set -e
@@ -29,7 +33,7 @@ conda activate uprmvs
 
 RUN_NAME=R
 
-# --- arm 配置 (三个脚本只有这里不同) ---
+# --- arm 配置 (各脚本只有这里不同) ---
 LR=3e-4
 NUM_GLOBAL=32
 NUM_LOCAL=16
@@ -38,16 +42,20 @@ BRANCH_PRIOR=off
 VISIBILITY=off
 STAGE1_WEIGHT=0.5
 W_BRANCH=0
-SPRE_BALANCE=on
+SEED=20260526
 
 # --- 以下所有 arm 共用, 不要单独改 ---
 STEPS=12000
-SEED=20260526
+SPRE_BALANCE=on
 BATCH_SIZE=2          # 消融期间必须全 arm 一致, 否则 arm 之间不可比
 NUM_VIEWS=5
 VAL_BATCH_SIZE=6      # 验证只前向且在 no_grad 下, 不影响任何指标, 纯省时间
 NUM_WORKERS=16
 VAL_INTERVAL=500
+# 10 而不是默认 50: 梯度范数的尖峰会被 50 步的窗口均值抹平, 而 grad/norm_unclipped、
+# grad/amp_scale、grad/nonfinite_frac 这三条正是 L 发散的提前量。全 arm 统一取 10,
+# 否则 train/* 曲线的平滑程度不同, 诊断量之间没法横向比。
+LOG_INTERVAL=10
 
 # 代码版本: 只记录 + 拦"改过但没提交的跟踪文件"。未跟踪的 slurm 输出不算。
 GIT_SHA=$(git rev-parse HEAD)
@@ -59,11 +67,9 @@ fi
 
 # --- 归档上一轮的同名 run (--resume off 的必要配套) -------------------------
 # --resume off 只让训练从 step 0 开始, 它不会动 log/experiments/<run>/ 里已有的
-# 文件。不归档的话有三个后果: best_metric 从 inf 起算, 第一次验证就用新的
-# best.pth 覆盖旧的; latest.pth 同理; 而 tensorboard 是把同一个 run 下所有事件
-# 文件按 step 合并的 —— 新旧两轮的 step 0-12000 会叠在一起, compare_arms.py
-# 读出来的窗口均值就成了两轮的混合。移走而不是删掉: L 的 NaN latest.pth 是取证
-# 材料, D0/R 的 best.pth 是点云 eval 的输入。
+# 文件。不归档的话: best_metric 从 inf 起算会覆盖旧 best.pth; 而 tensorboard 把
+# 同一个 run 下所有事件文件按 step 合并 —— 新旧两轮的 step 0-12000 会叠在一起,
+# compare_arms.py 读出来就是两轮的混合。移走而不是删掉。
 RUN_DIR="log/experiments/$RUN_NAME"
 if [[ -e "$RUN_DIR" ]]; then
     ARCHIVE="log/experiments/_archive/${RUN_NAME}_$(date -u +%Y%m%d_%H%M%S)"
@@ -93,6 +99,7 @@ exec python -u train.py \
     --num-workers "$NUM_WORKERS" \
     --val-batch-size "$VAL_BATCH_SIZE" \
     --val-interval "$VAL_INTERVAL" \
+    --log-interval "$LOG_INTERVAL" \
     --num-global "$NUM_GLOBAL" \
     --num-local "$NUM_LOCAL" \
     --gate-local "$GATE_LOCAL" \

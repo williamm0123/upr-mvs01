@@ -25,6 +25,9 @@ from tensorboard.backend.event_processing import event_accumulator as ea
 HIST = {"7.29 (b69ee46)": 2.7688, "8.16 (c8057bc)": 3.0111}
 
 DIAGS = [
+    ("train/diag_grad_norm_unclipped", "grad_norm"),
+    ("train/diag_grad_amp_scale", "amp_scale"),
+    ("train/diag_grad_nonfinite_frac", "nonfin_frac"),
     ("train/diag_stage1_bp_raw_abs_err", "bp_raw"),
     ("train/diag_stage1_bp_post_abs_err", "bp_post"),
     ("train/diag_stage1_bp_flip_help", "flip_help"),
@@ -91,7 +94,7 @@ def main() -> None:
         t, _ = window_mean(d.get("val/tail_frac_8mm"), args.lo, args.hi)
         last = int(d["val/abs_err"][0].max())
         rows.append((v, name, v, a, t, n, last))
-    for _, name, v, a, t, n, last in sorted(rows):
+    for _, name, v, a, t, n, last in sorted(rows, key=lambda r: (np.isnan(r[0]), r[0])):
         dv = v - ref_v
         mark = "" if not np.isfinite(dv) else ("  ✓确认" if dv <= -0.15 else
                                                ("  ~待定" if dv <= -0.05 else ""))
@@ -109,8 +112,10 @@ def main() -> None:
             continue
         print(f"{label:<16}" + "".join(
             (f"{x:>12.4f}" if np.isfinite(x) else f"{'-':>12}") for x in vals))
-    print("\n  bp_post < bp_raw 才说明分支先验有正贡献; 反之应保持 branch_prior=off")
+    print("\n  abs_err 是 nan / #pts 远小于 9 = 这个 arm 中途发散或被杀, 先看它的 slurm 日志")
+    print("  bp_post < bp_raw 才说明分支先验有正贡献; 反之应保持 branch_prior=off")
     print("  s2/s3_floor 高 = 窗宽由 range_min_gi*global_interval 决定 (改 num_global 会整体缩放)")
+    print("  amp_scale 一路下滑 / nonfin_frac 非 0 = 溢出在变频繁, 是发散的提前量")
 
     print(f"\n深度分桶 val abs_err (q0 近 -> q3 远)\n")
     print(f"{'':<16}" + "".join(f"{n[:11]:>12}" for n in names))

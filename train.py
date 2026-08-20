@@ -481,6 +481,8 @@ def main_worker(
         train_overrides["warmup_steps"] = args.warmup_steps
     if args.val_interval is not None:
         train_overrides["val_interval"] = args.val_interval
+    if args.log_interval is not None:
+        train_overrides["log_interval"] = args.log_interval
     if args.amp is not None:
         train_overrides["amp"] = args.amp == "on"
     if args.nan_watchdog is not None:
@@ -805,22 +807,48 @@ def _train_step(model, loss_fn, optimizer, scaler, batch, cfg, device, step, use
     else:
         per_norm, total_norm = [], torch.zeros((), device=device)
 
-    if watch and per_norm and not bool(torch.isfinite(total_norm)):
+    # 单步梯度非有限**不是**发散。AMP 的 GradScaler 正是靠"把 loss 放大到溢出 ->
+    # 发现 inf -> 跳过这步并把 scale 减半"来自动找可用的缩放系数的, 而
+    # scaler.unscale_() 只是除以 scale, inf/scale 仍然是 inf。在这里见到一次
+    # inf 就终止, 等于把 AMP 的正常工作机制当成事故 —— L 那个 arm 恰恰是最容易
+    # 触发溢出的, 会在第一次正常溢出时白死。
+    # 真发散的特征是**连续**若干步都非有限 (scaler 已经把 scale 一路减半却仍然
+    # 救不回来)。所以这里记连击数, 到 nan_grad_patience 才报。
+    nonfinite_grad = bool(per_norm) and not bool(torch.isfinite(total_norm))
+    streak = (getattr(_train_step, "_nf_streak", 0) + 1) if nonfinite_grad else 0
+    _train_step._nf_streak = streak
+    patience = max(int(getattr(cfg.train, "nan_grad_patience", 3)), 1)
+    if watch and nonfinite_grad and streak >= patience:
         ok = torch.isfinite(torch.stack(per_norm)).tolist()
         bad_names = [named[i][0] for i, good in enumerate(ok) if not good]
         probes = {f"grad.{named[i][0]}": grads[i] for i, good in enumerate(ok) if not good}
         raise NonFiniteError(_nonfinite_report(
             "backward — 梯度", step, lr, scaler, batch, dict(list(probes.items())[:12]),
             extra_lines=[
+                f"  连续 {streak} 步梯度非有限 (patience={patience}) —— 不是 AMP 的一次性溢出",
                 f"  unclipped grad norm = {float(total_norm):g}",
                 f"  非有限梯度的参数: {len(bad_names)}/{len(named)} 个",
                 f"  最靠前的几个: {bad_names[:6]}",
             ],
         ))
 
-    torch.nn.utils.clip_grad_norm_(params, cfg.train.grad_clip, error_if_nonfinite=watch)
+    # error_if_nonfinite 必须是 False: 溢出那一步交给 scaler.step() 去跳过,
+    # 这里抛异常就又把正常的 AMP 行为当成事故了。
+    torch.nn.utils.clip_grad_norm_(params, cfg.train.grad_clip, error_if_nonfinite=False)
     # 这条曲线是提前量: L 那次事故之前梯度范数其实已经在涨, 只是没人记录。
-    logs["grad/norm_unclipped"] = float(total_norm)
+    # 只在有限时记: WindowedMeter 按 key 各自累计均值 (log_sums/log_counts),
+    # 缺席的步不进分母。写 nan 进去会把整个窗口的均值污染成 nan, 而这条曲线正是
+    # 事故复盘要看的那条。溢出的信息由下面的 nonfinite_frac 承载。
+    if not nonfinite_grad:
+        logs["grad/norm_unclipped"] = float(total_norm)
+    # 事故的提前量都在这两条曲线上:
+    #   amp_scale 一路往下掉 = 溢出在变频繁 (每次溢出 scaler 把它减半)
+    #   nonfinite_frac 是窗口内溢出步的占比, 0 -> 非 0 就是预警
+    logs["grad/nonfinite_frac"] = 1.0 if nonfinite_grad else 0.0
+    try:
+        logs["grad/amp_scale"] = float(scaler.get_scale()) if scaler.is_enabled() else 0.0
+    except Exception:
+        pass
     scaler.step(optimizer)
     scaler.update()
     return logs, outputs
@@ -1359,6 +1387,9 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=None, help="learning-rate override")
     parser.add_argument("--warmup-steps", type=int, default=None, help="LR warmup steps override")
     parser.add_argument("--val-interval", type=int, default=None, help="steps between validation runs")
+    parser.add_argument("--log-interval", type=int, default=None,
+                        help="每多少步往 tensorboard 刷一次窗口均值 (默认 50)。查发散时"
+                             "调小到 10 —— 梯度范数的尖峰会被 50 步的均值抹平。")
     parser.add_argument("--amp", choices=["on", "off"], default=None, help="AMP override")
     parser.add_argument("--prior-target-w", type=int, default=None,
                         help="VGGT/DA3 prior width override (default 518; must be a multiple of 14). "

@@ -1,5 +1,5 @@
 #!/bin/bash -l
-#SBATCH --job-name=D0
+#SBATCH --job-name=R_bp
 #SBATCH --partition=gpu-a100
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -13,15 +13,16 @@
 #SBATCH --error=slurm-%x-%j.err
 
 # =============================================================================
-# arm D0
+# arm R_bp
 #
-# 8.16 那次的完整配置, lr 2e-4。确定性基线 —— 所有 Δ 的分母。
-# 上一轮 best val abs_err = 2.8805, 与 8.16 在 12k 步的 2.9152 只差 0.035
-# (单点噪声 0.109 之内), 说明播种/确定性/run 隔离这些改动是行为中性的。
+# R + 分支先验整套 (branch_prior on 且 w_branch 0.5)。
+# 为什么两个必须一起开: branch loss 监督的是 s1[branch_q], 而 branch_q 只在
+# branch_prior 打开时才被赋值 (models/network.py), 关着时 l_branch 恒为 0 ——
+# w_branch 单独开是死参数。这个 arm 若发散, 就直接指认它是 L 失稳的原因。
 #
-#     sbatch scripts/arm_D0.sh
+#     sbatch scripts/arm_R_bp.sh
 #
-# 单卡 A100, 12000 步, 约 3 小时。结果写 log/experiments/D0/。
+# 单卡 A100, 12000 步, 约 3 小时。结果写 log/experiments/R_bp/。
 # 全部 arm 的差异只有下面 "arm 配置" 那一段, 其余逐字相同 —— 这是单变量比较的前提。
 # 比较: python scripts/compare_arms.py --ref D0
 # =============================================================================
@@ -31,16 +32,16 @@ set -e
 source ~/.bashrc
 conda activate uprmvs
 
-RUN_NAME=D0
+RUN_NAME=R_bp
 
 # --- arm 配置 (各脚本只有这里不同) ---
-LR=2e-4
-NUM_GLOBAL=40
-NUM_LOCAL=8
-GATE_LOCAL=on
+LR=3e-4
+NUM_GLOBAL=32
+NUM_LOCAL=16
+GATE_LOCAL=off
 BRANCH_PRIOR=on
-VISIBILITY=on
-STAGE1_WEIGHT=1.5
+VISIBILITY=off
+STAGE1_WEIGHT=0.5
 W_BRANCH=0.5
 SEED=20260526
 

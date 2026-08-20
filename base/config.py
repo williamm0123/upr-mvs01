@@ -374,6 +374,13 @@ class TrainConfig:
     # 出现第一个非有限 loss/梯度就终止, 而不是让 GradScaler 一路跳步空转。
     # 关掉只该用于复现历史事故 —— 正常训练没有理由带着 nan 继续跑。
     nan_watchdog: bool = True
+    # 连续多少步梯度非有限才判定为真发散。1 步不算: AMP 的 GradScaler 本来就
+    # 靠"故意溢出 -> 跳过这步 -> 把 scale 减半"来找可用的缩放系数, 而
+    # scaler.unscale_() 之后 inf/scale 仍然是 inf —— 见 train.py 关口 2。
+    # 10 而不是 3: GradScaler 从初始 scale 2^16 起步, 每次溢出减半, 要降到
+    # 2^6 就得连续溢出 10 次 —— 这段热身全程梯度都是 inf, 却完全正常。
+    # 真发散的特征是 scale 已经被压到很低却仍然救不回来。
+    nan_grad_patience: int = 10
     seed: int = 20260526
     log_interval: int = 50
     vis_interval: int = 100
