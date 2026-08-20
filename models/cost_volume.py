@@ -213,4 +213,11 @@ class CostVolumeBuilder(nn.Module):
             weight_sum = weight_sum + w
         cost = agg / weight_sum.clamp(min=1e-6)
         Probe.log(self.tag, "cost", cost)
+        # 相关体的幅度 —— 2026-08-21 那次事故的唯一直接指标。
+        # stage4 的 cost 量级是 stage1 的约 200 倍 (特征幅度 ~13 -> ~500, 而组内
+        # 平均的通道数 16 -> 2), 实测最大值经常越过 fp16 的 65504: 越过的那个样本
+        # 在 autocast 转 fp16 的瞬间就变 inf, 于是 logits - logits.amax() = nan。
+        # bf16 下这条线不再是威胁, 但幅度本身仍是训练是否健康的信号。
+        with torch.no_grad():
+            self.last_cost_max = float(cost.detach().abs().amax())
         return cost

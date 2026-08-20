@@ -429,5 +429,9 @@ class UprMVSNet(nn.Module):
             stage_out["vis"] = vs
         stage_out["range_diag"] = range_diag
         stage_out["range_diag"]["branch"] = {"bp_beta": float(getattr(self, "last_bp_beta", 0.0))}
+        stage_out["range_diag"]["cost"] = {
+            f"max_s{i + 1}": float(getattr(m, "last_cost_max", 0.0))
+            for i, m in enumerate(self.cost_builders)
+        }
         Probe.log("out", "depth_full", depth_full)
         return {"depth_full": depth_full, **stage_out}
