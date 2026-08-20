@@ -57,6 +57,21 @@ if [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
     exit 1
 fi
 
+# --- 归档上一轮的同名 run (--resume off 的必要配套) -------------------------
+# --resume off 只让训练从 step 0 开始, 它不会动 log/experiments/<run>/ 里已有的
+# 文件。不归档的话有三个后果: best_metric 从 inf 起算, 第一次验证就用新的
+# best.pth 覆盖旧的; latest.pth 同理; 而 tensorboard 是把同一个 run 下所有事件
+# 文件按 step 合并的 —— 新旧两轮的 step 0-12000 会叠在一起, compare_arms.py
+# 读出来的窗口均值就成了两轮的混合。移走而不是删掉: L 的 NaN latest.pth 是取证
+# 材料, D0/R 的 best.pth 是点云 eval 的输入。
+RUN_DIR="log/experiments/$RUN_NAME"
+if [[ -e "$RUN_DIR" ]]; then
+    ARCHIVE="log/experiments/_archive/${RUN_NAME}_$(date -u +%Y%m%d_%H%M%S)"
+    mkdir -p "$(dirname "$ARCHIVE")"
+    mv "$RUN_DIR" "$ARCHIVE"
+    echo "=== 上一轮已归档 (未删除): $RUN_DIR -> $ARCHIVE ==="
+fi
+
 echo "=== job=${SLURM_JOB_ID:-manual} host=$(hostname) run=$RUN_NAME ==="
 echo "=== git=${GIT_SHA:0:12} (clean) ==="
 nvidia-smi -L
@@ -88,5 +103,5 @@ exec python -u train.py \
     --spre-balance-corrupt "$SPRE_BALANCE" \
     --spre on \
     --no-clean-lists \
-    --resume false \
+    --resume off \
     --build-priors skip

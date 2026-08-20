@@ -100,5 +100,5 @@ exec python -u train.py \
     --spre-balance-corrupt "$SPRE_BALANCE" \
     --spre on \
     --no-clean-lists \
-    --resume false \
+    --resume auto \
     --build-priors skip
