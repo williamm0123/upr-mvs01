@@ -1201,6 +1201,21 @@ def _run_training(model, loss_fn, optimizer, scaler, cfg, device, args, world_si
     )
 
     max_steps = args.steps if args.steps else cfg.train.max_steps
+    # 已经跑完的 run 被原样重投: --resume auto 捡回 step=max_steps 的 latest.pth,
+    # while 循环一次都不进, 然后照常走最后那次验证并打印 [val final step N+1] ——
+    # 一行看起来完全正常的结果, 实际上零训练步, 白烧一个 GPU 名额 (2026-08-18,
+    # D0/L/R 三个作业各中一次)。这里明确拦下来, 并说清楚三条出路。
+    if start_step >= max_steps:
+        if is_main:
+            print(
+                f"\n[已完成] {args.name}: latest.pth 已经在 step {start_step - 1}, "
+                f"而 --steps={max_steps}。没有可训练的步数, 直接退出。\n"
+                f"  想继续训练 -> 调大 --steps;\n"
+                f"  想重跑一次 -> 换 --name (checkpoint 按 run 隔离, 不会打架), "
+                f"或 --resume off 并先把旧的 latest.pth 挪走;\n"
+                f"  只想重新验证 -> 用 scripts/eval_pointcloud.sh, 别走训练入口。\n"
+            )
+        return
     model.train()
     use_amp = cfg.train.amp and device.type == "cuda"
     meter = WindowedMeter(device, is_ddp)

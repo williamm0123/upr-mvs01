@@ -88,5 +88,5 @@ exec python -u train.py \
     --spre-balance-corrupt "$SPRE_BALANCE" \
     --spre on \
     --no-clean-lists \
-    --resume auto \
+    --resume false \
     --build-priors skip
