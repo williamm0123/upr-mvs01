@@ -82,7 +82,7 @@ def build(args):
     args.ckpt = resolve_ckpt(args.ckpt)
     if args.ckpt:
         print(f"[ckpt] {args.ckpt}")
-    ck = torch.load(args.ckpt, map_location="cpu") if args.ckpt else None
+    ck = T.load_checkpoint(args.ckpt, map_location="cpu") if args.ckpt else None
     if ck is not None and ck.get("config"):
         fp = ck.get("fingerprint") or {}
         print(f"[ckpt] step={ck.get('step','?')} fingerprint 摘要: "

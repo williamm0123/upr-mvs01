@@ -675,7 +675,7 @@ def main_worker(
     if not args.smoke and args.resume == "auto":
         ckpt_path = run_paths(run_name)["model"] / "latest.pth"
         if ckpt_path.exists():
-            ckpt = torch.load(ckpt_path, map_location=device)
+            ckpt = load_checkpoint(ckpt_path, map_location=device)
             try:
                 (model.module if isinstance(model, DDP) else model).load_state_dict(ckpt["model"])
             except RuntimeError as exc:
@@ -1110,6 +1110,20 @@ class _EpochShuffleSampler(torch.utils.data.Sampler):
 
     def __len__(self) -> int:
         return len(self.order)
+
+
+def load_checkpoint(path, map_location=None):
+    """读我们自己写的 checkpoint。
+
+    torch 2.6 把 ``torch.load`` 的 ``weights_only`` 默认值改成了 True, 而
+    TrainLogger.save 会把整份配置快照 (含 numpy 对象) 一起存进去 —— 于是
+    ``--resume auto`` 和所有离线工具在新 torch 上都会 UnpicklingError。
+    这些文件是本仓库自己产出的, 显式关掉即可; 老 torch 没有这个参数, 兜底重试。
+    """
+    try:
+        return torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
 
 
 def _amp_dtype(cfg) -> torch.dtype:

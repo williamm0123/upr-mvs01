@@ -275,7 +275,12 @@ def _align_cfg_to_ckpt(cfg, state: dict, override: str = "auto", fingerprint=Non
 
 def load_model(cfg, args, device: torch.device) -> tuple[UprMVSNet, Path]:
     ckpt_path = _resolve_ckpt(args)
-    ckpt = torch.load(ckpt_path, map_location=device)
+    # weights_only 默认值在 torch 2.6 变成 True, 而 checkpoint 里有配置快照。
+    # 见 train.load_checkpoint。
+    try:
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    except TypeError:
+        ckpt = torch.load(ckpt_path, map_location=device)
     state = ckpt["model"]
     cfg, has_spre = _align_cfg_to_ckpt(cfg, state, getattr(args, "spre", "auto"),
                                        fingerprint=ckpt.get("fingerprint"))
