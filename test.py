@@ -127,11 +127,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--fuse-only", action="store_true",
                    help="跳过推理, 直接拿 --out 下已缓存的逐视角深度重新融合。换融合方法或"
                         "调阈值时用它 —— 重跑推理是 3 个 arm x 1078 样本的浪费。")
-    p.add_argument("--fusion", choices=["geo", "gipuma"], default="geo",
-                   help="geo = 内置的几何+光度一致性 (每个 ref 视角各输出一遍存活像素, "
-                        "**跨视角不去重**, 49 视角下一个 scan 出 2500-4500 万点); "
-                        "gipuma = 调 fusibile 二进制, 它把跨视角一致的点聚成一个, "
-                        "通常降到 1-3M 点。先跑 scripts/build_fusibile.sh 编译。")
+    p.add_argument("--fusion", choices=["geo", "dedup", "gipuma"], default="geo",
+                   help="geo = 几何+光度一致性, 每个 ref 视角各输出一遍存活像素, "
+                        "**跨视角不去重** —— 49 视角下一个 scan 出 2500-4500 万点; "
+                        "dedup = geo 再加 fusibile 式的跨视角消费标记, 同一个表面点只由"
+                        "最先认领它的 ref 视角输出一次 (纯 torch, 无外部依赖); "
+                        "gipuma = 调 fusibile 二进制 (需 CUDA<12 编译, 见 scripts/build_fusibile.sh)。")
     p.add_argument("--fusibile-exe", default="third_party/fusibile/fusibile",
                    help="fusibile 可执行文件 (相对路径按项目根解析)")
     p.add_argument("--gipuma-disp-thresh", type=float, default=0.25,
@@ -553,6 +554,17 @@ def save_ply(path: Path, points: np.ndarray, colors: np.ndarray) -> None:
 
 @torch.no_grad()
 def fuse_scan(scan_dir: Path, args, device: torch.device) -> tuple[np.ndarray, np.ndarray]:
+    """几何+光度一致性融合。``args.fusion == "dedup"`` 时额外做跨视角去重。
+
+    不去重的话, 49 个 ref 视角各自输出一遍自己的存活像素, 同一个物理表面点在重叠
+    区被重复写 5-15 次 —— 一个 scan 2500-4500 万点、ply 600MB。
+
+    去重照搬 fusibile 的做法: 一个 ref 像素通过一致性检查、被写成点之后, 把它在
+    各个**源视角**里对应的那个像素标记为"已消费"; 那些视角轮到当 ref 时直接跳过。
+    于是每个表面点只由最先认领它的视角输出一次。视角按 id 升序处理, 结果确定。
+    """
+    dedup = getattr(args, "fusion", "geo") == "dedup"
+    consumed: dict[int, torch.Tensor] = {}
     views = {}
     for f in sorted(scan_dir.glob("*.npz")):
         z = np.load(f)
@@ -564,9 +576,15 @@ def fuse_scan(scan_dir: Path, args, device: torch.device) -> tuple[np.ndarray, n
             "image": z["image"],
             "src_views": [int(s) for s in z["src_views"]],
         }
+    if dedup:
+        for vid, v in views.items():
+            consumed[vid] = torch.zeros_like(v["depth"], dtype=torch.bool)
+
     all_pts, all_cols = [], []
-    for ref_id, ref in views.items():
-        srcs = [views[s] for s in ref["src_views"] if s in views]
+    for ref_id in sorted(views):
+        ref = views[ref_id]
+        src_ids = [s for s in ref["src_views"] if s in views]
+        srcs = [views[s] for s in src_ids]
         if not srcs:
             continue
         H, W = ref["depth"].shape
@@ -611,8 +629,24 @@ def fuse_scan(scan_dir: Path, args, device: torch.device) -> tuple[np.ndarray, n
         d_avg = (dr.squeeze(0) + (z_back * consistent).sum(dim=0)) / (n_geo + 1).float()
         keep = ((ref["conf"].view(-1) > args.photo_thresh) & (n_geo >= args.geo_views)
                 & (dr.squeeze(0) > 0)).view(H, W)
+        if dedup:
+            # 已经被更早的 ref 视角认领过的像素不再输出
+            keep = keep & ~consumed[ref_id]
         if not keep.any():
             continue
+        if dedup:
+            # 把这些点在各源视角里对应的像素标记为已消费。uv 是 ref 像素投到该
+            # 源视角的浮点坐标, 四舍五入取整并夹进画幅; 只标记"一致 且 被输出"的。
+            kf = keep.view(-1)
+            ui = uv.round().long()                                     # [S,2,N]
+            inb = ((ui[:, 0] >= 0) & (ui[:, 0] < W)
+                   & (ui[:, 1] >= 0) & (ui[:, 1] < H))                 # [S,N]
+            mark = consistent & inb & kf.unsqueeze(0)
+            flat = (ui[:, 1].clamp(0, H - 1) * W + ui[:, 0].clamp(0, W - 1))
+            for si, sid in enumerate(src_ids):
+                idx = flat[si][mark[si]]
+                if idx.numel():
+                    consumed[sid].view(-1)[idx] = True
         pts = unproject_depth(d_avg.view(1, H, W), torch.inverse(K_ref), torch.inverse(E_ref))
         pts = pts[0].permute(1, 2, 0)[keep]
         all_pts.append(pts.cpu().numpy())
@@ -626,7 +660,7 @@ def run_fusion(out_root: Path, ply_dir: Path, args, device: torch.device) -> Pat
     ply_dir.mkdir(parents=True, exist_ok=True)
     scan_dirs = sorted((out_root / "depth").iterdir())
 
-    if args.fusion == "gipuma":
+    if getattr(args, "fusion", "geo") == "gipuma":
         from utils.fusion_gipuma import fuse_scan_gipuma
         exe = Path(args.fusibile_exe)
         if not exe.is_absolute():
