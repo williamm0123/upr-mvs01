@@ -23,14 +23,45 @@ CUDA_ARCH=${CUDA_ARCH:-80}          # A100 = 80, V100 = 70, 3090 = 86
 REPO=${REPO:-https://github.com/YoYo000/fusibile.git}
 DST=third_party/fusibile
 
-command -v nvcc  >/dev/null || { echo "找不到 nvcc —— 先 module load cuda 或装 cudatoolkit-dev" >&2; exit 1; }
+command -v nvcc  >/dev/null || {
+    echo "找不到 nvcc。登录节点通常没有 CUDA toolkit, 试:" >&2
+    echo "    module load cuda/11.8      # 或 module avail cuda 看有哪些" >&2
+    echo "    conda install -c nvidia cuda-nvcc=11.8" >&2
+    echo "或者申请一个 GPU 节点再编译 (二进制编好之后哪跑都行)。" >&2
+    exit 1
+}
 command -v cmake >/dev/null || { echo "找不到 cmake" >&2; exit 1; }
 
-echo "=== nvcc: $(nvcc --version | tail -2 | head -1) ==="
+CUDA_VER=$(nvcc --version | grep -oP 'release \K[0-9]+' | head -1)
+echo "=== nvcc: CUDA $CUDA_VER ($(which nvcc)) ==="
 echo "=== 目标架构: sm_${CUDA_ARCH} ==="
 
+# fusibile 是 2016 年的代码, 用的是 CUDA 的 texture reference API。那套 API 在
+# CUDA 11 里已弃用、**CUDA 12 里彻底移除**, 所以 CUDA >= 12 会在编译期直接失败
+# (典型报错: 'texture' is not a template / undefined identifier tex2D)。
+# 二进制只要编出来, 在什么 CUDA 运行时上跑都没问题 —— 所以拿一个旧 toolchain
+# 编译是可行的, 不用改运行环境。
+if [[ -n "$CUDA_VER" && "$CUDA_VER" -ge 12 ]]; then
+    echo "" >&2
+    echo "!!! CUDA $CUDA_VER: fusibile 用的 texture reference API 在 CUDA 12 已被移除," >&2
+    echo "!!! 原版几乎必然编不过。三条出路:" >&2
+    echo "!!!   1) 换一个 CUDA 11 的 toolchain 只用来编译:" >&2
+    echo "!!!        module load cuda/11.8 && bash scripts/build_fusibile.sh" >&2
+    echo "!!!      (编出来的二进制在 CUDA 12 运行时上照常跑)" >&2
+    echo "!!!   2) 用修好 texture API 的 fork: REPO=<url> bash scripts/build_fusibile.sh" >&2
+    echo "!!!   3) 不用 fusibile, 改用内置的去重融合 (见 --fusion 的说明)" >&2
+    echo "" >&2
+    echo "仍要继续请设 FORCE=1。" >&2
+    [[ "${FORCE:-0}" == "1" ]] || exit 1
+fi
+
 mkdir -p third_party
-[[ -d "$DST/.git" ]] || git clone --depth 1 "$REPO" "$DST"
+if [[ ! -f "$DST/CMakeLists.txt" ]]; then
+    # 只剩 CMakeFiles/ 的残留目录要清掉, 否则 cmake 会拿旧缓存继续报错
+    [[ -d "$DST" ]] && { echo "=== 清掉不完整的 $DST ==="; rm -rf "$DST"; }
+    git clone --depth 1 "$REPO" "$DST"
+fi
+[[ -f "$DST/CMakeLists.txt" ]] || { echo "clone 之后仍找不到 $DST/CMakeLists.txt" >&2; exit 1; }
 
 cd "$DST"
 # 覆盖写死的 arch。原文件里通常是 -gencode arch=compute_30,code=sm_30 之类。
