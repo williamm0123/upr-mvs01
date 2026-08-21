@@ -124,6 +124,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--conf-mode", choices=["product", "geomean", "last"], default="product",
                    help="how to combine per-stage mode mass; 'last' reproduces the inert "
                         "pre-fix behaviour for A/B only")
+    p.add_argument("--fuse-only", action="store_true",
+                   help="跳过推理, 直接拿 --out 下已缓存的逐视角深度重新融合。换融合方法或"
+                        "调阈值时用它 —— 重跑推理是 3 个 arm x 1078 样本的浪费。")
     p.add_argument("--fusion", choices=["geo", "gipuma"], default="geo",
                    help="geo = 内置的几何+光度一致性 (每个 ref 视角各输出一遍存活像素, "
                         "**跨视角不去重**, 49 视角下一个 scan 出 2500-4500 万点); "
@@ -707,6 +710,18 @@ def main() -> None:
           f"prior_resize={args.prior_resize_scale}")
     if args.fuse and not args.priors_only:
         print(f"[test] fused point clouds -> {ply_dir}")
+
+    if args.fuse_only:
+        # 深度缓存已经在 out_root/depth 下, 不需要先验、不需要模型、不需要 GPU 推理
+        dcache = out_root / "depth"
+        if not dcache.is_dir() or not any(dcache.iterdir()):
+            raise SystemExit(f"--fuse-only 需要已有的深度缓存, 但 {dcache} 为空。\n"
+                             f"先不带 --fuse-only 跑一次推理。")
+        print(f"[test] --fuse-only: 用 {dcache} 下已缓存的深度重新融合")
+        run_fusion(out_root, ply_dir, args, device)
+        scan_ids = " ".join(str(int(s.replace("scan", ""))) for s in scans)
+        print(f"\n[test] {len(scans)} clouds in {ply_dir}")
+        return
 
     ensure_priors(ds, device, args.build_priors, prior_wh, args.prior_resize_scale)
     if args.priors_only:

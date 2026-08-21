@@ -27,7 +27,12 @@ CONDA_ENV=${CONDA_ENV:-uprmvs}
 GPU_ID=${GPU_ID:-0}
 
 # ---- 跑哪些数据 -------------------------------------------------------------
-PHASE=${PHASE:-all}               # all | priors | infer
+PHASE=${PHASE:-all}               # all | priors | infer | fuse
+# fuse = 只重新融合已缓存的深度, 不跑先验也不跑推理。换融合方法/调阈值时用它。
+FUSION=${FUSION:-geo}             # geo = 内置 (逐视角输出, 不去重); gipuma = fusibile (去重)
+FUSIBILE_EXE=${FUSIBILE_EXE:-third_party/fusibile/fusibile}
+GIPUMA_DISP=${GIPUMA_DISP:-0.25}  # MVSFormer++ 的取值
+GIPUMA_NC=${GIPUMA_NC:-3}
 SPLIT=${SPLIT:-test}              # test = 官方 22 个测试场景；val 用来和训练日志对齐
 SMOKE=${SMOKE:-0}                 # 1 = 只跑第一个 scan（scan1），流程验证用
 MAX_SCANS=${MAX_SCANS:-0}         # 0 = 全部；SMOKE=1 时强制为 1
@@ -107,8 +112,8 @@ export PYTHONUNBUFFERED=1
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 
 case "$PHASE" in
-    all|priors|infer) ;;
-    *) echo "PHASE 必须是 all / priors / infer，收到: $PHASE" >&2; exit 2 ;;
+    all|priors|infer|fuse) ;;
+    *) echo "PHASE 必须是 all / priors / infer / fuse，收到: $PHASE" >&2; exit 2 ;;
 esac
 
 case "$SMOKE" in
@@ -211,6 +216,14 @@ case "$FUSE" in
             --geo-pix "$GEO_PIX"
             --geo-rel "$GEO_REL"
         )
+        infer_args+=(--fusion "$FUSION")
+        if [[ "$FUSION" == "gipuma" ]]; then
+            infer_args+=(
+                --fusibile-exe "$FUSIBILE_EXE"
+                --gipuma-disp-thresh "$GIPUMA_DISP"
+                --gipuma-num-consistent "$GIPUMA_NC"
+            )
+        fi
         [[ -n "$PLY_DIR" ]] && infer_args+=(--ply-dir "$PLY_DIR")
         # 几何一致性只在"已缓存的"视角之间做：截断参考视角会把源视角一起截掉，
         # GEO_VIEWS 个一致视角凑不齐，整个 scan 融出 0 个点。
@@ -224,7 +237,14 @@ case "$FUSE" in
 esac
 
 echo "=== phase=$PHASE split=$SPLIT scans=$( [[ $MAX_SCANS -eq 0 ]] && echo all || echo $MAX_SCANS ) \
-views=$NUM_VIEWS resize=$RESIZE full_image=$FULL_IMAGE fuse=$FUSE out=$OUT ==="
+views=$NUM_VIEWS resize=$RESIZE full_image=$FULL_IMAGE fuse=$FUSE fusion=$FUSION out=$OUT ==="
+
+# ---- PHASE=fuse: 只重新融合 --------------------------------------------------
+if [[ "$PHASE" == "fuse" ]]; then
+    echo "=== 只重新融合 (backend=$FUSION), 不跑先验也不跑推理 ==="
+    echo "+ python test.py ${common_args[*]} --fuse-only ${infer_args[*]}"
+    exec "$PYTHON_BIN" test.py "${common_args[@]}" --fuse-only "${infer_args[@]}"
+fi
 
 # ---- 阶段 1: 建 prior --------------------------------------------------------
 if [[ "$PHASE" == "all" || "$PHASE" == "priors" ]]; then
