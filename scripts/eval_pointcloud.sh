@@ -71,11 +71,46 @@ REFUSE=${REFUSE:-0}
 # --- 打分 (可选) -------------------------------------------------------------
 score_all () {
     echo ""
-    echo "=== ply 大小 ==="
+    # 只报 du 是不够的: ply 头里写了顶点数, 文件大小必须等于 头 + 15*顶点数。
+    # 对不上 = 写被截断 (配额/磁盘满), 而 [fuse] 那行照样打印了完整点数。
+    echo "=== ply 完整性 ==="
+    local bad=0
     for arm in $ARMS; do
         d="log/pred_points_${arm}_${TAG}"
-        echo "    $arm: $(du -sh "$d" 2>/dev/null | cut -f1)  ($(ls "$d"/*.ply 2>/dev/null | wc -l) 个)"
+        local n; n=$(ls "$d"/*.ply 2>/dev/null | wc -l)
+        local msg; msg=$(python3 - "$d" <<'EOF'
+import sys, glob, os
+tot = short = 0
+worst = ""
+for f in sorted(glob.glob(os.path.join(sys.argv[1], "*.ply"))):
+    with open(f, "rb") as fh:
+        head = b""
+        while b"end_header\n" not in head and len(head) < 4096:
+            c = fh.read(1)
+            if not c: break
+            head += c
+    try:
+        nv = int([l for l in head.decode("ascii", "replace").splitlines()
+                  if l.startswith("element vertex")][0].split()[-1])
+    except Exception:
+        print("头损坏 " + os.path.basename(f)); sys.exit(0)
+    want, got = len(head) + 15 * nv, os.path.getsize(f)
+    tot += nv
+    if got != want:
+        short += 1
+        if not worst:
+            worst = f"{os.path.basename(f)} {got:,}/{want:,} 字节"
+print(f"{tot/1e6:.1f}M 点  " + (f"!! {short} 个被截断: {worst}" if short else "全部完整"))
+EOF
+)
+        echo "    $arm: $(du -sh "$d" 2>/dev/null | cut -f1)  ($n 个)  $msg"
+        [[ "$msg" == *"!!"* || "$msg" == *"损坏"* ]] && bad=1
     done
+    if [[ $bad == 1 ]]; then
+        echo ""
+        echo "!! ply 被截断 —— 不要拿去打分。先查配额:  quota -s ; df -h /scr" >&2
+        return 1
+    fi
 
     if [[ "$SCORE" != "1" ]]; then
         echo ""

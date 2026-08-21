@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from collections import defaultdict
@@ -547,9 +548,21 @@ def save_ply(path: Path, points: np.ndarray, colors: np.ndarray) -> None:
               f"element vertex {len(points)}\n"
               "property float x\nproperty float y\nproperty float z\n"
               "property uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n")
+    head = header.encode("ascii")
+    want = len(head) + v.nbytes
     with path.open("wb") as f:
-        f.write(header.encode("ascii"))
+        f.write(head)
         v.tofile(f)
+        # 网络/配额文件系统上, 缓冲写在配额耗尽时不会立刻报错 —— 错误只在 flush
+        # 时冒出来, 不 fsync 的话可能连 flush 都不报, 于是留下一个只有文件头的
+        # ply, 而调用方还照常打印 "N points"。2026-08-22 那次 dedup 融合就是:
+        # 逐 scan 打印 700-1200 万点, du 却只有 45K。
+        f.flush()
+        os.fsync(f.fileno())
+    got = path.stat().st_size
+    if got != want:
+        raise IOError(f"{path} 写入不完整: {got} 字节, 应为 {want} "
+                      f"({len(points):,} 点)。多半是磁盘配额满了 —— 先 df/quota 再重跑。")
 
 
 @torch.no_grad()
