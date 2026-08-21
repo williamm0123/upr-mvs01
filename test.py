@@ -124,6 +124,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--conf-mode", choices=["product", "geomean", "last"], default="product",
                    help="how to combine per-stage mode mass; 'last' reproduces the inert "
                         "pre-fix behaviour for A/B only")
+    p.add_argument("--fusion", choices=["geo", "gipuma"], default="geo",
+                   help="geo = 内置的几何+光度一致性 (每个 ref 视角各输出一遍存活像素, "
+                        "**跨视角不去重**, 49 视角下一个 scan 出 2500-4500 万点); "
+                        "gipuma = 调 fusibile 二进制, 它把跨视角一致的点聚成一个, "
+                        "通常降到 1-3M 点。先跑 scripts/build_fusibile.sh 编译。")
+    p.add_argument("--fusibile-exe", default="third_party/fusibile/fusibile",
+                   help="fusibile 可执行文件 (相对路径按项目根解析)")
+    p.add_argument("--gipuma-disp-thresh", type=float, default=0.25,
+                   help="fusibile 的视差一致性阈值 (MVSFormer++ 用 0.25)")
+    p.add_argument("--gipuma-num-consistent", type=int, default=3,
+                   help="fusibile 要求的一致视角数 (MVSFormer++ 用 3)")
+    p.add_argument("--keep-gipuma-tmp", action="store_true",
+                   help="保留导出的中间目录 (每个 scan 约 1GB), 默认跑完即删")
     p.add_argument("--geo-views", type=int, default=3, help="min consistent source views")
     p.add_argument("--geo-pix", type=float, default=1.0, help="max reprojection error (px)")
     p.add_argument("--geo-rel", type=float, default=0.01, help="max relative depth difference")
@@ -609,6 +622,29 @@ def fuse_scan(scan_dir: Path, args, device: torch.device) -> tuple[np.ndarray, n
 def run_fusion(out_root: Path, ply_dir: Path, args, device: torch.device) -> Path:
     ply_dir.mkdir(parents=True, exist_ok=True)
     scan_dirs = sorted((out_root / "depth").iterdir())
+
+    if args.fusion == "gipuma":
+        from utils.fusion_gipuma import fuse_scan_gipuma
+        exe = Path(args.fusibile_exe)
+        if not exe.is_absolute():
+            exe = Path(ProjectPaths().project_path) / exe
+        if not exe.exists():
+            raise SystemExit(
+                f"找不到 fusibile: {exe}\n"
+                "先编译: bash scripts/build_fusibile.sh\n"
+                "或改用内置融合: --fusion geo (但它不做跨视角去重, 点数会是几千万)")
+        print(f"[fuse] backend=gipuma exe={exe} disp={args.gipuma_disp_thresh} "
+              f"num_consistent={args.gipuma_num_consistent} photo_thresh={args.photo_thresh}")
+        for sd in scan_dirs:
+            scan_id = int(sd.name.replace("scan", ""))
+            out = ply_dir / f"mvsnet{scan_id:03d}_l3.ply"
+            n = fuse_scan_gipuma(sd, out, str(exe), args.photo_thresh,
+                                 args.gipuma_disp_thresh, args.gipuma_num_consistent,
+                                 keep_tmp=args.keep_gipuma_tmp)
+            print(f"[fuse] {sd.name}: {n:,} points -> {out}" if n >= 0
+                  else f"[fuse] {sd.name}: -> {out}")
+        return ply_dir
+
     for sd in scan_dirs:
         scan_id = int(sd.name.replace("scan", ""))
         pts, cols = fuse_scan(sd, args, device)
