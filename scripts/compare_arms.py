@@ -37,6 +37,15 @@ DIAGS = [
     ("train/diag_stage3_floor_binding", "s3_floor"),
     ("train/diag_stage4_in_range", "s4_in_rng"),
     ("train/diag_stage1_guard_win_rate", "guard_win"),
+    # 第二轮新增: 决定 floor 抬多少 / 双模态值不值得做 / fp16 溢出监控
+    ("train/diag_stage4_need_half_p90", "need_half90"),
+    ("train/diag_stage4_have_half_mean", "have_half"),
+    ("train/diag_stage4_cover_x2", "cover_x2"),
+    ("train/diag_stage4_frac_floorbound", "floorbound"),
+    ("train/diag_stage1_gt_rank_le2", "gt_rank<=2"),
+    ("train/diag_stage4_adapt_scale", "adapt_scale"),
+    ("train/diag_branch_bp_beta", "bp_beta"),
+    ("train/diag_cost_max_s4", "cost_max_s4"),
 ]
 
 
@@ -118,6 +127,7 @@ def main() -> None:
     print("  amp_scale 一路下滑 / nonfin_frac 非 0 = 溢出在变频繁, 是发散的提前量")
     print("  need_half90 > have_half = 窗口不够宽; cover_x2 = 窗宽翻倍后的覆盖率")
     print("  gt_rank<=2 高 = 正确候选常在 top-2, 双模态才值得做")
+    print("  cost_max_s4 > 65504 = fp16 装不下 —— 2026-08-21 五个 arm 就死在这")
 
     print(f"\n深度分桶: abs_err / stage4 覆盖率 / 覆盖条件下的误差 (q0 近 -> q3 远)\n")
     print(f"{'':<16}" + "".join(f"{n[:11]:>12}" for n in names))
