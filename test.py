@@ -127,8 +127,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--fuse-only", action="store_true",
                    help="跳过推理, 直接拿 --out 下已缓存的逐视角深度重新融合。换融合方法或"
                         "调阈值时用它 —— 重跑推理是 3 个 arm x 1078 样本的浪费。")
-    p.add_argument("--fusion", choices=["geo", "dedup", "gipuma"], default="geo",
-                   help="geo = 几何+光度一致性, 每个 ref 视角各输出一遍存活像素, "
+    p.add_argument("--fusion", choices=["geo", "dedup", "gipuma"], default="dedup",
+                   help="默认 dedup。geo = 几何+光度一致性, 每个 ref 视角各输出一遍存活像素, "
                         "**跨视角不去重** —— 49 视角下一个 scan 出 2500-4500 万点; "
                         "dedup = geo 再加 fusibile 式的跨视角消费标记, 同一个表面点只由"
                         "最先认领它的 ref 视角输出一次 (纯 torch, 无外部依赖); "

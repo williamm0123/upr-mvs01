@@ -29,7 +29,9 @@ GPU_ID=${GPU_ID:-0}
 # ---- 跑哪些数据 -------------------------------------------------------------
 PHASE=${PHASE:-all}               # all | priors | infer | fuse
 # fuse = 只重新融合已缓存的深度, 不跑先验也不跑推理。换融合方法/调阈值时用它。
-FUSION=${FUSION:-geo}             # geo = 内置 (逐视角输出, 不去重); gipuma = fusibile (去重)
+# dedup = 内置融合 + fusibile 式跨视角去重 (默认); geo = 不去重的旧行为;
+# gipuma = 外部 fusibile 二进制
+FUSION=${FUSION:-dedup}
 FUSIBILE_EXE=${FUSIBILE_EXE:-third_party/fusibile/fusibile}
 GIPUMA_DISP=${GIPUMA_DISP:-0.25}  # MVSFormer++ 的取值
 GIPUMA_NC=${GIPUMA_NC:-3}

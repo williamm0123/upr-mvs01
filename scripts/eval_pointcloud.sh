@@ -47,20 +47,68 @@ RESIZE=${RESIZE:-0.8}         # 见上面关于口径的说明
 NUM_VIEWS=${NUM_VIEWS:-5}     # 与训练一致; 降到 3 明显变差
 EXP_ROOT=log/experiments
 # --- 融合后端 ---
-# geo    = 内置的几何+光度一致性。每个 ref 视角各输出一遍存活像素, **跨视角不去重**,
-#          49 视角下一个 scan 出 2500-4500 万点、ply 约 600MB。
-# gipuma = 调 fusibile 二进制, 把跨视角一致的点聚成一个, 通常降到 1-3M 点。
-#          需要先编译: bash scripts/build_fusibile.sh (或指向已有的一份)。
-FUSION=${FUSION:-geo}
+# dedup  = 默认。内置的几何+光度一致性, 再加 fusibile 式的跨视角消费标记: 一个 ref
+#          像素被写成点之后, 它在各源视角里对应的像素标记为已消费, 那些视角轮到当
+#          ref 时跳过。同一个表面点只输出一次。纯 torch, 无外部依赖。
+# geo    = 旧行为, **跨视角不去重** —— 49 视角下一个 scan 出 2500-4500 万点、
+#          ply 约 600MB。留着只为对照。
+# gipuma = 外部 fusibile 二进制。A100 是 sm_80, CUDA 11 支持, 所以 HPC 上可以编
+#          (bash scripts/build_fusibile.sh, 需要 module load cuda/11.x —— CUDA 12
+#          移除了它用的 texture reference API)。
+FUSION=${FUSION:-dedup}
 FUSIBILE_EXE=${FUSIBILE_EXE:-third_party/fusibile/fusibile}
+PHOTO_THRESH=${PHOTO_THRESH:-0.3}   # MVSFormer++ 用 0.5; 换阈值要三个 arm 一起换
+GEO_VIEWS=${GEO_VIEWS:-3}
+TAG=${TAG:-$FUSION}                 # ply 目录后缀, 不同融合/阈值的结果可并存对比
+# 打分 (可选): 装了 Fast-DTU-Evaluation 和 DTU GT 才跑, 否则只提示命令。
+SCORE=${SCORE:-0}
+EVAL_TOOL=${EVAL_TOOL:-$PWD/third_party/Fast-DTU-Evaluation}
+EVAL_GT=${EVAL_GT:-/scr/user/qinglong/dataset/DTU/SampleSet/MVS Data}
 # REFUSE=1: 跳过推理, 直接拿 log/depth_cache/test_<arm> 里已缓存的深度重新融合。
 # 换融合方法或调阈值时用它 —— 重跑推理是每个 arm 1078 个样本的浪费。
 REFUSE=${REFUSE:-0}
 
+# --- 打分 (可选) -------------------------------------------------------------
+score_all () {
+    echo ""
+    echo "=== ply 大小 ==="
+    for arm in $ARMS; do
+        d="log/pred_points_${arm}_${TAG}"
+        echo "    $arm: $(du -sh "$d" 2>/dev/null | cut -f1)  ($(ls "$d"/*.ply 2>/dev/null | wc -l) 个)"
+    done
+
+    if [[ "$SCORE" != "1" ]]; then
+        echo ""
+        echo "=== 打分是独立的第三步 (SCORE=1 可让本脚本代跑) ==="
+        for arm in $ARMS; do
+            echo "  python eval_dtu.py --method mvsnet --save \\"
+            echo "      --pred_dir $PWD/log/pred_points_${arm}_${TAG} --gt_dir \"$EVAL_GT\""
+        done
+        echo "=== overall 与 Phase-1 的 0.326mm 比; arm 之间的差值才是结论 ==="
+        return
+    fi
+
+    [[ -f "$EVAL_TOOL/eval_dtu.py" ]] || { echo "SCORE=1 但找不到 $EVAL_TOOL/eval_dtu.py" >&2; return 1; }
+    [[ -d "$EVAL_GT" ]] || { echo "SCORE=1 但找不到 DTU GT: $EVAL_GT" >&2; return 1; }
+    if [[ "$SMOKE" == "1" ]]; then SCAN_IDS=(1); else SCAN_IDS=($(sed 's/scan//' lists/dtu/test.txt)); fi
+    for arm in $ARMS; do
+        echo ""
+        echo "=== 打分 $arm ==="
+        ( cd "$EVAL_TOOL" && python eval_dtu.py \
+            --scans "${SCAN_IDS[@]}" --method mvsnet --save \
+            --pred_dir "$OLDPWD/log/pred_points_${arm}_${TAG}" \
+            --gt_dir "$EVAL_GT" \
+            --out_dir "$OLDPWD/log/dtu_eval/${arm}_${TAG}" )
+    done
+    echo ""
+    echo "=== 打分结果在 log/dtu_eval/<arm>_${TAG}/ ==="
+}
+
 echo "=== job=${SLURM_JOB_ID:-manual} host=$(hostname) ==="
 echo "=== git=$(git rev-parse --short=12 HEAD) ==="
 nvidia-smi -L
-echo "=== arms=$ARMS resize=$RESIZE views=$NUM_VIEWS smoke=$SMOKE fusion=$FUSION refuse=$REFUSE ==="
+echo "=== arms=$ARMS resize=$RESIZE views=$NUM_VIEWS smoke=$SMOKE ==="
+echo "=== fusion=$FUSION tag=$TAG photo_thresh=$PHOTO_THRESH geo_views=$GEO_VIEWS refuse=$REFUSE score=$SCORE ==="
 
 if [[ "$FUSION" == "gipuma" ]]; then
     _exe="$FUSIBILE_EXE"; [[ "$_exe" = /* ]] || _exe="$PWD/$_exe"
@@ -77,20 +125,29 @@ if [[ "$REFUSE" == "1" ]]; then
         echo "=== arm=$arm 重新融合 (backend=$FUSION) ==="
         PHASE=fuse SMOKE="$SMOKE" NUM_VIEWS="$NUM_VIEWS" RESIZE="$RESIZE" FULL_IMAGE=1 FUSE=1 \
             FUSION="$FUSION" FUSIBILE_EXE="$FUSIBILE_EXE" \
+        PHOTO_THRESH="$PHOTO_THRESH" GEO_VIEWS="$GEO_VIEWS" \
+            PHOTO_THRESH="$PHOTO_THRESH" GEO_VIEWS="$GEO_VIEWS" \
             OUT="log/depth_cache/test_$arm" \
-            PLY_DIR="log/pred_points_${arm}_${FUSION}" \
+            PLY_DIR="log/pred_points_${arm}_${TAG}" \
             bash scripts/test_dtu.sh
     done
-    echo ""
-    for arm in $ARMS; do echo "===   $arm -> log/pred_points_${arm}_${FUSION}/"; done
+    score_all
     exit 0
 fi
 
 # --- 先确认权重都在, 免得建完 prior 才发现少一个 --------------------------
+declare -A CKPT
 for arm in $ARMS; do
-    ck="$EXP_ROOT/$arm/model/best.pth"
-    [[ -f "$ck" ]] || { echo "找不到 $ck" >&2; exit 1; }
-    echo "    $arm -> $ck"
+    # HPC 上训练写的是 <arm>/model/best.pth; 从别处拷过来的可能少一层。两种都认。
+    for c in "$EXP_ROOT/$arm/model/best.pth" "$EXP_ROOT/$arm/best.pth"; do
+        [[ -f "$c" ]] && { CKPT[$arm]=$c; break; }
+    done
+    [[ -n "${CKPT[$arm]:-}" ]] || {
+        echo "找不到 $arm 的权重。找过 $EXP_ROOT/$arm/{model/,}best.pth" >&2
+        echo "现有: $(ls "$EXP_ROOT/$arm" 2>/dev/null | tr '\n' ' ')" >&2
+        exit 1
+    }
+    echo "    $arm -> ${CKPT[$arm]}"
 done
 
 # --- 阶段 1: 测试集 prior, 只建一次, 两个 arm 共用 ------------------------
@@ -110,16 +167,16 @@ for arm in $ARMS; do
     PHASE=infer BUILD_PRIORS=skip SMOKE="$SMOKE" \
         NUM_VIEWS="$NUM_VIEWS" RESIZE="$RESIZE" FULL_IMAGE=1 FUSE=1 \
         FUSION="$FUSION" FUSIBILE_EXE="$FUSIBILE_EXE" \
-        CKPT="$EXP_ROOT/$arm/model/best.pth" \
+        PHOTO_THRESH="$PHOTO_THRESH" GEO_VIEWS="$GEO_VIEWS" \
+        CKPT="${CKPT[$arm]}" \
         OUT="log/depth_cache/test_$arm" \
-        PLY_DIR="log/pred_points_$arm" \
+        PLY_DIR="log/pred_points_${arm}_${TAG}" \
         bash scripts/test_dtu.sh
 done
 
 echo ""
 echo "======================================================================"
 echo "=== 完成。ply 在:"
-for arm in $ARMS; do echo "===   $arm -> log/pred_points_$arm/"; done
-echo "=== 下一步 (独立第三步): 用 Fast-DTU-Evaluation 对这两个目录打分,"
-echo "===   overall 与 Phase-1 的 0.326mm 比。两个 arm 之间的差值才是本次结论。"
+for arm in $ARMS; do echo "===   $arm -> log/pred_points_${arm}_${TAG}/"; done
 echo "======================================================================"
+score_all
