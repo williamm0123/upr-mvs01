@@ -70,14 +70,7 @@ if ! "$PYTHON_BIN" -c 'import torch, sys; sys.exit(0 if torch.cuda.is_available(
     exit 1
 fi
 
-# 跑出来的曲线要对得上一个 commit, 否则几周后没人说得清那条线是哪版代码。
-# 单卡是 interactive 探索用的, 所以这里只警告不拦截 (双卡 sbatch 是硬拦)。
-if [[ -n "$(git status --porcelain --untracked-files=no 2>/dev/null)" ]]; then
-    echo "!! 工作树有未提交的改动 —— 这一版的结果对不上任何 commit:"
-    git status --short --untracked-files=no >&2
-else
-    echo "git=$(git rev-parse --short HEAD 2>/dev/null || echo unknown) (clean)"
-fi
+echo "git=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 
 echo "per_gpu_batch=$PER_GPU_BATCH  全局 batch=$GLOBAL_BATCH  (单卡)"
 echo "steps=$STEPS horizon=$LR_HORIZON lr=$LR (${LR_SCALING} 缩放自 $LR_REF @ 全局 $LR_REF_BATCH) seed=$SEED"

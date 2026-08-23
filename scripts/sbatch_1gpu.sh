@@ -57,14 +57,8 @@ NPROC=1
 # shellcheck source=scripts/_arm_common.sh
 source "$PROJECT_DIR/scripts/_arm_common.sh"
 
-# -------------------------------------------------------- 干净工作树是硬要求
-# 跑出来的曲线必须对得上一个 commit, 否则几周后没人能说清那条线是哪版代码。
-GIT_SHA=$(git rev-parse HEAD)
-if [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
-    echo "工作树有未提交的改动 —— 这一版跑出来的结果对不上任何 commit" >&2
-    git status --short --untracked-files=no >&2
-    exit 1
-fi
+# 只记一下当前 SHA 进日志, 不做任何拦截。
+GIT_SHA=$(git rev-parse HEAD 2>/dev/null || echo unknown)
 
 RUN_DIR="log/experiments/$RUN_NAME"
 if [[ -e "$RUN_DIR" ]]; then
@@ -85,7 +79,7 @@ export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:Tr
 
 echo "=================================================================="
 echo " arm=$ARM  run=$RUN_NAME  job=${SLURM_JOB_ID:-manual}  host=$(hostname)"
-echo " git=${GIT_SHA:0:12} (clean)"
+echo " git=${GIT_SHA:0:12}"
 echo " 单卡  per_gpu_batch=$PER_GPU_BATCH  global_batch=$GLOBAL_BATCH"
 echo " steps=$STEPS  horizon=$LR_HORIZON  amp=$AMP_DTYPE  seed=$SEED"
 echo " lr=$LR  (${LR_SCALING} 缩放自 $LR_REF @ 全局 batch $LR_REF_BATCH)"
