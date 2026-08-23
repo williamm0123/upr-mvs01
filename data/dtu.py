@@ -47,6 +47,10 @@ class DTUMVSDataset(Dataset):
         # nviews 不一致时长度对不上, collate 会报错。默认忽略 (网络 use_src_weights
         # 也默认 False), 需要时显式打开并保证缓存 view 数一致。
         self.use_src_weights = bool(kwargs.get('use_src_weights', False))
+        # W3-B: 是否连源视图的 GT 深度/mask 一起读。默认 False —— 打开等于每样本
+        # 多读 N-1 张 PFM + mask, 而且它们必须跑**完全一致**的 resize / crop /
+        # 增强路径, 否则遮挡标签会和 warp 出来的几何对不上。
+        self.load_src_depth = bool(kwargs.get('load_src_depth', False))
 
         # --- 逐样本确定性随机 ---
         # 增强、多尺度 resize、随机裁剪、prior 腐蚀原本各自调 np.random / 无种子
@@ -243,7 +247,7 @@ class DTUMVSDataset(Dataset):
         scan, light_idx, ref_view, _ = self.metas[idx]
         return self.prior_cache_dir / scan / f"prior_{ref_view:0>4}_{light_idx}.npz"
 
-    def precrop_inputs(self, idx, resize_scale=None, aug_params=None):
+    def precrop_inputs(self, idx, resize_scale=None, aug_params=None, load_src_depth=None):
         """Pre-crop multi-view inputs (before random crop), shared by both
         __getitem__ and the offline prior precompute so the two stay aligned.
 
@@ -255,8 +259,11 @@ class DTUMVSDataset(Dataset):
         view_ids = [ref_view] + src_views[:(self.nviews - 1)]
         resize_scale = self.resize_scale if resize_scale is None else resize_scale
 
+        if load_src_depth is None:
+            load_src_depth = getattr(self, "load_src_depth", False)
         resized_imgs, resized_intrinsics, extrinsics = [], [], []
         depth_hr = mask_hr = None
+        src_depth_hr, src_mask_hr = [], []
         depth_values = []
         for i, view_id in enumerate(view_ids):
             img_filename = os.path.join(self.datapath, 'Rectified_raw/{}/rect_{:0>3}_{}_r5000.png'.format(scan, view_id + 1, light_idx))
@@ -278,6 +285,16 @@ class DTUMVSDataset(Dataset):
                 depth_values = np.arange(depth_min, depth_max, depth_interval, dtype=np.float32)
                 if resize_scale != 1.0:
                     img, depth_hr, intrinsic, mask_hr = self.pre_resize(img, depth_hr, intrinsic, mask_hr, resize_scale)
+            elif load_src_depth:
+                # 源视图的 GT 必须走与参考视图**同一条** resize 路径 —— 差一个
+                # 插值方式或半个像素, 遮挡标签就落到相邻表面上了。
+                d_s = np.asarray(read_pfm(depth_filename_hr), dtype=np.float32)
+                m_s = self.read_mask(mask_filename_hr)
+                if resize_scale != 1.0:
+                    img, d_s, intrinsic, m_s = self.pre_resize(
+                        img, d_s, intrinsic, m_s, resize_scale)
+                src_depth_hr.append(d_s)
+                src_mask_hr.append(m_s)
             elif resize_scale != 1.0:
                 img, _, intrinsic, _ = self.pre_resize(img, None, intrinsic, None, resize_scale)
 
@@ -293,6 +310,8 @@ class DTUMVSDataset(Dataset):
             "extrinsics": np.stack(extrinsics, axis=0),
             "depth_hr": depth_hr,
             "mask_hr": mask_hr,
+            "src_depth_hr": src_depth_hr or None,
+            "src_mask_hr": src_mask_hr or None,
             "depth_values": depth_values,
             "scan": scan, "ref_view": ref_view, "light_idx": light_idx,
         }
@@ -356,13 +375,19 @@ class DTUMVSDataset(Dataset):
         images, intrinsics, projection_matrices = [], [], []
         # depth_gt = mask_gt = sfm_depth_crop = None
         depth_gt = mask_gt =  None
+        src_d_hr, src_m_hr = pc.get("src_depth_hr"), pc.get("src_mask_hr")
+        src_depth_gt, src_mask_gt = [], []
         for i in range(num_v):
+            _d_in = depth_hr if i == 0 else (src_d_hr[i - 1] if src_d_hr else None)
+            _m_in = mask_hr if i == 0 else (src_m_hr[i - 1] if src_m_hr else None)
             img, K, depth, mask = self.crop_at(
                 resized_imgs[i], resized_intrinsics[i], crop_x, crop_y,
-                depth_hr if i == 0 else None, mask_hr if i == 0 else None,
-                crop_h=crop_h, crop_w=crop_w)
+                _d_in, _m_in, crop_h=crop_h, crop_w=crop_w)
             if i == 0:
                 depth_gt, mask_gt = depth, mask
+            elif src_d_hr:
+                src_depth_gt.append(depth)
+                src_mask_gt.append(mask)
                 # _, _, sfm_depth_crop, _ = self.crop_at(
                 #     resized_imgs[0], resized_intrinsics[0], crop_x, crop_y, sfm_depth)
 
@@ -416,4 +441,9 @@ class DTUMVSDataset(Dataset):
         }
         if src_weights is not None:
             sample["src_weights"] = src_weights
+        if src_depth_gt:
+            # W3-B 的遮挡标签原料。与参考视图共用同一个 crop 窗口和同一组
+            # 光度增强参数, 所以 warp 出来的 uv 可以直接在这上面采样。
+            sample["src_depth_gt"] = np.stack(src_depth_gt, axis=0).astype(np.float32)
+            sample["src_mask_gt"] = np.stack(src_mask_gt, axis=0).astype(np.float32)
         return sample

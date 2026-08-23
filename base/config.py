@@ -234,6 +234,35 @@ class DepthRangeConfig:
     depth_adaptive_stages: tuple[bool, bool, bool] = (False, True, True)
     # floor = 只缩放下限; both = 连 range_k*winner_interval 那一项也缩放
     depth_adaptive_apply: str = "floor"
+
+    # ================= W1: 可学习的逆深度范围控制器 =================
+    # range_min_gi / range_max_gi / depth_adaptive_* 在 axis_space="inverse" 下
+    # **不再是训练期常数**, 只当 RangeController 的初始化值。它们没有被删除, 因为
+    # 1) axis_space="legacy_depth" 仍然要用; 2) 历史 checkpoint 要能复现;
+    # 3) 实现校验的 legacy 对照路径要有配置来源。
+    #
+    # legacy_depth —— 完全等价于现在的实现 (默认, 所有旧脚本行为不变)
+    # inverse      —— 可学习控制器 + 逆深度轴
+    axis_space: str = "legacy_depth"
+    # legacy 轴 -> inverse 轴的凸组合迁移步数。零初始化只保证"控制器不动手",
+    # 挡不住"深度均匀 -> 逆深度均匀"这个坐标变化, 所以要额外做轴的 blend。
+    axis_blend_steps: int = 2000
+    pnorm_p: float = 16.0          # p-范数软最大: A=B 时只比严格 max 高 4.4%
+    rho_max: float = 8.0           # 半宽相对基准的倍率上下界 [h0/rho, h0*rho]
+    ctrl_hidden: int = 32
+    ctrl_beta_init: float = 0.05   # softplus(beta) 的初值, 不用 softplus(0)=0.693
+    # 每级的目标覆盖率 (pinball 的 tau)。**tau 是优化目标不是保证** ——
+    # 实际覆盖必须在独立验证集上量, 见 stageK/coverage_at_tau。
+    tau_stages: tuple[float, float, float] = (0.98, 0.95, 0.92)
+    # SPRE 门 gamma 的初值, 第一个必须是 1.0 (gamma_k = gamma_{k-1}*sigmoid(a_k))
+    spre_gate_init: tuple[float, float, float, float] = (1.0, 0.60, 0.35, 0.20)
+    # SPRE 的 r/e 是否作为 meta 通道进入 stage2-4 的代价体正则器
+    spre_cascade: bool = False
+    # stage4 的深度头: expect = 现有的 mode-centered 期望; map = 硬选面 + 逐候选残差
+    stage4_head: str = "expect"
+    residual_scale: float = 0.5    # d_final = d_map + residual_scale * tanh(r) * interval
+    # 逐级的 mode_centered_regression 半窗。None 表示四级都用 mode_window。
+    mode_window_stages: tuple[int, int, int, int] | None = None
     edge_grad_rel: float = 0.03
     sigma_max_ratio: float = 0.15
     k_sigma: float = 3.0
@@ -255,6 +284,14 @@ class CostVolumeConfig:
     """
 
     num_groups: int = 8
+    # W3-A: 逐 (source, 假设) 几何有效 mask + 逐 voxel 归一化 + n_valid 通道
+    geo_valid_aggregation: bool = False
+    # softmax = 旧的 source 维竞争; sigmoid = 多标签独立可见性 (W3-B)
+    vis_mode: str = "softmax"
+    # W3-B: 用源视图 GT 深度给可见性头接遮挡监督。打开会让 dataset 每样本多读
+    # N-1 张 PFM + mask, 并在 stage1 多留一份 [S,B,D,H,W,(2)] 的投影几何。
+    # 需要 vis_mode="sigmoid" + visibility_weighting=True 才有意义。
+    vis_supervise: bool = False
     num_depths_stage1: int = 48   # = depth_range.num_global + num_local
     num_depths_stage2: int = 16
     num_depths_stage3: int = 8
@@ -291,6 +328,18 @@ class DecoderConfig:
     unet_base_channels: int = 16
     unet_depth: int = 3
     use_residual_to_vggt: bool = True
+
+    # ============== W3-C: 学出来的最终重建置信度 (models/fusion_conf.py) ==============
+    # 替代 test.cascade_confidence 那个手工概率乘积。目标 1[|d_final-gt| < conf_tau_mm],
+    # 训练完在验证集上做一次温度缩放, --photo-thresh 才第一次有物理含义。
+    fusion_conf: bool = False
+    # 头的输入是否 detach。默认 True: 它是一条**自带监督的旁路**, 只学 "怎么读
+    # 后验", 不许用 BCE 去反过来重塑深度特征 —— 否则 W3 的归因就说不清了。
+    fusion_conf_detach: bool = True
+    fusion_conf_hidden: int = 32
+    # head bias 的初值先验 (logit(p))。acc@2mm 实测在 0.9 附近, 从这里起步比
+    # 零 bias (先验 0.5) 收敛快也稳。
+    fusion_conf_prior: float = 0.9
 
 
 @dataclass(frozen=True)
@@ -355,6 +404,25 @@ class LossConfig:
     w_spre: float = 0.5           # corruption-BCE weight (corrupted prior -> 0, clean -> 1)
     w_spre_soft: float = 0.5      # prior-error soft-target weight
     spre_soft_tau_mm: float = 10.8 # exp(-(|prior-gt|/tau)^2) scale, in the depth unit (mm)
+
+    # ================= W1: 范围控制器与 stage4 残差 =================
+    # pinball(分位数)损失。非负、有下界, 宽度惩罚自带 —— 不要退回
+    # "hinge + lambda*log(half)", 那个目标在 half->0 时无下界。
+    w_range: float = 1.0
+    w_center: float = 0.2          # 防止左右非对称半宽与中心互相补偿
+    # stage4 逐候选残差。只监督离 GT 最近的那个 bin, 且只在 GT 落在范围内时。
+    w_residual: float = 1.0
+    # OOR 方向损失: 只告诉后验"正确答案在轴的哪一端", 不参与任何跨表面平均。
+    # 它正好覆盖 CE 掩码 (valid & in_range) 的补集。权重要小。
+    w_oor: float = 0.1
+    # W3-C 最终融合置信度 (v1 目标只用 |d-gt|<tau_mm, n_geo 前向拿不到)
+    w_conf: float = 0.0
+    conf_tau_mm: float = 2.0
+    # W3-B: 遮挡监督。y_vis = 1[z_src <= D_src_gt(pi(x)) + delta_occ_mm]。
+    # 多标签 —— 每个 (source, 候选) 独立 sigmoid, **不是** source 维 softmax:
+    # 真实情况常常是 4 个源视图全部可见, 强制竞争表达不了。
+    w_vis: float = 0.0
+    delta_occ_mm: float = 2.0
 
 
 @dataclass(frozen=True)

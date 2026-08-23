@@ -125,6 +125,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--conf-mode", choices=["product", "geomean", "last"], default="product",
                    help="how to combine per-stage mode mass; 'last' reproduces the inert "
                         "pre-fix behaviour for A/B only")
+    p.add_argument("--conf-source", choices=["auto", "cascade", "learned"], default="auto",
+                   help="W3-C: learned = 用训练出来的融合置信度头 (温度标定过, "
+                        "--photo-thresh 才有物理含义); cascade = 旧的手工概率乘积; "
+                        "auto = checkpoint 里有头就用头, 没有就退回 cascade")
     p.add_argument("--fuse-only", action="store_true",
                    help="跳过推理, 直接拿 --out 下已缓存的逐视角深度重新融合。换融合方法或"
                         "调阈值时用它 —— 重跑推理是 3 个 arm x 1078 样本的浪费。")
@@ -223,6 +227,25 @@ def build_dataset(cfg, args) -> DTUMVSDataset:
     return ds
 
 
+def eval_namespace(**overrides) -> argparse.Namespace:
+    """离线诊断脚本用的 args 命名空间。
+
+    ``build_dataset`` / ``load_model`` 读十来个 ``args.*`` 字段, 每个诊断脚本
+    自己拼一份 Namespace 的话, 漏一个字段就是一次 AttributeError, 而且三份会
+    慢慢漂移到不同的默认值上 (于是"同一个验证集"其实不是同一个)。这里给一份,
+    诊断脚本只覆盖自己关心的。
+    """
+    base = dict(
+        ckpt=None, ckpt_dir="log/model_eval", spre="auto",
+        split="val", list=None, no_clean_lists=False,
+        num_views=None, resize_scale=0.8, full_image=True,
+        scans=None, max_scans=0, max_refs=0,
+        num_workers=8, limit=0, cfg_override="auto",
+    )
+    base.update(overrides)
+    return argparse.Namespace(**base)
+
+
 def _resolve_ckpt(args) -> Path:
     """Explicit --ckpt wins. Otherwise prefer best.pth then latest.pth inside
     --ckpt-dir (default log/model_eval, a stable snapshot copied aside so eval
@@ -278,6 +301,29 @@ def _align_cfg_to_ckpt(cfg, state: dict, override: str = "auto", fingerprint=Non
                       cost_volume=replace(cfg.cost_volume,
                                           visibility_weighting=fingerprint["visibility_weighting"],
                                           use_src_weights=fingerprint["use_src_weights"]))
+        # W1/W3 的开关。它们里面有三个会改**参数形状** (spre_cascade 给
+        # stage2-4 的正则器 +2 通道, geo_valid +1 通道), 对不上就直接 load 失败;
+        # 其余的只改前向路径, 对不上则是"跑了另一个模型"而不报错 —— 更危险。
+        # 用 .get 带 legacy 默认值, 好让 2026-08-22 之前的 checkpoint 照常读。
+        cfg = replace(cfg,
+                      depth_range=replace(cfg.depth_range,
+                                          axis_space=fingerprint.get("axis_space", "legacy_depth"),
+                                          stage4_head=fingerprint.get("stage4_head", "expect"),
+                                          spre_cascade=fingerprint.get("spre_cascade", False),
+                                          mode_window_stages=(
+                                              tuple(fingerprint["mode_window_stages"])
+                                              if fingerprint.get("mode_window_stages") else None)),
+                      cost_volume=replace(cfg.cost_volume,
+                                          geo_valid_aggregation=fingerprint.get(
+                                              "geo_valid_aggregation", False),
+                                          vis_mode=fingerprint.get("vis_mode", "softmax")),
+                      decoder=replace(cfg.decoder,
+                                      fusion_conf=fingerprint.get("fusion_conf", False),
+                                      fusion_conf_detach=fingerprint.get(
+                                          "fusion_conf_detach", True)))
+        if fingerprint.get("tau_stages"):
+            cfg = replace(cfg, depth_range=replace(
+                cfg.depth_range, tau_stages=tuple(fingerprint["tau_stages"])))
         if override == "auto":
             cfg = replace(cfg, spre=replace(
                 cfg.spre, enabled=fingerprint["spre_enabled"],
@@ -465,6 +511,11 @@ def depth_vis(depth: np.ndarray) -> np.ndarray:
 def run_inference(model, ds, cfg, args, device, out_root: Path) -> dict:
     # [min, max, mean_sum, n] —— 融合置信度的饱和自检, 见下面的 WARNING
     _conf_samples: list = []      # 融合置信度的抽样, 用于下面的阈值自检
+    # risk-coverage 的原料。它是连接 val 与点云的那条桥: 按 conf 降序保留 kappa,
+    # 报 R(kappa)。相关性要在最终候选上**实测**确认, 不能预设。
+    _rc_conf: list = []
+    _rc_err: list = []
+    _conf_kind = "cascade"
     loader = DataLoader(ds, batch_size=1, shuffle=False,
                         num_workers=args.num_workers, collate_fn=_collate, pin_memory=True)
     use_amp = cfg.train.amp and device.type == "cuda"
@@ -479,7 +530,15 @@ def run_inference(model, ds, cfg, args, device, out_root: Path) -> dict:
         with torch.autocast(device_type=device.type, enabled=use_amp):
             outputs = model(batch)
         pred = outputs["depth_full"].float()
-        conf = cascade_confidence(outputs, window=args.conf_window, mode=args.conf_mode)
+        fc = outputs.get("fusion_conf")
+        if args.conf_source == "learned" and fc is None:
+            raise SystemExit("--conf-source learned 但这个 checkpoint 没有融合置信度头 "
+                             "(训练时需要 --conf-head on)")
+        if fc is not None and args.conf_source in ("auto", "learned"):
+            conf = fc["prob"].float()          # 已过温度标定
+            _conf_kind = f"learned(T={fc['T']:.3f})"
+        else:
+            conf = cascade_confidence(outputs, window=args.conf_window, mode=args.conf_mode)
         # 饱和自检: conf 恒为 1 意味着 --photo-thresh 门控是死的, 融合实际只跑了
         # 几何一致性。2026-08-08 那组 DTU 数就是这么废掉的。
         _conf_samples.append(conf.detach().flatten()[::97].float().cpu())
@@ -492,7 +551,10 @@ def run_inference(model, ds, cfg, args, device, out_root: Path) -> dict:
         dv = batch["depth_values"].float()
         m &= (gt >= dv.amin(dim=1).view(-1, 1, 1)) & (gt <= dv.amax(dim=1).view(-1, 1, 1))
         if m.any():
-            meter.update(scan, (pred[m] - gt[m]).abs())
+            err_m = (pred[m] - gt[m]).abs()
+            meter.update(scan, err_m)
+            _rc_conf.append(conf[m].detach().flatten()[::13].float().cpu())
+            _rc_err.append(err_m.detach().flatten()[::13].float().cpu())
 
         if args.fuse:
             d = out_root / "depth" / scan
@@ -520,7 +582,8 @@ def run_inference(model, ds, cfg, args, device, out_root: Path) -> dict:
         import numpy as _np
         q = _np.percentile(cs, [1, 5, 50, 95, 99])
         keep = float((cs > args.photo_thresh).mean())
-        print(f"[test] fusion confidence (window={args.conf_window}, mode={args.conf_mode}): "
+        print(f"[test] fusion confidence [{_conf_kind}] "
+              f"(window={args.conf_window}, mode={args.conf_mode}): "
               f"p1 {q[0]:.4f}  p5 {q[1]:.4f}  p50 {q[2]:.4f}  p95 {q[3]:.4f}  p99 {q[4]:.4f}")
         print(f"[test] --photo-thresh {args.photo_thresh} 保留 {100*keep:.2f}% 的像素")
         # "置信度不恒定" != "阈值有效"。真正要报警的是阈值一个像素都不筛,
@@ -531,7 +594,34 @@ def run_inference(model, ds, cfg, args, device, out_root: Path) -> dict:
                   f"这正是 2026-08-08 那组 DTU 数作废的原因。请按上面的分位数"
                   f"重新选阈值; 注意 product / geomean 的阈值不可互换。")
 
-    return {"overall": meter.overall(), "per_scan": per_scan}
+    rc = {}
+    if _rc_conf:
+        from models.fusion_conf import (
+            brier_score, expected_calibration_error, risk_at_coverage, risk_coverage,
+        )
+        c_all = torch.cat(_rc_conf)
+        e_all = torch.cat(_rc_err)
+        cov, rk, aurc = risk_coverage(c_all, e_all)
+        y2 = (e_all < 2.0).float()
+        rc = {
+            "conf_source": _conf_kind,
+            "aurc_mm": aurc,
+            "risk_at_0.6_mm": risk_at_coverage(c_all, e_all, 0.6),
+            "risk_at_1.0_mm": float(e_all.mean()),
+            "aurc_1m_acc2": risk_coverage(c_all, 1.0 - y2)[2],
+            "ece": expected_calibration_error(c_all, y2),
+            "brier": brier_score(c_all, y2),
+            "curve": {f"{float(k):.2f}": float(v) for k, v in
+                      zip(cov[::10].tolist(), rk[::10].tolist())},
+        }
+        print(f"[test] risk-coverage [{_conf_kind}]: AURC={aurc:.4f}mm  "
+              f"R(0.6)={rc['risk_at_0.6_mm']:.4f}mm  R(1.0)={rc['risk_at_1.0_mm']:.4f}mm")
+        # ECE 说的是"准不准", AURC 说的是"当过滤器好不好用" —— 两者可以一好一坏。
+        # AURC 好而 ECE 差 = 只需重新校准, 不必重训。
+        print(f"[test] calibration vs 1[|d-gt|<2mm]: ECE={rc['ece']:.4f}  "
+              f"Brier={rc['brier']:.4f}")
+
+    return {"overall": meter.overall(), "per_scan": per_scan, "risk_coverage": rc}
 
 
 # --------------------------------------------------------------------------- #

@@ -434,6 +434,11 @@ def _synthetic_batch(cfg, device: torch.device, batch_size: int) -> dict:
         "prior_corrupt_mask": (torch.rand(B, H, W) > 0.7),
     }
     batch["extrinsics"][:, 1:, 0, 3] = 5.0
+    if cfg.cost_volume.vis_supervise:
+        # W3-B 的遮挡监督也要走一遍 —— 否则 --smoke 覆盖不到 L_vis, 而那条路上
+        # 有 grid_sample 的坐标约定, 恰恰是最容易静默写错的地方。
+        batch["src_depth_gt"] = torch.rand(B, V - 1, H, W) * 400 + dmin
+        batch["src_mask_gt"] = (torch.rand(B, V - 1, H, W) > 0.2).float()
     return {k: v.to(device) for k, v in batch.items()}
 
 
@@ -536,6 +541,31 @@ def main_worker(
         dr_over["gate_local_branch"] = args.gate_local == "on"
     if args.branch_prior is not None:
         dr_over["branch_prior"] = args.branch_prior == "on"
+    if args.axis_space is not None:
+        dr_over["axis_space"] = args.axis_space
+    if args.axis_blend_steps is not None:
+        dr_over["axis_blend_steps"] = args.axis_blend_steps
+    if args.rho_max is not None:
+        dr_over["rho_max"] = args.rho_max
+    if args.tau_stages is not None:
+        v = tuple(float(x) for x in args.tau_stages.split(","))
+        if len(v) != 3 or not all(0.5 < x < 1.0 for x in v):
+            raise SystemExit("--tau-stages 需要三个 (0.5, 1.0) 内的值")
+        dr_over["tau_stages"] = v
+    if args.spre_cascade is not None:
+        dr_over["spre_cascade"] = args.spre_cascade == "on"
+    if args.spre_gate_init is not None:
+        v = tuple(float(x) for x in args.spre_gate_init.split(","))
+        if len(v) != 4 or abs(v[0] - 1.0) > 1e-6:
+            raise SystemExit("--spre-gate-init 需要四个值且第一个为 1.0")
+        dr_over["spre_gate_init"] = v
+    if args.stage4_head is not None:
+        dr_over["stage4_head"] = args.stage4_head
+    if args.mode_window_stages is not None:
+        v = tuple(int(x) for x in args.mode_window_stages.split(","))
+        if len(v) != 4:
+            raise SystemExit("--mode-window-stages 需要四个整数")
+        dr_over["mode_window_stages"] = v
     if dr_over:
         cfg = replace(cfg, depth_range=replace(cfg.depth_range, **dr_over))
     # num_depths_stage1 必须恒等于 num_global + num_local (network.py 会断言),
@@ -550,8 +580,21 @@ def main_worker(
         cv_over["warp_channels_stage4"] = args.warp_channels_stage4
     if args.num_groups is not None:
         cv_over["num_groups"] = args.num_groups
+    if args.geo_valid is not None:
+        cv_over["geo_valid_aggregation"] = args.geo_valid == "on"
+    if args.vis_mode is not None:
+        cv_over["vis_mode"] = args.vis_mode
+    if args.vis_supervise is not None:
+        cv_over["vis_supervise"] = args.vis_supervise == "on"
     if cv_over:
         cfg = replace(cfg, cost_volume=replace(cfg.cost_volume, **cv_over))
+    dec_over = {}
+    if args.conf_head is not None:
+        dec_over["fusion_conf"] = args.conf_head == "on"
+    if args.conf_detach is not None:
+        dec_over["fusion_conf_detach"] = args.conf_detach == "on"
+    if dec_over:
+        cfg = replace(cfg, decoder=replace(cfg.decoder, **dec_over))
     if args.stage1_weight is not None:
         cfg = replace(cfg, stage_weights=replace(cfg.stage_weights, stage1=args.stage1_weight))
     loss_over = {}
@@ -559,6 +602,13 @@ def main_worker(
         loss_over["w_branch"] = args.w_branch
     if args.spre_balance_corrupt is not None:
         loss_over["spre_balance_corrupt"] = args.spre_balance_corrupt == "on"
+    for _a, _k in (("w_range", "w_range"), ("w_center", "w_center"),
+                   ("w_residual", "w_residual"), ("w_oor", "w_oor"),
+                   ("w_conf", "w_conf"), ("conf_tau_mm", "conf_tau_mm"),
+                   ("w_vis", "w_vis"), ("delta_occ_mm", "delta_occ_mm")):
+        _v = getattr(args, _a, None)
+        if _v is not None:
+            loss_over[_k] = _v
     if loss_over:
         cfg = replace(cfg, loss=replace(cfg.loss, **loss_over))
 
@@ -1254,6 +1304,18 @@ def _arch_fingerprint(cfg) -> dict:
         "spre_balance_corrupt": cfg.loss.spre_balance_corrupt,
         "range_k": list(cfg.depth_range.range_k),
         "range_min_gi": list(cfg.depth_range.range_min_gi),
+        "axis_space": cfg.depth_range.axis_space,
+        "axis_blend_steps": cfg.depth_range.axis_blend_steps,
+        "stage4_head": cfg.depth_range.stage4_head,
+        "mode_window_stages": (list(cfg.depth_range.mode_window_stages)
+                               if cfg.depth_range.mode_window_stages else None),
+        "spre_cascade": cfg.depth_range.spre_cascade,
+        "tau_stages": list(cfg.depth_range.tau_stages),
+        "geo_valid_aggregation": cfg.cost_volume.geo_valid_aggregation,
+        "vis_mode": cfg.cost_volume.vis_mode,
+        "vis_supervise": cfg.cost_volume.vis_supervise,
+        "fusion_conf": cfg.decoder.fusion_conf,
+        "fusion_conf_detach": cfg.decoder.fusion_conf_detach,
         "range_max_gi": cfg.depth_range.range_max_gi,
         "local_half_gi": [cfg.depth_range.local_half_min_gi, cfg.depth_range.local_half_max_gi],
         "gate_hard_conf": cfg.depth_range.gate_hard_conf,
@@ -1306,6 +1368,7 @@ def _run_training(model, loss_fn, optimizer, scaler, cfg, device, args, world_si
         prior_corruption_prob=cfg.train.prior_corruption_prob,
         seed=cfg.train.seed,
         use_src_weights=cfg.cost_volume.use_src_weights,
+        load_src_depth=cfg.cost_volume.vis_supervise,
         # Augmentation is train-only: val must stay deterministic or best.pth
         # gets selected on a moving target.
         aug=PhotometricAug(
@@ -1350,6 +1413,7 @@ def _run_training(model, loss_fn, optimizer, scaler, cfg, device, args, world_si
         nviews=cfg.train.num_views,
         mode="val",
         use_src_weights=cfg.cost_volume.use_src_weights,
+        load_src_depth=cfg.cost_volume.vis_supervise,
     )
     # A silently-empty val split poisons best.pth (val abs_err computes to 0.0
     # at the first validation and can never be beaten). Fail loudly instead.
@@ -1584,6 +1648,45 @@ def main() -> None:
                              "构造所以 RNG 流一致; affine = 用逆深度仿射标定过的缓存")
     parser.add_argument("--prior-cache", type=str, default=None,
                         help="覆盖先验缓存目录 (--prior affine 时指向仿射标定的那一份)")
+    # ================= W1 / W3 开关 (默认全部等价于旧行为) =================
+    parser.add_argument("--axis-space", choices=["legacy_depth", "inverse"], default=None,
+                        help="legacy_depth=现有实现(默认); inverse=可学习控制器+逆深度轴")
+    parser.add_argument("--axis-blend-steps", type=int, default=None,
+                        help="legacy 轴 -> inverse 轴的凸组合迁移步数, 默认 2000")
+    parser.add_argument("--tau-stages", type=str, default=None,
+                        help="三级 pinball 目标覆盖率, 逗号分隔, 默认 0.98,0.95,0.92")
+    parser.add_argument("--rho-max", type=float, default=None,
+                        help="半宽相对基准的倍率界 [h0/rho, h0*rho], 默认 8")
+    parser.add_argument("--spre-cascade", choices=["on", "off"], default=None,
+                        help="SPRE 的 r/e 作为 meta 通道进入 stage2-4 的正则器")
+    parser.add_argument("--spre-gate-init", type=str, default=None,
+                        help="四级 SPRE 门初值, 第一个必须是 1.0, 默认 1.0,0.6,0.35,0.2")
+    parser.add_argument("--stage4-head", choices=["expect", "map"], default=None,
+                        help="expect=现有的 mode-centered 期望; map=硬选面+逐候选残差")
+    parser.add_argument("--mode-window-stages", type=str, default=None,
+                        help="四级各自的 mode_centered_regression 半窗, 逗号分隔")
+    parser.add_argument("--geo-valid", choices=["on", "off"], default=None,
+                        help="W3-A: 逐假设几何有效 mask + 逐 voxel 归一化 + n_valid 通道")
+    parser.add_argument("--vis-mode", choices=["softmax", "sigmoid"], default=None,
+                        help="softmax=旧的 source 维竞争; sigmoid=多标签独立可见性")
+    parser.add_argument("--w-range", type=float, default=None)
+    parser.add_argument("--w-center", type=float, default=None)
+    parser.add_argument("--w-residual", type=float, default=None)
+    parser.add_argument("--w-oor", type=float, default=None)
+    parser.add_argument("--conf-head", choices=["on", "off"], default=None,
+                        help="W3-C: 学出来的融合置信度头 (替代 test.cascade_confidence)")
+    parser.add_argument("--conf-detach", choices=["on", "off"], default=None,
+                        help="置信度头的输入是否 detach, 默认 on (旁路, 不重塑深度特征)")
+    parser.add_argument("--w-conf", type=float, default=None)
+    parser.add_argument("--conf-tau-mm", type=float, default=None,
+                        help="置信度标签阈值 1[|d-gt| < tau], 默认 2.0mm")
+    parser.add_argument("--vis-supervise", choices=["on", "off"], default=None,
+                        help="W3-B: 用源视图 GT 深度给可见性头接遮挡监督 "
+                             "(要求 --vis-mode sigmoid --visibility on; "
+                             "dataset 每样本多读 N-1 张 PFM)")
+    parser.add_argument("--w-vis", type=float, default=None)
+    parser.add_argument("--delta-occ-mm", type=float, default=None,
+                        help="遮挡容差 y_vis = 1[z_src <= D_gt(pi(x)) + delta], 默认 2.0mm")
     parser.add_argument("--range-min-gi", type=str, default=None,
                         help="三个转移的窗宽下限, 逗号分隔, 如 '0.66,0.20,0.10'")
     parser.add_argument("--depth-adaptive", choices=["on", "off"], default=None,

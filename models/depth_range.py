@@ -514,3 +514,154 @@ def apply_branch_prior(
     out.scatter_(1, global_idx, zg)
     out.scatter_(1, local_idx, zl)
     return torch.where(branch_active.unsqueeze(1), out, logits)
+
+
+# ===========================================================================
+#  W1: 逆深度轴 / 非均匀轴记账 / 物理口径的第二峰
+#  下面这一组是 refine_range_from_posterior 的替代路径, 旧函数原样保留 ——
+#  它是 --axis-space legacy_depth 的实现, 也是实现校验时的对照。
+# ===========================================================================
+
+
+def local_intervals(hypos: torch.Tensor, min_interval: float = 1e-4) -> torch.Tensor:
+    """逐 bin 的局部间距 (h_{i+1} - h_{i-1})/2, 端点用单边差分。
+
+    ``hypos`` [B, D, H, W] 沿 dim=1 单调。返回同形状。
+
+    ``min_interval`` 是**有量纲**的下限, 默认 1e-4 只对**深度(毫米)轴**成立。
+    逆深度轴上典型间距是 1e-5 量级, 1e-4 会把整张图钉在同一个常数上 ——
+    w_bar 恒等于 1e-4, 窗口宽出 3-20 倍, 而且完全静默。逆深度轴的调用方一律
+    传 0.0, 退化由 ``robust_local_scale`` 的 ``> eps`` 过滤 + 回退 g_v 处理。
+
+    为什么必须逐 bin: 现在 network.py 用 ``span / (D-1)`` 当下一级的
+    ``winner_interval``, 也当 Huber 的 scale。深度均匀轴上这是对的, 逆深度
+    均匀轴上就不对了 —— 远端 bin 在深度空间里宽得多。不改这里, 前面所有
+    逆深度的工作都会被一个错误的归一化尺度吃掉。
+    """
+    d_next = torch.cat([hypos[:, 1:], hypos[:, -1:]], dim=1)
+    d_prev = torch.cat([hypos[:, :1], hypos[:, :-1]], dim=1)
+    interval = 0.5 * (d_next - d_prev)
+    interval = interval.clone()
+    if hypos.shape[1] >= 2:
+        interval[:, 0] = hypos[:, 1] - hypos[:, 0]
+        interval[:, -1] = hypos[:, -1] - hypos[:, -2]
+    return interval.abs().clamp_min(min_interval)
+
+
+def robust_local_scale(
+    intervals: torch.Tensor,
+    mode_idx: torch.Tensor,
+    fallback: torch.Tensor,
+    half: int = 2,
+    eps: float = 1e-9,
+    return_fallback: bool = False,
+):
+    """winner 邻域内正间距的中位数 —— 范围损失的归一化尺度。
+
+    为什么不能直接用 ``intervals.gather(1, mode_idx)``: stage1 的 16 个 local
+    bin 挤在先验附近, winner 落在两个近重复候选之间时局部间距会趋近 0, 而
+    范围损失要除以它 —— 少量像素就能产生极大梯度。中位数对近重复稳健。
+
+    ``fallback`` 广播到输出形状 (通常是 g_v), 邻域内没有有效正间距时用它。
+    返回 [B, H, W]。
+    """
+    D = intervals.shape[1]
+    offs = torch.arange(-half, half + 1, device=intervals.device).view(1, -1, 1, 1)
+    idx = (mode_idx + offs).clamp(0, D - 1)
+    w = intervals.gather(1, idx).float()
+    w = torch.where(w > eps, w, torch.full_like(w, float("nan")))
+    wbar = w.nanmedian(dim=1).values
+    fb = fallback.expand_as(wbar)
+    good = torch.isfinite(wbar) & (wbar > eps)
+    out = torch.where(good, wbar, fb)
+    if return_fallback:
+        # 回退比例偏高 = stage1 的近重复候选比预想严重 (wbar_fallback_frac)
+        return out, (~good).float().mean()
+    return out
+
+
+def to_inverse(depth: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """深度 -> 逆深度。深度升序的轴换过去就是逆深度降序, 调用方注意。"""
+    return 1.0 / depth.clamp_min(eps)
+
+
+def build_axis_inverse(
+    v_c: torch.Tensor,
+    h_lo: torch.Tensor,
+    h_hi: torch.Tensor,
+    num_depths: int,
+    v_min: torch.Tensor,
+    v_max: torch.Tensor,
+) -> torch.Tensor:
+    """在逆深度空间均匀布点, 转回深度并**按深度升序**返回。
+
+    左右可以不等宽 (控制器输出非对称半宽)。夹持由调用方在 v 空间用整体缩放 +
+    平移完成 (range_controller 里做), 这里只做最后一道安全 clamp。
+    """
+    t = torch.linspace(-1.0, 1.0, num_depths, device=v_c.device, dtype=torch.float32)
+    t = t.view(1, num_depths, 1, 1)
+    h = torch.where(t < 0, h_lo.unsqueeze(1), h_hi.unsqueeze(1))
+    v = v_c.unsqueeze(1) + h * t
+    v = v.clamp(min=v_min.unsqueeze(1), max=v_max.unsqueeze(1))
+    d = 1.0 / v.clamp_min(1e-8)
+    return d.flip(dims=[1])                     # v 升序 -> 深度降序 -> 翻转成升序
+
+
+def blend_axes(d_legacy: torch.Tensor, d_inverse: torch.Tensor, lam: float) -> torch.Tensor:
+    """legacy(深度均匀) -> inverse(逆深度均匀) 的凸组合迁移。
+
+    零初始化控制器只保证 "控制器不动手", 挡不住 "深度均匀 -> 逆深度均匀" 这个
+    坐标变化 —— 即使端点相同, 中间候选也必然不同。凸组合让 step 0 的候选轴
+    **真正等于** f10, 再在 warm-up 期内平滑迁移。两条轴都按深度升序, 凸组合
+    仍然升序。
+    """
+    if lam >= 1.0:
+        return d_inverse
+    if lam <= 0.0:
+        return d_legacy
+    return (1.0 - lam) * d_legacy + lam * d_inverse
+
+
+def second_mode_physical(
+    prob: torch.Tensor,
+    v_axis: torch.Tensor,
+    mode_idx: torch.Tensor,
+    h_sep: torch.Tensor,
+    h_mass: torch.Tensor,
+    sep_k: float = 2.0,
+):
+    """物理口径的 **deployable** 第二峰。
+
+    与旧 ``second_mode`` 的三点区别:
+      1. 分离性用 |v_j - v_m| 的**物理逆深度距离**, 不用 bin 索引距离 ——
+         stage1 是 global+local 混合轴, 相邻 local bin 可能只差零点几毫米。
+      2. 返回的是**峰邻域质量**, 不是 winner 邻域之外的总质量 (平坦后验一路假阳)。
+      3. 选峰用 "winner 之外、物理分离的局部极大里概率最高的那个", 不用 GT ——
+         这才是部署时拿得到的量。离线诊断脚本里另有一个用 GT 的 oracle 口径,
+         两者的差距就是 "峰存在但选不出来" 的部分。
+
+    返回 ``(v_second, mass, dv_peak, found, j2)``, 前四个各 [B, H, W],
+    ``j2`` 是 [B, 1, H, W] 的峰索引 (给 "回归窗口是否跨两个表面" 的诊断用)。
+    """
+    p_prev = torch.cat([prob[:, :1], prob[:, :-1]], dim=1)
+    p_next = torch.cat([prob[:, 1:], prob[:, -1:]], dim=1)
+    is_peak = (prob >= p_prev) & (prob >= p_next)
+
+    v_m = v_axis.gather(1, mode_idx)                                  # [B,1,H,W]
+    sep = (v_axis - v_m).abs() > (sep_k * h_sep).unsqueeze(1)
+    cand = is_peak & sep
+    score = torch.where(cand, prob.float(), torch.full_like(prob, -1.0, dtype=torch.float32))
+    j2 = score.argmax(dim=1, keepdim=True)
+    found = score.gather(1, j2) >= 0.0
+
+    v2 = v_axis.gather(1, j2)
+    near = (v_axis - v2).abs() <= h_mass.unsqueeze(1)
+    mass = torch.where(near, prob.float(), torch.zeros_like(prob, dtype=torch.float32)).sum(1, keepdim=True)
+    dv2 = (v2 - v_m).abs()
+
+    zero = torch.zeros_like(mass)
+    return (torch.where(found, v2, v_m).squeeze(1),
+            torch.where(found, mass, zero).squeeze(1),
+            torch.where(found, dv2, zero).squeeze(1),
+            found.squeeze(1),
+            j2)

@@ -63,11 +63,40 @@ class CostVolumeUNet(nn.Module):
         return self.head(feat).squeeze(1)
 
 
+def _posterior_sigma(prob: torch.Tensor, hypos: torch.Tensor) -> torch.Tensor:
+    """整条轴上的后验标准差。
+
+    MAP 模式下不再有 mode-centered 的 sigma, 但这个量仍然是有用的**特征**
+    (残差头和融合置信度头都要它), 只是不再当深度估计用。
+    """
+    p = prob.float()
+    h = hypos.float()
+    mu = (p * h).sum(dim=1, keepdim=True)
+    var = (p * (h - mu) ** 2).sum(dim=1)
+    return var.clamp_min(1e-12).sqrt()
+
+
 class DepthDecoder(nn.Module):
-    def __init__(self, in_channels: int = 8, base: int = 16, depth: int = 3, mode_window: int = 2) -> None:
+    """``head_mode``:
+
+    ``expect`` —— 现有行为: 在 argmax 附近 +-mode_window 个 bin 上做期望。
+    ``map``    —— 硬 MAP 选面, 深度 = argmax 对应的候选, 亚 bin 修正交给
+                  外面的逐候选残差头 (models/range_controller.Stage4ResidualHead)。
+
+    为什么 stage4 要 ``map``: ``mode_centered_regression`` 取
+    ``w = min(2*mode_window+1, D)``, 而 mode_window=2、num_depths_stage4=4 ->
+    w = 4 = **全轴**。stage4 的深度实际上是一次普通 soft-argmax; 窗口跨度
+    (f15 下 4.9mm) 在遮挡边界上常常同时含两个表面, 输出就落在两者之间。
+    """
+
+    def __init__(self, in_channels: int = 8, base: int = 16, depth: int = 3,
+                 mode_window: int = 2, head_mode: str = "expect") -> None:
         super().__init__()
         self.unet = CostVolumeUNet(in_channels=in_channels, base=base, depth=depth)
         self.mode_window = mode_window
+        self.head_mode = str(head_mode).lower()
+        if self.head_mode not in ("expect", "map"):
+            raise ValueError(f"head_mode 只能是 expect / map, 收到 {head_mode!r}")
         self.tag = "stage?"          # network.py 构造后写入, 只给探针用
 
     def forward(
@@ -95,6 +124,15 @@ class DepthDecoder(nn.Module):
         # Mode-centered regression instead of a global soft-argmin: over a
         # bimodal posterior (wrong local peak + correct global peak) the global
         # expectation lands between the peaks, on no real surface.
-        depth, sigma, mode_idx = mode_centered_regression(prob, depth_hypos.float(), self.mode_window)
+        if self.head_mode == "map":
+            # 硬选面: 不做任何跨 bin 的期望, 所以永远不会落在两个表面之间。
+            # argmax 不可导, 深度对后验没有梯度 —— 这是有意的: CE 训练选择,
+            # 逐候选残差训练亚 bin 修正, 两条监督互不污染。
+            mode_idx = prob.argmax(dim=1, keepdim=True)
+            depth = depth_hypos.float().gather(1, mode_idx).squeeze(1)
+            sigma = _posterior_sigma(prob, depth_hypos)
+        else:
+            depth, sigma, mode_idx = mode_centered_regression(
+                prob, depth_hypos.float(), self.mode_window)
         Probe.log(self.tag, "depth", depth)
         return depth, sigma, prob, logits, mode_idx, logits_raw

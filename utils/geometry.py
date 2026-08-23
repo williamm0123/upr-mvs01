@@ -50,7 +50,24 @@ def homography_warp_features(
     E_src: torch.Tensor,
     depth_hypos: torch.Tensor,
     feature_stride: int,
+    return_valid: bool = False,
+    return_geom: bool = False,
 ) -> torch.Tensor:
+    """``return_valid=True`` 时额外返回逐 (source, 假设, 像素) 的几何有效 mask。
+
+    W3-A: 这两个量 (z_src 和 uv) 本来就算出来了然后被扔掉; 出画幅的位置采到 0
+    之后照样进源视图平均, 系统性压低边界和被遮挡像素的相关性。默认 False 是
+    为了不改变任何现有调用方的行为。
+
+    ``return_geom=True`` (蕴含 return_valid) 再多返回 ``(uv_img, z_src)``,
+    W3-B 的遮挡标签要用: ``y_vis = 1[z_src <= D_src_gt(uv_img) + delta]``。
+
+    **uv_img 归一化到整幅图像而不是特征图**。K 在这里是按 ``K_img/stride`` 缩过的,
+    所以特征像素坐标 x stride 就是图像像素坐标 —— 精确, 没有半像素偏移。直接拿
+    特征网格的归一化坐标去采全分辨率 GT 会差半个 stride, 而遮挡标签恰恰在遮挡
+    边界上才有意义, 那正是半个 stride 会取到另一个表面的地方。
+    """
+    return_valid = return_valid or return_geom
     B, C, H, W = src_features.shape
     D = depth_hypos.shape[1]
     device = src_features.device
@@ -98,6 +115,22 @@ def homography_warp_features(
 
         uv_x = uv[:, 0] / (W - 1) * 2.0 - 1.0
         uv_y = uv[:, 1] / (H - 1) * 2.0 - 1.0
+        valid = None
+        if return_valid:
+            # 在 nan_to_num / clamp 之前算 —— clamp 之后出界的坐标会被压回 ±2,
+            # 分不出 "刚好在边上" 和 "远在画幅外"。z 用未 clamp 的原始值。
+            z_raw = pix_src[:, 2]
+            valid = ((z_raw > 1e-6)
+                     & (uv_x.abs() <= 1.0) & (uv_y.abs() <= 1.0)
+                     & torch.isfinite(uv_x) & torch.isfinite(uv_y) & torch.isfinite(z_raw))
+            valid = valid.view(B, D, H, W)
+        geom = None
+        if return_geom:
+            # 特征像素 -> 图像像素 -> 整幅图像的归一化坐标 (align_corners=True)
+            gx = (uv[:, 0] * feature_stride) / max(W * feature_stride - 1, 1) * 2.0 - 1.0
+            gy = (uv[:, 1] * feature_stride) / max(H * feature_stride - 1, 1) * 2.0 - 1.0
+            geom = (torch.stack([gx, gy], dim=-1).view(B, D, H, W, 2),
+                    z_src.view(B, D, H, W))
         grid_sample = torch.stack([uv_x, uv_y], dim=-1)
         # Sanitize before the (possibly fp16) cast: pixels behind the camera or far
         # out of frustum produce huge / non-finite coords that overflow fp16 and turn
@@ -114,7 +147,12 @@ def homography_warp_features(
             padding_mode="zeros",
             align_corners=True,
         )
-    return warped.view(B, D, C, H, W).permute(0, 2, 1, 3, 4).contiguous()
+    out = warped.view(B, D, C, H, W).permute(0, 2, 1, 3, 4).contiguous()
+    if return_geom:
+        return out, valid, geom[0], geom[1]
+    if return_valid:
+        return out, valid
+    return out
 
 
 

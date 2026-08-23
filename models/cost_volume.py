@@ -41,19 +41,39 @@ class VisibilityHead(nn.Module):
       mean  深度维均值                 (整体相关强度基线)
     """
 
-    def __init__(self, hidden: int = 16) -> None:
+    def __init__(self, hidden: int = 16, per_hypothesis: bool = False) -> None:
         super().__init__()
         self.net = nn.Sequential(
             nn.Conv2d(3, hidden, 1), nn.ReLU(inplace=True),
             nn.Conv2d(hidden, hidden, 3, padding=1), nn.ReLU(inplace=True),
             nn.Conv2d(hidden, 1, 1),
         )
+        # W3-B: 逐 (source, 假设) 的 logit。遮挡是**逐假设**的 —— 同一个像素,
+        # 近处那个候选可能可见而远处那个被挡住, per-pixel 的标量表达不了这件事。
+        # 输入多一路逐假设的相关性 c_j, 其余三个统计量沿 D 广播; 参数量仍然与 D
+        # 无关 (D 当成 batch 维送进 1x1 卷积)。
+        self.per_hypothesis = bool(per_hypothesis)
+        self.hyp_net = nn.Sequential(
+            nn.Conv2d(4, hidden, 1), nn.ReLU(inplace=True),
+            nn.Conv2d(hidden, hidden, 3, padding=1), nn.ReLU(inplace=True),
+            nn.Conv2d(hidden, 1, 1),
+        )
+        # 两条分支只走一条。没用的那条必须冻结 —— DDP 是
+        # find_unused_parameters=False, 一个"要梯度却没收到梯度"的参数会直接
+        # 让第二次 all-reduce 报错 (而且只在多卡上报, 单卡跑得好好的)。
+        # 两条都留在 state_dict 里, 所以两种 vis_mode 的 checkpoint 互相可加载。
+        (self.net if self.per_hypothesis else self.hyp_net).requires_grad_(False)
 
     def forward(self, cv_s: torch.Tensor) -> torch.Tensor:
         """``cv_s`` [B,G,D,H,W] -> 未归一化的 logits [B,1,H,W]。
 
-        调用方在收齐所有 source 之后在 source 维做 softmax —— 每个 source 独立
-        sigmoid 不构成竞争, 无法表达"这块区域该信谁"。
+        ``vis_mode='softmax'`` (旧行为): 调用方在 source 维做 softmax, 强制不同
+        视图竞争。**这是个建模错误** —— 可见性是多标签的, 4 个源视图完全可能同时
+        可见, 强制竞争大概也是它退化成近似恒等 (熵 0.974、有效源视角 3.87/4) 的
+        原因之一。
+
+        ``vis_mode='sigmoid'`` (W3-B): 每个 source 独立 sigmoid, 聚合时再按
+        sum(M*omega) 归一化。这一路可以接监督 (源视图 GT 深度的遮挡标签)。
         """
         c = cv_s.mean(dim=1)                                   # [B,D,H,W]
         peak = c.amax(dim=1, keepdim=True)
@@ -62,7 +82,13 @@ class VisibilityHead(nn.Module):
         D = c.shape[1]
         ent = (-(p * p.log()).sum(dim=1, keepdim=True) / max(torch.log(torch.tensor(float(D))).item(), 1e-6))
         x = torch.cat([peak, mean, ent.to(peak.dtype)], dim=1)
-        return self.net(x)                                      # [B,1,H,W] logits
+        if not self.per_hypothesis:
+            return self.net(x)                                  # [B,1,H,W] logits
+        B, Dn, Hh, Ww = c.shape
+        xb = x.unsqueeze(2).expand(B, 3, Dn, Hh, Ww)             # 沿 D 广播
+        f = torch.cat([c.unsqueeze(1), xb], dim=1)               # [B,4,D,H,W]
+        f = f.permute(0, 2, 1, 3, 4).reshape(B * Dn, 4, Hh, Ww)  # D 当 batch
+        return self.hyp_net(f).view(B, Dn, Hh, Ww)               # [B,D,H,W] logits
 
 
 class CostVolumeBuilder(nn.Module):
@@ -88,6 +114,8 @@ class CostVolumeBuilder(nn.Module):
         num_groups: int = 8,
         use_half: bool = True,
         visibility_weighting: bool = False,
+        vis_mode: str = "softmax",
+        geo_valid: bool = False,
     ) -> None:
         super().__init__()
         if warp_channels % num_groups != 0:
@@ -102,8 +130,24 @@ class CostVolumeBuilder(nn.Module):
         # 之后每个模块从全局 RNG 取到的随机数, 于是 "只关掉可见性头" 的消融实际上
         # 连 decoder 的初始权重都换了一套, 不是配对实验。这里始终建、始终消耗同样
         # 的 RNG, 关掉时它只是不参与前向也不产生梯度。
-        self.vis_head = VisibilityHead()
+        self.vis_mode = str(vis_mode).lower()
+        self.vis_head = VisibilityHead(per_hypothesis=(self.vis_mode == "sigmoid"))
         self.use_vis = bool(visibility_weighting)
+        # W3-B: 存下逐 source 的 logits 与投影几何, 让**损失侧**去算遮挡标签。
+        # 把源视图 GT 深度传进模型是另一条耦合, 没必要 —— 模型只需要交出
+        # "我在哪里、投到了哪儿", 标签怎么造是监督的事。
+        self.collect_vis_geom = False
+        self.last_vis_sup = None
+        # W3-A: 逐 (source, 假设) 的几何有效 mask + 逐 voxel 归一化 + n_valid 通道。
+        # 打开时 cost volume 多一个通道, 调用方的 in_channels 要 +1。
+        self.geo_valid = bool(geo_valid)
+        self.last_n_valid = None
+        # W3-C: source 间相关性的均值/方差 —— 融合置信度头的几何代理特征。
+        # 默认关: 它多留一个 [B,2,D,H,W] 的 detach 张量 (stage4 全分辨率约 10MB),
+        # 不用的时候没理由付这个钱。network.py 在构造后按需打开。
+        self.collect_src_stats = False
+        self.last_src_stats = None
+        self.last_n_valid_stats = None
         self.tag = "stage?"          # network.py 构造后写入, 只给探针用
         if not self.use_vis:
             # 关掉时冻结: 它拿不到梯度, 不冻结的话 DDP (find_unused_parameters=False)
@@ -165,19 +209,30 @@ class CostVolumeBuilder(nn.Module):
         weight_sum = ref_feat.new_zeros(B, 1, 1, 1, 1, dtype=torch.float32)
         # 两遍: 先收齐每个 source 的相关体和可见性 logits, 再在 source 维竞争
         # 归一化。一遍式的 per-source sigmoid 不构成竞争。
-        cvs, vlogits = [], []
+        cvs, vlogits, valids = [], [], []
+        geoms = [] if (self.collect_vis_geom and self.use_vis) else None
         for s in range(S):
             src_p = self.proj(src_feats[:, s]).to(sample_dtype)
             Probe.log(self.tag, "src_p", src_p, src=s)
-            warped = homography_warp_features(
-                src_p,
-                K_ref,
-                K_src[:, s],
-                E_ref,
-                E_src[:, s],
-                depth_hypos,
-                feature_stride,
-            )
+            if geoms is not None:
+                warped, valid_s, uv_img, z_src = homography_warp_features(
+                    src_p, K_ref, K_src[:, s], E_ref, E_src[:, s],
+                    depth_hypos, feature_stride, return_geom=True,
+                )
+                geoms.append((uv_img.detach(), z_src.detach()))
+                if self.geo_valid:
+                    valids.append(valid_s)
+            elif self.geo_valid:
+                warped, valid_s = homography_warp_features(
+                    src_p, K_ref, K_src[:, s], E_ref, E_src[:, s],
+                    depth_hypos, feature_stride, return_valid=True,
+                )
+                valids.append(valid_s)
+            else:
+                warped = homography_warp_features(
+                    src_p, K_ref, K_src[:, s], E_ref, E_src[:, s],
+                    depth_hypos, feature_stride,
+                )
             Probe.log(self.tag, "warped", warped, src=s)
             cv_s = group_wise_correlation(ref_p, warped, self.num_groups).float()
             Probe.log(self.tag, "cv_s", cv_s, src=s)
@@ -185,7 +240,28 @@ class CostVolumeBuilder(nn.Module):
             if self.use_vis:
                 vlogits.append(self.vis_head(cv_s))
         self.last_vis_stats = None
-        if self.use_vis:
+        self.last_vis_sup = None
+        if self.use_vis and self.vis_mode == "sigmoid":
+            # 多标签: 每个 source 独立 sigmoid, 不做竞争。4 个源视图完全可以同时
+            # 可见, softmax 强制的竞争表达不了这件事。均值不再恒为 1, 归一化交给
+            # 下面的 wsum。
+            zl = torch.stack(vlogits, dim=0).float()                  # [S,B,D,H,W]
+            vis = torch.sigmoid(zl).unsqueeze(2)                      # [S,B,1,D,H,W]
+            if geoms is not None:
+                self.last_vis_sup = {
+                    "logits": zl,
+                    "uv": torch.stack([g[0] for g in geoms], dim=0),  # [S,B,D,H,W,2]
+                    "z": torch.stack([g[1] for g in geoms], dim=0),   # [S,B,D,H,W]
+                }
+            with torch.no_grad():
+                v_ = vis.squeeze(2)
+                self.last_vis_stats = {
+                    "mean_w": float(v_.mean()),
+                    "frac_visible": float((v_ > 0.5).float().mean()),
+                    "eff_src": float(v_.sum(0).mean()),
+                    "num_src": float(S),
+                }
+        elif self.use_vis:
             pi = torch.softmax(torch.stack(vlogits, dim=0).float(), dim=0)   # [S,B,1,H,W]
             vis = pi * S                                                     # 均值恒为 1
             with torch.no_grad():
@@ -201,6 +277,10 @@ class CostVolumeBuilder(nn.Module):
                     "concentrated": float((mx > 0.7).float().mean()),
                     "num_src": float(S),
                 }
+        if self.geo_valid or (self.use_vis and self.vis_mode == "sigmoid"):
+            # 逐假设的权重让分母也必须逐假设 —— 标量分母会把 "这个候选只有一个
+            # 源视图看得见" 和 "四个都看得见" 归一化成同一个尺度。
+            weight_sum = ref_feat.new_zeros(B, 1, D, H, W, dtype=torch.float32)
         for s, cv_s in enumerate(cvs):
             w = (
                 src_weights[:, s].view(B, 1, 1, 1, 1).float()
@@ -208,10 +288,38 @@ class CostVolumeBuilder(nn.Module):
                 else ref_feat.new_ones(B, 1, 1, 1, 1, dtype=torch.float32)
             )
             if self.use_vis:
-                w = w * vis[s].unsqueeze(2)          # [B,1,1,H,W]
+                # softmax 路: vis[s] 是 [B,1,H,W] -> [B,1,1,H,W] 沿 D 广播。
+                # sigmoid 路: 已经是 [B,1,D,H,W], 逐假设的权重, 不再广播。
+                w = w * (vis[s] if self.vis_mode == "sigmoid" else vis[s].unsqueeze(2))
+            if self.geo_valid:
+                # 逐 (source, 假设, 像素) 的有效性进分子也进分母 —— 出画幅的
+                # warp 采到 0, 旧写法照样把这个 0 平均进去。
+                w = w * valids[s].unsqueeze(1).to(torch.float32)             # [B,1,D,H,W]
             agg = agg + cv_s * w
             weight_sum = weight_sum + w
         cost = agg / weight_sum.clamp(min=1e-6)
+        if self.collect_src_stats:
+            with torch.no_grad():
+                # 组维平均后在 source 维取均值/标准差: "各个源视图有多一致"。
+                gm = torch.stack([c.mean(dim=1) for c in cvs], dim=0).float()  # [S,B,D,H,W]
+                self.last_src_stats = torch.stack(
+                    [gm.mean(0), gm.std(0, unbiased=False)], dim=1)            # [B,2,D,H,W]
+        if self.geo_valid:
+            n_valid = torch.stack(valids, dim=0).sum(0).to(torch.float32)    # [B,D,H,W]
+            self.last_n_valid = n_valid.detach()
+            with torch.no_grad():
+                # p10 = 0 就说明有大量 voxel 一个源视图都没有支撑 —— 那些位置的
+                # cost 是纯 0, 需要 fallback 而不是当作 "相关性很低"。
+                f = n_valid.detach().flatten()[::97].float()
+                if f.numel():
+                    self.last_n_valid_stats = {
+                        "p10": float(f.quantile(0.10)), "p50": float(f.quantile(0.50)),
+                        "zero_frac": float((f == 0).float().mean()),
+                    }
+            # 一个 source 支撑的 voxel 和四个支撑的归一化后尺度相同但方差差 4 倍,
+            # 不把这件事告诉正则器, 它只能当噪声。
+            cost = torch.where(n_valid.unsqueeze(1) > 0, cost, torch.zeros_like(cost))
+            cost = torch.cat([cost, (n_valid / max(S, 1)).unsqueeze(1)], dim=1)
         Probe.log(self.tag, "cost", cost)
         # 相关体的幅度 —— 2026-08-21 那次事故的唯一直接指标。
         # stage4 的 cost 量级是 stage1 的约 200 倍 (特征幅度 ~13 -> ~500, 而组内
