@@ -99,21 +99,20 @@ PRIOR=${PRIOR:-on}
 # **每张卡**的 batch。单卡脚本和双卡脚本都用这一个值 —— 这正是"每张卡的训练
 # 参数相同"的含义; 两者的全局 batch 因此差一倍, 调用方要自己把这件事说清楚。
 #
-# 2026-08-23: 从 1 抬到 5, 目标是把 A100-80GB 吃到 ~95%。实测 (真实配置:
-# DINOv3 all_view + SPRE + W1/W3A/C, 最大尺度 640x896, views=5):
-#     per-GPU batch 1 -> allocated 12.66 GiB / reserved 14.66 GiB  = 80GB 的 18.3%
-# 这正是之前看到的 18.1%。
+# 2026-08-23: 1 -> 5 -> **4**。
+#   * batch 1 实测 (真实配置: DINOv3 all_view + SPRE + W1/W3A/C, 最大尺度
+#     640x896, views=5): allocated 12.66 GiB / reserved 14.66 GiB = 80GB 的 18.3%
+#     —— 这正是之前看到的 18.1%。
+#   * batch 5 在 A100-80GB 上实跑通过 (gpu07, ARM=w1 单卡 2040 步, 约 3.6 s/step)。
+#   * 定为 4: 留出余量。多尺度最大尺度那几步是显存峰值, 而 30k 步的长跑里
+#     "偶尔 OOM 一次" 的代价是几十小时。
 #
-# **提交 30k 之前必须先在 A100 上实测**, 不要信这里的默认值:
+# 换卡或换 arm 之后先量一遍, 不要信这里的默认值:
 #     ARM=w1 bash scripts/fit_batch.sh
 # 它走的是与训练**完全同一条** cfg 覆盖路径, 所以量的就是训练本身的显存。
 # (scripts/verify_w1.py --mem 那条路把 dino 和 spre 关掉了, 数字系统性偏低,
 #  不能拿来定 batch。)
-#
-# 为什么 5 只是估计: 显存对 batch 近似线性, 但对像素数**不是**干净的线性
-# (stage4 全分辨率代价体占了大头, 与 FPN/DINO 的缩放规律不同), 小卡上量到的
-# 斜率外推到 80GB 有 5-7 的不确定区间。所以要在目标卡上量。
-PER_GPU_BATCH=${PER_GPU_BATCH:-5}
+PER_GPU_BATCH=${PER_GPU_BATCH:-4}
 NUM_VIEWS=${NUM_VIEWS:-5}
 VAL_BATCH_SIZE=${VAL_BATCH_SIZE:-6}
 # batch 抬起来之后 dataloader 才是瓶颈: 每个样本要读 5 张图 + prior,
