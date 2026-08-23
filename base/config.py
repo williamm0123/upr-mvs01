@@ -249,6 +249,27 @@ class DepthRangeConfig:
     axis_blend_steps: int = 2000
     pnorm_p: float = 16.0          # p-范数软最大: A=B 时只比严格 max 高 4.4%
     rho_max: float = 8.0           # 半宽相对基准的倍率上下界 [h0/rho, h0*rho]
+    # ---- 2026-08-23 W1 首跑发现: 级联倒挂 (bin 间距 s2 2.12 < s3 2.72 < s4 6.88mm),
+    #      stage4 有 15% 像素想要比整个深度域还宽的窗口 (rho_bind=0.15, 而
+    #      sat_frac=0 —— 顶到的是物理域不是 tanh 的界)。
+    #
+    # 逐级 rho: None = 三级都用 rho_max; 给三个值如 (8,4,2) 则逐级收紧。
+    # 它只是**安全界**, 限制 controller 相对 h0 的倍率; 级联细化由
+    # child_interval_cap 负责, 两者职责不同, 不要混。
+    rho_stages: tuple[float, float, float] | None = None
+
+    # ---- 子级候选间隔约束 (取代半宽单调) ----
+    # 为什么不是 h_{k+1} <= h_k: 各级假设数是 D2=16, D3=8, D4=4, 半宽下降**不能**
+    # 保证 bin 间距下降 —— 半宽减半而假设数减半, 间距原地不动。真正要约束的是
+    #     Delta_v(child) <= xi_k * Delta_v(parent)
+    # 即"四假设的 stage4 不许比八假设的 stage3 更粗"。
+    child_interval_cap: bool = False
+    # xi_k 的初值 = legacy 范围策略下的最大 child/parent bin 比:
+    #   2*1.5*2/15 = 0.4, 2*0.9*2/7 = 0.5142857, 2*0.6*2/3 = 0.8
+    # 其中的 2 来自 (1 + aH + bE) <= 1 + 0.5 + 0.5。
+    # 参数化成 sigmoid(raw), 结构性保证 0 < xi < 1 —— 可学, 但永远不许后级更粗。
+    refine_ratio_init: tuple[float, float, float] = (0.4, 0.5142857142857142, 0.8)
+    refine_cap_p: float = 16.0     # 平滑上界的锐度; >= 2
     ctrl_hidden: int = 32
     ctrl_beta_init: float = 0.05   # softplus(beta) 的初值, 不用 softplus(0)=0.693
     # 每级的目标覆盖率 (pinball 的 tau)。**tau 是优化目标不是保证** ——
@@ -410,6 +431,13 @@ class LossConfig:
     # "hinge + lambda*log(half)", 那个目标在 half->0 时无下界。
     w_range: float = 1.0
     w_center: float = 0.2          # 防止左右非对称半宽与中心互相补偿
+    # pinball 的归一化分母。
+    #   axis   = 上一级 winner 的局部间距 w_bar (现状)
+    #   global = 全局逆深度间距 g_v (与当前窗口无关)
+    # 为什么这是个开关: w_bar 同时是基准尺度 A_k 的因子**和**这里的分母, 而它
+    # 来自上一级已经变宽的轴 —— 轴变宽 -> A 变大 -> 更宽; 轴变宽 -> 分母变大 ->
+    # 宽度惩罚显得更小。两条路都指向"更宽"。global 切断第二条。
+    pinball_scale: str = "axis"
     # stage4 逐候选残差。只监督离 GT 最近的那个 bin, 且只在 GT 落在范围内时。
     w_residual: float = 1.0
     # OOR 方向损失: 只告诉后验"正确答案在轴的哪一端", 不参与任何跨表面平均。

@@ -412,20 +412,32 @@ class MVSLoss:
                 if not vk.any():
                     continue
                 v_gt = 1.0 / gt_k.clamp_min(1e-6)
-                wbar = st["w_bar"].detach().clamp_min(1e-12)
+                # **两个尺度不是一回事, 不能共用一个变量。**
+                #   w_parent = 上一级 winner 的局部间距 —— center loss 的定义域
+                #   w_loss   = pinball 的归一化分母
+                # 之前两者都用 w_parent, 而 w_parent 同时又是基准尺度 A_k 的因子,
+                # 且来自上一级**已经变宽**的轴: 轴宽 -> A 大 -> 更宽; 轴宽 ->
+                # 分母大 -> 宽度惩罚显得更小。两条路都指向"更宽"。
+                # pinball_scale=global 把分母换成与当前窗口无关的 g_v, 切断第二条。
+                w_parent = st["w_bar"].detach().clamp_min(1e-12)
+                _sc = str(getattr(cfg, "pinball_scale", "axis")).lower()
+                w_loss = (st["w_fixed"] if (_sc == "global" and "w_fixed" in st)
+                          else st["w_bar"]).detach().clamp_min(1e-12)
                 a = 0.5 * (1.0 - float(st["tau"]))
-                u_lo = (v_gt - st["v_lo"]) / wbar
-                u_hi = (v_gt - st["v_hi"]) / wbar
+                u_lo = (v_gt - st["v_lo"]) / w_loss
+                u_hi = (v_gt - st["v_hi"]) / w_loss
                 q_lo = torch.maximum(a * u_lo, (a - 1.0) * u_lo)
                 q_hi = torch.maximum((1.0 - a) * u_hi, -a * u_hi)
                 l_pin = (q_lo + q_hi)[vk].mean()
                 # 中心项: 非对称的 h_lo/h_hi 单靠 pinball 可以用 "中心偏一点 +
                 # 一侧更宽" 达到同样的端点, 这一项把中心钉住。只在 GT 已经落在
                 # 上一级一个 bin 之内时生效 —— 那正是亚 bin 修正的定义域。
-                m_c = vk & ((v_gt - st["v_m"]).abs() <= wbar)
+                # **这里必须用 w_parent 而不是 g_v**: center head 的职责就是修正
+                # "一个父级 bin 以内" 的量化误差, 换成全局尺度就改了它的定义域。
+                m_c = vk & ((v_gt - st["v_m"]).abs() <= w_parent)
                 if m_c.any():
                     l_ctr = F.smooth_l1_loss(
-                        ((st["v_c"] - v_gt) / wbar)[m_c],
+                        ((st["v_c"] - v_gt) / w_parent)[m_c],
                         torch.zeros_like(v_gt)[m_c], beta=1.0)
                 else:
                     l_ctr = total.new_zeros(())

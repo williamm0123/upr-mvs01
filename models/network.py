@@ -147,8 +147,13 @@ class UprMVSNet(nn.Module):
             edge_b=float(self.range_cfg.range_edge_b),
             hidden=int(getattr(self.range_cfg, "ctrl_hidden", 32)),
             pnorm_p=float(getattr(self.range_cfg, "pnorm_p", 16.0)),
-            rho_max=float(getattr(self.range_cfg, "rho_max", 8.0)),
+            rho_max=(tuple(self.range_cfg.rho_stages)
+                     if getattr(self.range_cfg, "rho_stages", None)
+                     else float(getattr(self.range_cfg, "rho_max", 8.0))),
             beta_init=float(getattr(self.range_cfg, "ctrl_beta_init", 0.05)),
+            refine_ratio_init=tuple(getattr(self.range_cfg, "refine_ratio_init",
+                                            (0.4, 0.5142857142857142, 0.8))),
+            refine_cap_p=float(getattr(self.range_cfg, "refine_cap_p", 16.0)),
         )
         self.res_head = Stage4ResidualHead(
             num_depths=cv_cfg.num_depths_stage4, feat_channels=fpn_c,
@@ -187,6 +192,12 @@ class UprMVSNet(nn.Module):
         if self.use_conf_head:
             # source 间相关性统计只有 stage4 用得上, 只在那一级收集。
             self.cost_builders[3].collect_src_stats = True
+        self.child_interval_cap = bool(getattr(self.range_cfg, "child_interval_cap", False))
+        if not (self.child_interval_cap and ctrl_trains):
+            # xi_k 只在 cap 打开时进前向 (关掉时 q 恒为 1, 与它无关)。
+            # 不冻结的话它就是一个"要梯度却永远收不到"的参数 —— 白占优化器
+            # 状态, 而且 DDP(find_unused_parameters=False) 会在第二步直接报错。
+            self.range_ctrl.refine_ratio_raw.requires_grad_(False)
         self.residual_scale = float(getattr(self.range_cfg, "residual_scale", 0.5))
         self.axis_blend_steps = int(getattr(self.range_cfg, "axis_blend_steps", 2000))
 
@@ -617,7 +628,9 @@ class UprMVSNet(nn.Module):
                 v_c, h_lo, h_hi, ctrl_diag = self.range_ctrl(
                     k - 1, ctrl_feats, v_m, prev["w_bar_v"], g_v,
                     entropy=ctrl_feats[:, 0], edge=e_map, reliability=r_k,
-                    gamma=gammas[k], v_min=v_min, v_max=v_max, blend=blend,
+                    gamma=gammas[k], v_min=v_min, v_max=v_max,
+                    num_depths=self.num_depths[k],
+                    apply_interval_cap=self.child_interval_cap, blend=blend,
                 )
                 hypos_inv = build_axis_inverse(v_c, h_lo, h_hi, self.num_depths[k], v_min, v_max)
                 # legacy -> inverse 的凸组合: 两条轴都按深度升序, 组合仍然升序。
@@ -625,15 +638,34 @@ class UprMVSNet(nn.Module):
                 range_ctrl_out[f"stage{k + 1}"] = {
                     "v_lo": v_c - h_lo, "v_hi": v_c + h_hi, "v_c": v_c,
                     "v_m": v_m, "w_bar": prev["w_bar_v"], "hw": tuple(prev["hw"]),
+                    # 与当前窗口**无关**的固定尺度, 供 pinball_scale=global 用。
+                    # 切断 "轴变宽 -> 分母变大 -> 宽度惩罚变小" 那条反馈。
+                    "w_fixed": g_v.expand_as(prev["w_bar_v"]),
                     "tau": float(self.range_cfg.tau_stages[k - 1]),
                 }
                 with torch.no_grad():
+                    # **deprecated**: 一阶换算 h_d ~ h_v/v_c^2, 大窗口下误差明显。
+                    # 保留只为历史曲线可比, 判读用 ctrl_exact_half_mm_*。
                     hm = (0.5 * (h_lo + h_hi) / v_c.clamp_min(1e-12) ** 2).flatten(1)[:, ::97].float()
                     range_stats["ctrl_half_p50"] = float(hm.quantile(0.5)) if hm.numel() else 0.0
                     range_stats["ctrl_half_p90"] = float(hm.quantile(0.9)) if hm.numel() else 0.0
                     range_stats["ctrl_sat_frac"] = float(ctrl_diag["sat_frac"])
                     range_stats["ctrl_rho_bind"] = float(ctrl_diag["rho_bind_frac"])
                     range_stats["ctrl_delta_abs"] = float(ctrl_diag["delta_abs_mean"])
+                    # 范围分解 + 级联分辨率。只看 h 分不出 "上一级把基准撑大了"
+                    # (A/h0 大) 和 "控制器自己要更宽" (mult 大); 也分不出 cap 拦了
+                    # 多少 (gap_cap_bind) 与物理域拦了多少 (physical_bind)。
+                    for _k in ("A_over_B_p50", "A_over_B_p90",
+                               "h0_over_gv_p50", "h0_over_gv_p90",
+                               "mult_raw_p50", "mult_raw_p90", "refine_ratio",
+                               "gap_ratio_raw_p50", "gap_ratio_raw_p90",
+                               "gap_ratio_final_p50", "gap_ratio_final_p90",
+                               "gap_ratio_final_p99",
+                               "gap_cap_bind_frac", "gap_cap_q_p50", "gap_cap_q_p10",
+                               "physical_bind_frac",
+                               "exact_half_mm_p50", "exact_half_mm_p90"):
+                        if _k in ctrl_diag:
+                            range_stats[f"ctrl_{_k}"] = float(ctrl_diag[_k])
                     range_stats["ctrl_blend"] = float(blend)
                     # legacy 轴与 inverse 轴的逐元素差 —— 迁移完成后它仍然很大,
                     # 说明 "深度均匀 -> 逆深度均匀" 这个坐标变化本身影响不小,
@@ -664,6 +696,13 @@ class UprMVSNet(nn.Module):
             # 逐 bin 局部间距 —— 逆深度轴在深度空间非均匀, span/(D-1) 不再成立
             interval_k = local_intervals(hypos_k)
             wi_k = interval_k.gather(1, mode_idx_k).squeeze(1)
+            with torch.no_grad():
+                # 级联分辨率的直接读数。均值会被少数极宽像素拉走, 所以报分位数:
+                # "stage4 是不是比 stage3 粗" 要看 p50/p90 而不是 mean。
+                _iv = wi_k.flatten()[::97].float()
+                if _iv.numel():
+                    range_stats["interval_mm_p50"] = float(_iv.quantile(0.5))
+                    range_stats["interval_mm_p90"] = float(_iv.quantile(0.9))
             range_stats["wbar_fallback_frac"] = float(prev.get("wbar_fb", 0.0))
             range_diag[f"stage{k + 1}"] = range_stats
             edge_k = self._resize_map(s1.edge, feat_k.shape[-2:])

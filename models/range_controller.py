@@ -110,10 +110,21 @@ class RangeController(nn.Module):
         pnorm_p: float = 16.0,
         rho_max: float = 8.0,
         beta_init: float = 0.05,
+        refine_ratio_init=(0.4, 0.5142857142857142, 0.8),
+        refine_cap_p: float = 16.0,
     ) -> None:
         super().__init__()
         self.pnorm_p = float(pnorm_p)
-        self.log_rho = math.log(float(rho_max))
+        # rho 可以逐级不同。W1 首跑 (2026-08-23) 的现象: stage4 有 15% 的像素
+        # 想要比整个深度域还宽的窗口, 而 sat_frac=0 —— 也就是说 tanh 没顶到界,
+        # 顶到的是物理域。逐级收紧 rho (如 8,4,2) 是最直接的一道闸。
+        if isinstance(rho_max, (tuple, list)):
+            rho_list = [float(x) for x in rho_max]
+            if len(rho_list) != 3:
+                raise ValueError(f"rho_max 逐级指定时需要三个值, 收到 {rho_max}")
+        else:
+            rho_list = [float(rho_max)] * 3
+        self.log_rho = [math.log(r) for r in rho_list]
 
         # --- 尺度系数: 逆 softplus 初始化, 让 step 0 复现旧公式的两项 ---
         self.kappa = nn.Parameter(torch.tensor([inverse_softplus(v) for v in range_k]))
@@ -123,6 +134,18 @@ class RangeController(nn.Module):
         # 低可靠度 -> 更宽。init 取一个小正数, 不用 softplus(0)=0.693 (那在
         # r=0 时就等于 exp(ln8 * tanh(0.69)) = 3.4x, 一上来就把窗口撑开)。
         self.beta = nn.Parameter(torch.tensor([inverse_softplus(beta_init)] * 3))
+
+        # --- 子级间隔上界 xi_k, 参数化成 sigmoid(raw) ---
+        # 结构性保证 0 < xi < 1: 它可以学, 但**永远**不允许后级候选间隔比父级更粗。
+        # 这是取代"半宽单调"的那条约束 —— 半宽下降不蕴含间距下降, 因为假设数也在减半。
+        rr = [float(x) for x in refine_ratio_init]
+        if len(rr) != 3 or not all(0.0 < x < 1.0 for x in rr):
+            raise ValueError(f"refine_ratio_init 需要三个 (0,1) 内的值, 收到 {refine_ratio_init}")
+        self.refine_ratio_raw = nn.Parameter(
+            torch.tensor([math.log(x / (1.0 - x)) for x in rr], dtype=torch.float32))
+        self.refine_cap_p = float(refine_cap_p)
+        if self.refine_cap_p < 2.0:
+            raise ValueError(f"refine_cap_p 需要 >= 2, 收到 {refine_cap_p}")
 
         # --- 共享主干, 最后一层零初始化 ---
         self.film = nn.Embedding(3, 2 * hidden)
@@ -147,6 +170,8 @@ class RangeController(nn.Module):
         gamma: torch.Tensor,
         v_min: torch.Tensor,
         v_max: torch.Tensor,
+        num_depths: int,
+        apply_interval_cap: bool,
         blend: float = 1.0,
     ):
         """
@@ -171,25 +196,58 @@ class RangeController(nn.Module):
         delta, s_lo, s_hi = self.head(h).float().unbind(dim=1)      # 各 [B,H,W]
 
         eps = 1e-12
+        # 父级局部间距。**进控制器前就 detach** —— 它是上一级轴的几何量, 不该
+        # 从这一级的范围损失往回收梯度。
+        w_parent = w_bar.detach().clamp_min(eps)
         # --- 基准尺度: 把熵/边缘项放回来, 否则 step 0 对不上旧实现 ---
         ent_term = 1.0 + F.softplus(self.w_ent[k]) * entropy + F.softplus(self.w_edge[k]) * edge
-        a_scale = F.softplus(self.kappa[k]) * w_bar.clamp_min(eps) * ent_term.clamp_min(eps)
+        a_scale = F.softplus(self.kappa[k]) * w_parent * ent_term.clamp_min(eps)
         b_scale = F.softplus(self.eta[k]) * g_v.clamp_min(eps).expand_as(a_scale)
         log_h0 = _pnorm_softmax(a_scale.clamp_min(eps).log(),
                                 b_scale.clamp_min(eps).log(), self.pnorm_p)
 
         # --- 中心: 最多移动一个上一级 bin ---
-        v_c = v_m + blend * w_bar * torch.tanh(delta)
+        v_c = v_m + blend * w_parent * torch.tanh(delta)
 
         # --- 半宽: 低可靠度更宽, 但作用随级衰减。
         #     写成 beta*gamma*(1-r) 而不是 beta*(1-gamma*r) —— 后者在 gamma 小时
         #     会把 r=1 (完全可靠) 也判成不可靠。
         unrel = F.softplus(self.beta[k]) * gamma * (1.0 - reliability.clamp(0.0, 1.0))
-        h_lo = torch.exp(log_h0 + blend * self.log_rho * torch.tanh(s_lo + unrel))
-        h_hi = torch.exp(log_h0 + blend * self.log_rho * torch.tanh(s_hi + unrel))
+        lr_k = self.log_rho[k]
+        mult_lo = torch.exp(blend * lr_k * torch.tanh(s_lo + unrel))
+        mult_hi = torch.exp(blend * lr_k * torch.tanh(s_hi + unrel))
+        h0 = log_h0.exp()
+        h_lo_raw = h0 * mult_lo
+        h_hi_raw = h0 * mult_hi
+
+        # ================= 子级候选间隔约束 (顺序不能动) =================
+        # 顺序固定为: h0 -> 倍率 -> h_raw -> **间隔上界** -> 物理域缩放 -> 夹中心。
+        # 间隔上界必须在物理域缩放**之前**, 否则 "级联精度约束" 和 "场景边界约束"
+        # 两种 binding 混在一起, 诊断上分不开。
+        #
+        # 约束的是**实际相邻候选的最大逆深度间隔**, 而不是半宽 —— 左右半宽不等宽
+        # 时, 更宽的那一侧决定了最粗的 bin。
+        t = torch.linspace(-1.0, 1.0, num_depths, device=v_c.device,
+                           dtype=torch.float32).view(1, num_depths, 1, 1)
+        offset_raw = torch.where(t < 0, t * h_lo_raw.unsqueeze(1), t * h_hi_raw.unsqueeze(1))
+        gap_raw = (offset_raw[:, 1:] - offset_raw[:, :-1]).abs().amax(dim=1)   # [B,H,W]
+
+        refine_ratio = torch.sigmoid(self.refine_ratio_raw[k])
+        cap = refine_ratio * w_parent
+        if apply_interval_cap:
+            # 平滑上界: q = min(1, cap/gap) 的软化版, 在 log 域算避免溢出。
+            #   gap << cap -> q ~ 1        (不干预)
+            #   gap >> cap -> q ~ cap/gap  (正好压到上界)
+            log_ratio = torch.log((gap_raw + eps) / (cap + eps))
+            q = torch.exp(-F.softplus(self.refine_cap_p * log_ratio) / self.refine_cap_p)
+        else:
+            q = torch.ones_like(gap_raw)
+        h_lo = h_lo_raw * q
+        h_hi = h_hi_raw * q
 
         # --- 物理范围: 先整体缩放再夹中心。只平移在 "区间比物理域还宽" 时无解。
         span = (v_max - v_min).clamp_min(eps).expand_as(h_lo)
+        phys_bind = ((h_lo + h_hi) > span).float().mean()      # cap 之后、缩放之前
         rho = torch.clamp(span / (h_lo + h_hi + eps), max=1.0)
         h_lo = h_lo * rho
         h_hi = h_hi * rho
@@ -197,12 +255,49 @@ class RangeController(nn.Module):
 
         sat = ((s_lo + unrel).abs() > 2.6465).float().mean() * 0.5 \
             + ((s_hi + unrel).abs() > 2.6465).float().mean() * 0.5    # atanh(0.99)
+        with torch.no_grad():
+            def _q(x, p):
+                f = x.flatten()[::97].float()
+                return float(f.quantile(p)) if f.numel() else 0.0
+            # 半宽的**分解**: h = h0 * mult, h0 = softmax_p(A, B)。
+            # 只看 h 分不出"基准尺度被上一级撑大了 (A 大)"和"控制器自己要更宽
+            # (mult 大)", 而这两件事的修法完全不同。
+            ab = a_scale / b_scale.clamp_min(eps)
+            hg = h0 / g_v.clamp_min(eps).expand_as(h0)
+            mr = 0.5 * (mult_lo + mult_hi)
+            gr_raw = gap_raw / w_parent
+            gap_fin = (gap_raw * q) / w_parent
+            # 精确的深度域等效半宽: 大窗口下 h_d ~ h_v/v_c^2 的一阶换算误差很大
+            d_far = 1.0 / (v_c - h_lo).clamp_min(eps)
+            d_near = 1.0 / (v_c + h_hi).clamp_min(eps)
+            h_exact = 0.5 * (d_far - d_near)
+            diag_extra = {
+                "A_over_B_p50": _q(ab, 0.5), "A_over_B_p90": _q(ab, 0.9),
+                "h0_over_gv_p50": _q(hg, 0.5), "h0_over_gv_p90": _q(hg, 0.9),
+                "mult_raw_p50": _q(mr, 0.5), "mult_raw_p90": _q(mr, 0.9),
+                "refine_ratio": float(refine_ratio),
+                "gap_ratio_raw_p50": _q(gr_raw, 0.5), "gap_ratio_raw_p90": _q(gr_raw, 0.9),
+                "gap_ratio_final_p50": _q(gap_fin, 0.5),
+                "gap_ratio_final_p90": _q(gap_fin, 0.9),
+                "gap_ratio_final_p99": _q(gap_fin, 0.99),
+                # bind_frac 只说"有没有碰到界", 说不出"压了多少"。xi_k 的初值
+                # 取的是 legacy 的**最大** child/parent 比, 而控制器初值又复现
+                # legacy —— 于是中位数天然就贴在界上, bind_frac 从第一步就接近 1。
+                # 判读要看 q 本身: q_p50 ~ 1 = 只是贴边; q_p10 明显 < 1 = 尾部在实压。
+                "gap_cap_bind_frac": float((q < 0.999).float().mean()),
+                "gap_cap_q_p50": _q(q, 0.5),
+                "gap_cap_q_p10": _q(q, 0.1),
+                "physical_bind_frac": float(phys_bind),
+                "exact_half_mm_p50": _q(h_exact, 0.5),
+                "exact_half_mm_p90": _q(h_exact, 0.9),
+            }
         diag = {
             "half_lo_mean": h_lo.detach(),
             "half_hi_mean": h_hi.detach(),
             "sat_frac": sat.detach(),
             "rho_bind_frac": (rho < 0.999).float().mean().detach(),
             "delta_abs_mean": delta.detach().abs().mean(),
+            **diag_extra,
         }
         return v_c, h_lo, h_hi, diag
 

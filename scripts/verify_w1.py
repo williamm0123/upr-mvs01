@@ -46,14 +46,15 @@ D_MIN, D_MAX = 425.0, 935.0
 
 def _cfg(axis="legacy_depth", stage4="expect", spre_cascade=False,
          geo_valid=False, vis_mode="softmax", conf_head=False,
-         vis_supervise=False, visibility=None, weights=None,
-         h=None, w=None, views=None):
+         vis_supervise=False, visibility=None, weights=None, child_cap=False,
+         rho_stages=None, pinball_scale="axis", h=None, w=None, views=None):
     c = MVSConfig()
     c = replace(c, dino=replace(c.dino, mode="off", feed_fpn=False))
     c = replace(c, spre=replace(c.spre, enabled=False, reliability_source="cached"))
     c = replace(c, depth_range=replace(
         c.depth_range, num_global=32, num_local=16, range_min_gi=(0.66, 0.20, 0.10),
-        axis_space=axis, stage4_head=stage4, spre_cascade=spre_cascade))
+        axis_space=axis, stage4_head=stage4, spre_cascade=spre_cascade,
+        child_interval_cap=child_cap, rho_stages=rho_stages))
     c = replace(c, cost_volume=replace(
         c.cost_volume, num_depths_stage1=48,
         geo_valid_aggregation=geo_valid, vis_mode=vis_mode,
@@ -62,7 +63,8 @@ def _cfg(axis="legacy_depth", stage4="expect", spre_cascade=False,
                               else vis_mode == "sigmoid")))
     c = replace(c, decoder=replace(c.decoder, fusion_conf=conf_head))
     lw = dict(w_conf=1.0 if conf_head else 0.0,
-              w_vis=1.0 if vis_supervise else 0.0)
+              w_vis=1.0 if vis_supervise else 0.0,
+              pinball_scale=pinball_scale)
     lw.update(weights or {})
     c = replace(c, loss=replace(c.loss, **lw))
     if h is not None:
@@ -163,7 +165,8 @@ def run_units() -> None:
     wbar = torch.full((B, H, W), 3e-6)
     for k in range(3):
         vc, hl, hh, _ = ctrl(k, feats, v_c, wbar, g_v, ent, edge, r,
-                             torch.tensor(0.0), v_min, v_max, blend=0.0)
+                             torch.tensor(0.0), v_min, v_max,
+                             num_depths=(16, 8, 4)[k], apply_interval_cap=False, blend=0.0)
         assert torch.allclose(vc, v_c, atol=1e-9)
         a = (float(F.softplus(ctrl.kappa[k])) * wbar
              * (1 + float(F.softplus(ctrl.w_ent[k])) * ent
@@ -178,15 +181,76 @@ def run_units() -> None:
 
     _, hl2, _, _ = ctrl(2, feats, v_c, torch.full((B, H, W), 1e-5),
                         torch.full((B, 1, 1), 1e-5), ent, edge, r,
-                        torch.tensor(0.0), v_min, v_max, blend=0.0)
+                        torch.tensor(0.0), v_min, v_max,
+                        num_depths=4, apply_interval_cap=False, blend=0.0)
     assert (hl2 > 0).all() and torch.isfinite(hl2).all()
     ok(f"p-范数走 log 域 logsumexp, 逆深度量纲下不下溢 (h={float(hl2.mean()):.3e})")
 
     vc3, hl3, hh3, _ = ctrl(0, feats, v_c, torch.full((B, H, W), 1.0), g_v, ent, edge, r,
-                            torch.tensor(0.0), v_min, v_max, blend=0.0)
+                            torch.tensor(0.0), v_min, v_max,
+                            num_depths=16, apply_interval_cap=False, blend=0.0)
     assert float((hl3 + hh3).max()) <= float((v_max - v_min)[0]) * 1.001
     assert (build_axis_inverse(vc3, hl3, hh3, 4, v_min, v_max).diff(dim=1) > 0).all()
     ok("区间宽于物理域时先按 rho 整体缩放再夹中心, 轴仍严格升序")
+
+    # ---- 子级候选间隔约束 (取代半宽单调) ----
+    # 为什么不是 h_{k+1} <= h_k: D2=16, D3=8, D4=4, 半宽减半而假设数也减半时
+    # 间距原地不动 —— 半宽单调**不蕴含**间距单调。下面第一条就是这个反例。
+    ctrl2 = RangeController(range_k=cfg.range_k, range_min_gi=(0.66, 0.20, 0.10),
+                            entropy_a=cfg.range_entropy_a, edge_b=cfg.range_edge_b,
+                            refine_ratio_init=(0.4, 0.5142857142857142, 0.8))
+    # 父级 D_p 半宽 h -> gap_p = 2h/(D_p-1); 子级 D_p/2 半宽 h/2 -> gap_c = 2h/(D_p-2)。
+    # 于是 gap_c/gap_p = (D_p-1)/(D_p-2) > 1: 半宽**已经减半**(满足半宽单调),
+    # bin 间距反而更粗。这就是半宽单调管不住级联分辨率的原因。
+    h_par = 4e-5
+    for D_par in (16, 8):
+        D_ch = D_par // 2
+        gap_par = 2 * h_par / (D_par - 1)
+        gap_ch = 2 * (h_par * 0.5) / (D_ch - 1)
+        assert gap_ch > gap_par, (D_par, gap_par, gap_ch)
+        assert abs(gap_ch / gap_par - (D_par - 1) / (D_par - 2)) < 1e-9
+    ok("半宽减半 + 假设数减半 -> 间距反而**变粗** (x(D-1)/(D-2)): "
+       "半宽单调约束不到级联分辨率")
+
+    zero = torch.zeros(B, ctrl2.in_ch, H, W)
+    wpar = torch.full((B, H, W), 4e-5)            # 父级局部间距
+    for k, D_ch in enumerate((16, 8, 4)):
+        _, hl, hh, dg = ctrl2(k, zero, v_c, wpar, g_v, ent, edge, r,
+                              torch.tensor(0.0), v_min, v_max,
+                              num_depths=D_ch, apply_interval_cap=True, blend=1.0)
+        t = torch.linspace(-1, 1, D_ch).view(1, D_ch, 1, 1)
+        off = torch.where(t < 0, t * hl.unsqueeze(1), t * hh.unsqueeze(1))
+        gap = (off[:, 1:] - off[:, :-1]).abs().amax(1)
+        xi = float(torch.sigmoid(ctrl2.refine_ratio_raw[k]))
+        ratio = (gap / wpar).max().item()
+        assert ratio <= xi * 1.001, (k, ratio, xi)
+        assert dg["gap_ratio_final_p99"] <= 1.001
+    ok("child_interval_cap 打开时: 子级最大间隔 <= xi_k * 父级间隔 (三级都验)")
+
+    # 关掉时必须完全不干预 —— 否则 W0 和历史 checkpoint 的行为就变了
+    _, hl_on, _, _ = ctrl2(2, zero, v_c, wpar, g_v, ent, edge, r, torch.tensor(0.0),
+                           v_min, v_max, num_depths=4, apply_interval_cap=True, blend=1.0)
+    _, hl_off, _, dg_off = ctrl2(2, zero, v_c, wpar, g_v, ent, edge, r, torch.tensor(0.0),
+                                 v_min, v_max, num_depths=4, apply_interval_cap=False, blend=1.0)
+    assert float(dg_off["gap_cap_bind_frac"]) == 0.0 and (hl_off >= hl_on - 1e-12).all()
+    ok("child_interval_cap 关闭时 q 恒为 1, 半宽不被压 (W0/历史 checkpoint 行为不变)")
+
+    # xi 可学: refine_ratio_raw 必须拿到有限且非零的梯度
+    ctrl3 = RangeController(range_k=cfg.range_k, range_min_gi=(0.66, 0.20, 0.10))
+    _, hl3, hh3, _ = ctrl3(2, zero, v_c, torch.full((B, H, W), 4e-5), g_v, ent, edge, r,
+                           torch.tensor(0.0), v_min, v_max,
+                           num_depths=4, apply_interval_cap=True, blend=1.0)
+    (hl3 + hh3).sum().backward()
+    grr = ctrl3.refine_ratio_raw.grad
+    assert grr is not None and torch.isfinite(grr).all() and float(grr[2].abs()) > 0
+    ok(f"refine_ratio_raw 可学 (grad[s4]={float(grr[2]):.3e}, 有限且非零)")
+
+    # 逐级 rho 安全界
+    ctrl4 = RangeController(range_k=cfg.range_k, range_min_gi=(0.66, 0.20, 0.10),
+                            rho_max=(8.0, 4.0, 2.0))
+    import math as _m
+    assert [round(_m.exp(x), 3) for x in ctrl4.log_rho] == [8.0, 4.0, 2.0]
+    ok("rho_stages=(8,4,2) 逐级生效 (只是安全界, 不负责级联细化)")
 
     dec = DepthDecoder(in_channels=8, base=8, depth=2, mode_window=2, head_mode="map")
     hyp4 = torch.linspace(500, 504, 4).view(1, 4, 1, 1).expand(B, 4, H, W).contiguous()
@@ -426,6 +490,7 @@ def run_ddp_precondition(device: str) -> None:
     cfgs = {
         "legacy": dict(axis="legacy_depth", stage4="expect"),
         "W1": dict(axis="inverse", stage4="map", spre_cascade=True),
+        "W1+cap": dict(axis="inverse", stage4="map", spre_cascade=True, child_cap=True),
         "W1+W3AC": dict(axis="inverse", stage4="map", spre_cascade=True,
                         geo_valid=True, conf_head=True),
         "W1+W3ABC": dict(axis="inverse", stage4="map", spre_cascade=True,

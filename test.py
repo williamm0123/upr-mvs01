@@ -310,6 +310,15 @@ def _align_cfg_to_ckpt(cfg, state: dict, override: str = "auto", fingerprint=Non
                                           axis_space=fingerprint.get("axis_space", "legacy_depth"),
                                           stage4_head=fingerprint.get("stage4_head", "expect"),
                                           spre_cascade=fingerprint.get("spre_cascade", False),
+                                          child_interval_cap=fingerprint.get(
+                                              "child_interval_cap", False),
+                                          refine_ratio_init=tuple(fingerprint.get(
+                                              "refine_ratio_init",
+                                              (0.4, 0.5142857142857142, 0.8))),
+                                          refine_cap_p=float(fingerprint.get(
+                                              "refine_cap_p", 16.0)),
+                                          rho_stages=(tuple(fingerprint["rho_stages"])
+                                                      if fingerprint.get("rho_stages") else None),
                                           mode_window_stages=(
                                               tuple(fingerprint["mode_window_stages"])
                                               if fingerprint.get("mode_window_stages") else None)),

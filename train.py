@@ -547,6 +547,22 @@ def main_worker(
         dr_over["axis_blend_steps"] = args.axis_blend_steps
     if args.rho_max is not None:
         dr_over["rho_max"] = args.rho_max
+    if args.rho_stages is not None:
+        v = tuple(float(x) for x in args.rho_stages.split(","))
+        if len(v) != 3 or not all(x > 1.0 for x in v):
+            raise SystemExit("--rho-stages 需要三个 > 1.0 的值, 如 '8,4,2'")
+        dr_over["rho_stages"] = v
+    if args.child_interval_cap is not None:
+        dr_over["child_interval_cap"] = args.child_interval_cap == "on"
+    if args.refine_ratio_init is not None:
+        v = tuple(float(x) for x in args.refine_ratio_init.split(","))
+        if len(v) != 3 or not all(0.0 < x < 1.0 for x in v):
+            raise SystemExit("--refine-ratio-init 需要三个 (0,1) 内的值")
+        dr_over["refine_ratio_init"] = v
+    if args.refine_cap_p is not None:
+        if args.refine_cap_p < 2.0:
+            raise SystemExit("--refine-cap-p 需要 >= 2.0")
+        dr_over["refine_cap_p"] = args.refine_cap_p
     if args.tau_stages is not None:
         v = tuple(float(x) for x in args.tau_stages.split(","))
         if len(v) != 3 or not all(0.5 < x < 1.0 for x in v):
@@ -605,7 +621,8 @@ def main_worker(
     for _a, _k in (("w_range", "w_range"), ("w_center", "w_center"),
                    ("w_residual", "w_residual"), ("w_oor", "w_oor"),
                    ("w_conf", "w_conf"), ("conf_tau_mm", "conf_tau_mm"),
-                   ("w_vis", "w_vis"), ("delta_occ_mm", "delta_occ_mm")):
+                   ("w_vis", "w_vis"), ("delta_occ_mm", "delta_occ_mm"),
+                   ("pinball_scale", "pinball_scale")):
         _v = getattr(args, _a, None)
         if _v is not None:
             loss_over[_k] = _v
@@ -1108,8 +1125,14 @@ def _fmt_val(m: dict) -> str:
     return main + (f" | depth-buckets {q}" if q else "")
 
 
-def _run_validation(model, loader, device, use_amp, is_ddp, amp_dtype=None) -> dict[str, float]:
+def _run_validation(model, loader, device, use_amp, is_ddp, amp_dtype=None,
+                    step: int | None = None, blend_steps: int = 2000) -> dict[str, float]:
     """Masked depth metrics over the val split.
+
+    ``step`` **必须**传: 前向里的 ``blend = min(1, step/axis_blend_steps)`` 决定
+    候选轴是 legacy 还是 inverse。不传的话验证恒在 blend=1 上跑, 而训练还在
+    blend=0.3 —— 两条曲线量的是两个模型, 而且这个错误完全静默。
+    独立的 test.py 不传 (step=None -> blend=1.0) 是对的: 部署用最终的完整逆深度轴。
 
     All ranks run their DistributedSampler shard and the pixel-weighted sums are
     all-reduced, so the result is identical on every rank (and SyncBN-safe,
@@ -1131,12 +1154,20 @@ def _run_validation(model, loader, device, use_amp, is_ddp, amp_dtype=None) -> d
     cq = torch.zeros(4, 2, 2, device=device, dtype=torch.float64)
     # model.eval() 不关梯度: 没有 no_grad 的话每个 batch 的激活都被 stats 里的
     # 累加项通过计算图引用着, 整个 val 集 (882 样本) 的图会一直挂到循环结束。
+    _blend_seen = None
     for batch in loader:
         batch = {k: (v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v)
                  for k, v in batch.items()}
         with torch.no_grad(), torch.autocast(device_type=device.type,
                                              dtype=amp_dtype or torch.float16, enabled=use_amp):
-            outputs = model(batch)
+            outputs = model(batch, step=step)
+        if _blend_seen is None:
+            rd = outputs.get("range_diag") or {}
+            for _st in ("stage2", "stage3", "stage4"):
+                if isinstance(rd.get(_st), dict) and "ctrl_blend" in rd[_st]:
+                    _blend_seen = float(rd[_st]["ctrl_blend"]); break
+            else:
+                _blend_seen = -1.0        # legacy_depth: 没有 ctrl_blend, 跳过断言
         pred = outputs["depth_full"].float()
         gt = batch["depth_gt"].float()
         m = batch["mask"].bool() & (gt > 0)
@@ -1196,6 +1227,12 @@ def _run_validation(model, loader, device, use_amp, is_ddp, amp_dtype=None) -> d
         dist.all_reduce(sq)
         dist.all_reduce(cq)
     model.train()
+    if _blend_seen is not None and _blend_seen >= 0.0 and step is not None:
+        want = min(1.0, float(step) / max(int(blend_steps), 1))
+        if abs(_blend_seen - want) > 1e-6:
+            raise RuntimeError(
+                f"验证的 ctrl_blend={_blend_seen:.6f} 与 step={step} 期望的 {want:.6f} 不符 —— "
+                f"说明 step 没传进前向, 验证跑的是另一条候选轴")
     if stats[1].item() == 0:
         raise RuntimeError(
             "validation produced no valid depth pixels — the val split is "
@@ -1203,6 +1240,9 @@ def _run_validation(model, loader, device, use_amp, is_ddp, amp_dtype=None) -> d
         )
     n = stats[1]
     extra = {}
+    if _blend_seen is not None and _blend_seen >= 0.0:
+        # val/ctrl_blend: 一眼看出验证跑在哪条轴上。它必须与训练同步爬到 1.0。
+        extra["ctrl_blend"] = float(_blend_seen)
     for b in range(4):
         nb = bq[b, 1]
         if nb <= 0:
@@ -1395,6 +1435,12 @@ def _arch_fingerprint(cfg) -> dict:
         "range_min_gi": list(cfg.depth_range.range_min_gi),
         "axis_space": cfg.depth_range.axis_space,
         "axis_blend_steps": cfg.depth_range.axis_blend_steps,
+        "rho_stages": (list(cfg.depth_range.rho_stages)
+                       if cfg.depth_range.rho_stages else None),
+        "child_interval_cap": cfg.depth_range.child_interval_cap,
+        "refine_ratio_init": list(cfg.depth_range.refine_ratio_init),
+        "refine_cap_p": cfg.depth_range.refine_cap_p,
+        "pinball_scale": cfg.loss.pinball_scale,
         "stage4_head": cfg.depth_range.stage4_head,
         "mode_window_stages": (list(cfg.depth_range.mode_window_stages)
                                if cfg.depth_range.mode_window_stages else None),
@@ -1605,7 +1651,9 @@ def _run_training(model, loss_fn, optimizer, scaler, cfg, device, args, world_si
             # Validation runs on ALL ranks (metrics are all-reduced); the
             # elif keeps ckpt_interval multiples of val_interval from double-saving.
             if step > 0 and cfg.train.val_interval > 0 and step % cfg.train.val_interval == 0:
-                val_metrics = _run_validation(model, val_loader, device, use_amp, is_ddp, _amp_dtype(cfg))
+                val_metrics = _run_validation(model, val_loader, device, use_amp, is_ddp,
+                                              _amp_dtype(cfg), step=step,
+                                              blend_steps=cfg.depth_range.axis_blend_steps)
                 if is_main:
                     logger.log_val(val_metrics, step)
                     logger.save(model, optimizer, step, val_metric=val_metrics["abs_err"])
@@ -1617,7 +1665,9 @@ def _run_training(model, loss_fn, optimizer, scaler, cfg, device, args, world_si
         epoch += 1
 
     # Final validation so the last weights are also considered for best.pth.
-    val_metrics = _run_validation(model, val_loader, device, use_amp, is_ddp, _amp_dtype(cfg))
+    val_metrics = _run_validation(model, val_loader, device, use_amp, is_ddp,
+                                  _amp_dtype(cfg), step=step,
+                                  blend_steps=cfg.depth_range.axis_blend_steps)
     if is_main:
         logger.log_val(val_metrics, step)
         logger.save(model, optimizer, step, val_metric=val_metrics["abs_err"])
@@ -1746,6 +1796,19 @@ def main() -> None:
                         help="三级 pinball 目标覆盖率, 逗号分隔, 默认 0.98,0.95,0.92")
     parser.add_argument("--rho-max", type=float, default=None,
                         help="半宽相对基准的倍率界 [h0/rho, h0*rho], 默认 8")
+    parser.add_argument("--rho-stages", type=str, default=None,
+                        help="逐级倍率**安全界**, 逗号分隔如 '8,4,2'。优先于 --rho-max。"
+                             "它不负责级联细化 —— 那是 --child-interval-cap 的职责")
+    parser.add_argument("--child-interval-cap", choices=["on", "off"], default=None,
+                        help="子级最大逆深度候选间隔 <= xi_k * 父级间隔。"
+                             "取代半宽单调: D 逐级减半时半宽下降并不蕴含间距下降")
+    parser.add_argument("--refine-ratio-init", type=str, default=None,
+                        help="xi_k 初值, 三个 (0,1) 内的值, 默认 0.4,0.5142857142857142,0.8")
+    parser.add_argument("--refine-cap-p", type=float, default=None,
+                        help="间隔上界的平滑锐度, >= 2, 默认 16")
+    parser.add_argument("--pinball-scale", choices=["axis", "global"], default=None,
+                        help="pinball 分母: axis=上一级局部间距(旧); "
+                             "global=全局逆深度间距 g_v, 切断'轴变宽->惩罚变小'的反馈")
     parser.add_argument("--spre-cascade", choices=["on", "off"], default=None,
                         help="SPRE 的 r/e 作为 meta 通道进入 stage2-4 的正则器")
     parser.add_argument("--spre-gate-init", type=str, default=None,

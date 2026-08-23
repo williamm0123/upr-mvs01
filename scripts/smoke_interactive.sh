@@ -3,16 +3,16 @@
 # UPRMVS 工单 v3 —— interactive 节点上的实现校验 + 显存实测。
 # 本脚本不含 sbatch/salloc/srun, 不申请任何资源, 只在已经拿到 GPU 的 shell 里跑。
 #
-#   salloc --partition=gpu-a100 --gres=gpu:2 --cpus-per-task=16 --mem=96G --time=02:00:00
+#   salloc --partition=gpu-a100 --gres=gpu:1 --cpus-per-task=16 --mem=96G --time=02:00:00
 #   cd /scr/user/qinglong/projects/upr-mvs01
 #   bash scripts/smoke_interactive.sh
 #
 # 五步, 全部是**实现校验**而不是性能实验:
 #   [1] 单元检查            不碰数据集, 秒级
 #   [2] legacy 等价性       axis_space=inverse 在 step 0 必须与 legacy 逐元素一致
-#   [3] DDP 前提            每个可训练参数都收到梯度 (双卡才会报的错, 单卡先查掉)
+#   [3] 死参数检查          每个可训练参数都要收到梯度 (白占优化器状态 / DDP 会炸)
 #   [4] 显存峰值            合成全分辨率前反向的确切峰值 + batch 扫描
-#   [5] 真实数据短跑        单卡四个 arm + 双卡 torchrun + 一次 200 步长跑
+#   [5] 真实数据短跑        四个 arm + 一次长跑 (2026-08-23 起只用单卡)
 #
 # **[2] 不过就不要往下走。** W1 同时动了轴的空间、interval 的算法、回归方式和
 # 损失, 任何一处写错都会以"效果不好"而不是报错的形式出现。
@@ -70,9 +70,9 @@ fi
 
 # ------------------------------------------------------------- [3] DDP 前提
 if run_stage ddpcheck; then
-echo; echo "### [3/5] DDP 前提: 每个可训练参数都要收到梯度 ###"
-echo "    (find_unused_parameters=False —— 违反了只在多卡第二步才报错,"
-echo "     排队几小时再撞上它太贵, 所以先在单卡查掉)"
+echo; echo "### [3/5] 死参数检查: 每个可训练参数都要收到梯度 ###"
+echo "    (要梯度却永远收不到 = 白占 AdamW 状态; 而且一旦回到 DDP"
+echo "     find_unused_parameters=False 会在第二个 iteration 直接报错)"
 "$PYTHON_BIN" scripts/verify_w1.py --ddp-check
 fi
 
@@ -97,7 +97,7 @@ echo "      target 512x640。按 0.57 + B x (0.18 + 21.9 x Mpx) GiB 外推到 64
 echo "      B=1 约 13GiB, B=2 约 26GiB, B=4 约 51GiB, W1/W3 再加约 6%。"
 fi
 
-# --------------------------------------------------- [5] 真实数据短跑 + 双卡
+# ------------------------------------------------------- [5] 真实数据短跑
 if run_stage run; then
 echo; echo "### [5/5] 真实数据短跑 (每个配置 ${SMOKE_STEPS} 步) ###"
 common=(
@@ -139,16 +139,6 @@ for cfgname in w0 w1 w3 w3b; do
   [[ "$rc" -eq 0 ]] || { echo "arm $cfgname 退出码 $rc" >&2; exit "$rc"; }
 done
 
-if [[ "$NGPU" -ge 2 ]]; then
-  echo; echo "--- 双卡 torchrun 短跑 (确认 DDP 起得来、没有 unused parameter) ---"
-  torchrun --standalone --nnodes=1 --nproc-per-node=2 train.py \
-      "${common[@]}" "${W1_ARGS[@]}" \
-      --geo-valid on --conf-head on --w-conf 1.0 --visibility off \
-      --name smoke_ddp2 2>&1 | tail -20
-  echo "[ok] 双卡 DDP 跑通"
-else
-  echo; echo "--- 跳过双卡: 只看到 $NGPU 张卡 ---"
-fi
 fi
 
 # ------------------------------------------- [5b] 真实数据长跑 (工单验收 (4))
@@ -191,6 +181,6 @@ echo " 校验结束。提交 30k 之前确认:"
 echo "   * [2] legacy 等价性 PASS —— 不过就不要提交"
 echo "   * [3] 四个配置都没有 '缺梯度' 的参数"
 echo "   * [4] 目标 batch 的峰值显存离 80GiB 有余量 (多尺度会再高约 40%)"
-echo "   * [5] 四个 arm 都没有非有限值, 双卡没有 NCCL 报错"
+echo "   * [5] 四个 arm 都没有非有限值"
 echo "   * [5b] ${LONG_STEPS} 步长跑没有 nan/inf, 梯度范数没有发散"
 echo "=================================================================="

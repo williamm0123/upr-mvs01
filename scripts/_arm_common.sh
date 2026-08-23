@@ -2,12 +2,13 @@
 # =============================================================================
 # UPRMVS 工单 v3 —— arm 定义与公共训练参数。**不要直接执行**, 由这两个脚本 source:
 #
-#   scripts/sbatch_ddp2.sh              双卡 A100-80GB, torchrun DDP
-#   scripts/train_umhpc_interactive.sh  单卡, interactive 节点直接跑
+#   scripts/sbatch_1gpu.sh              单卡 A100-80GB, 进 slurm 队列 (正式 30k)
+#   scripts/train_umhpc_interactive.sh  单卡, interactive shell 前台跑 (短跑/调试)
+#   scripts/fit_batch.sh                显存扫描
 #
-# 为什么要单独一个文件: 单卡和双卡唯一该有的差别是**进程数和全局 batch**,
-# 其余每一个参数都必须逐字相同。两个脚本各抄一份 arg 列表, 迟早会有人只改了
-# 一边 —— 那时候两条曲线还长得很像, 但已经不是同一个实验了。
+# 为什么要单独一个文件: 这几个入口的训练参数必须**逐字相同**。各抄一份 arg
+# 列表, 迟早会有人只改了一边 —— 那时候两条曲线还长得很像, 但已经不是同一个
+# 实验了。2026-08-23 起只用单卡, NPROC 恒为 1。
 #
 # 用法 (调用方):
 #   ARM=${ARM:-w1}
@@ -36,13 +37,17 @@ case "$ARM" in
       --axis-space inverse                       # A 逆深度轴 + E 非均匀轴记账
       --axis-blend-steps "${AXIS_BLEND_STEPS:-2000}"
       --tau-stages "${TAU_STAGES:-0.98,0.95,0.92}"   # C pinball 目标覆盖率
-      --rho-max "${RHO_MAX:-8.0}"                # B 半宽的倍率界 [h0/8, 8h0]
       --stage4-head map                          # D 硬 MAP + 逐候选残差
       --mode-window-stages "${MODE_WINDOW_STAGES:-2,2,1,2}"
       --spre-cascade on                          # F SPRE 累乘门贯穿四级
       --spre-gate-init "${SPRE_GATE_INIT:-1.0,0.60,0.35,0.20}"
       --w-range "${W_RANGE:-1.0}" --w-center "${W_CENTER:-0.2}"
       --w-residual "${W_RESIDUAL:-1.0}" --w-oor "${W_OOR:-0.1}"
+      --pinball-scale global                     # 分母改用 g_v, 切断反馈
+      --child-interval-cap on                    # 子级间隔 <= xi_k * 父级间隔
+      --refine-ratio-init "${REFINE_RATIO_INIT:-0.4,0.5142857142857142,0.8}"
+      --refine-cap-p "${REFINE_CAP_P:-16}"
+      --rho-stages "${RHO_STAGES:-8,4,2}"        # 逐级安全界, 不负责级联细化
       --visibility "${VISIBILITY:-off}"
     )
     ;;
@@ -52,13 +57,17 @@ case "$ARM" in
       --axis-space inverse
       --axis-blend-steps "${AXIS_BLEND_STEPS:-2000}"
       --tau-stages "${TAU_STAGES:-0.98,0.95,0.92}"
-      --rho-max "${RHO_MAX:-8.0}"
       --stage4-head map
       --mode-window-stages "${MODE_WINDOW_STAGES:-2,2,1,2}"
       --spre-cascade on
       --spre-gate-init "${SPRE_GATE_INIT:-1.0,0.60,0.35,0.20}"
       --w-range "${W_RANGE:-1.0}" --w-center "${W_CENTER:-0.2}"
       --w-residual "${W_RESIDUAL:-1.0}" --w-oor "${W_OOR:-0.1}"
+      --pinball-scale global                     # 分母改用 g_v, 切断反馈
+      --child-interval-cap on                    # 子级间隔 <= xi_k * 父级间隔
+      --refine-ratio-init "${REFINE_RATIO_INIT:-0.4,0.5142857142857142,0.8}"
+      --refine-cap-p "${REFINE_CAP_P:-16}"
+      --rho-stages "${RHO_STAGES:-8,4,2}"        # 逐级安全界, 不负责级联细化
       --geo-valid on                             # W3-A 逐假设几何有效聚合
       --conf-head on --w-conf "${W_CONF:-1.0}"   # W3-C 最终重建置信度
       --conf-tau-mm "${CONF_TAU_MM:-2.0}"

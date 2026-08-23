@@ -7,22 +7,17 @@
 #   cd /scr/user/qinglong/projects/upr-mvs01
 #   ARM=w1 bash scripts/train_umhpc_interactive.sh
 #
-# arm 与**每张卡**的训练参数全部来自 scripts/_arm_common.sh —— 与
-# scripts/sbatch_ddp2.sh 是同一份。两个脚本各抄一份 arg 列表迟早会漂, 那时候
-# 两条曲线还长得很像, 但已经不是同一个实验了。
+# arm 与训练参数全部来自 scripts/_arm_common.sh —— 与 scripts/sbatch_1gpu.sh
+# 是同一份。两个脚本各抄一份 arg 列表迟早会漂, 那时候两条曲线还长得很像,
+# 但已经不是同一个实验了。
 #
 # -----------------------------------------------------------------------------
-# 这一条必须先说清楚: 每张卡的参数相同, **全局 batch 不同**。
+# 2026-08-23 起**只用单卡**。本脚本与 scripts/sbatch_1gpu.sh 参数完全同源
+# (scripts/_arm_common.sh), 区别只是: 本脚本在 interactive shell 里前台跑,
+# sbatch 那个进队列。30k 的正式训练走 sbatch —— interactive 分配有时限,
+# 跑丢 30 小时很亏; 本脚本适合短跑和调试。
 #
-#     双卡 sbatch_ddp2.sh : 2 进程 x per-GPU 5 = 全局 batch 10
-#     单卡 (本脚本)       : 1 进程 x per-GPU 5 = 全局 batch 5
-#
-# 所以本脚本的曲线**不能**直接和双卡的比 —— 每步看到的样本少一半。lr 会按
-# 各自的全局 batch 自动 sqrt 缩放 (见 _arm_common.sh), 所以两边的 lr 也不同,
-# 这是有意的。要跟双卡对齐全局 batch 就 PER_GPU_BATCH=10, 但那样每卡参数又
-# 不同了 (显存也放不下) —— 两者不可兼得, 自己挑一个并记录。
-#
-# 显存: 提交长跑之前先量, 不要信默认的 PER_GPU_BATCH=5:
+# 显存: 提交长跑之前先量, 不要信默认的 PER_GPU_BATCH:
 #     ARM=w1 bash scripts/fit_batch.sh
 # =============================================================================
 
@@ -84,7 +79,7 @@ else
     echo "git=$(git rev-parse --short HEAD 2>/dev/null || echo unknown) (clean)"
 fi
 
-echo "per_gpu_batch=$PER_GPU_BATCH  全局 batch=$GLOBAL_BATCH (双卡同 batch 时是 $((2 * PER_GPU_BATCH)))"
+echo "per_gpu_batch=$PER_GPU_BATCH  全局 batch=$GLOBAL_BATCH  (单卡)"
 echo "steps=$STEPS horizon=$LR_HORIZON lr=$LR (${LR_SCALING} 缩放自 $LR_REF @ 全局 $LR_REF_BATCH) seed=$SEED"
 echo "views=$NUM_VIEWS workers=$NUM_WORKERS val_batch=$VAL_BATCH_SIZE val_interval=$VAL_INTERVAL"
 echo "build_priors=$BUILD_PRIORS resume=$RESUME"
