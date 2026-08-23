@@ -14,13 +14,16 @@
 # -----------------------------------------------------------------------------
 # 这一条必须先说清楚: 每张卡的参数相同, **全局 batch 不同**。
 #
-#     双卡 sbatch_ddp2.sh : 2 进程 x per-GPU 1 = 全局 batch 2
-#     单卡 (本脚本)       : 1 进程 x per-GPU 1 = 全局 batch 1
+#     双卡 sbatch_ddp2.sh : 2 进程 x per-GPU 5 = 全局 batch 10
+#     单卡 (本脚本)       : 1 进程 x per-GPU 5 = 全局 batch 5
 #
-# 所以本脚本跑出来的曲线**不能**直接和双卡的比 —— 每步看到的样本少一半, 同样
-# 的 lr 3e-4 和 30k 步意味着不同的优化轨迹。它的用途是: 只有一张卡时照常推进,
-# 或者量单卡的显存/吞吐。要跟双卡对齐全局 batch 就设 PER_GPU_BATCH=2, 但那样
-# 每张卡的参数又不同了 (BN 批量 10 vs 5) —— 两者不可兼得, 自己挑一个并记录。
+# 所以本脚本的曲线**不能**直接和双卡的比 —— 每步看到的样本少一半。lr 会按
+# 各自的全局 batch 自动 sqrt 缩放 (见 _arm_common.sh), 所以两边的 lr 也不同,
+# 这是有意的。要跟双卡对齐全局 batch 就 PER_GPU_BATCH=10, 但那样每卡参数又
+# 不同了 (显存也放不下) —— 两者不可兼得, 自己挑一个并记录。
+#
+# 显存: 提交长跑之前先量, 不要信默认的 PER_GPU_BATCH=5:
+#     ARM=w1 bash scripts/fit_batch.sh
 # =============================================================================
 
 set -euo pipefail
@@ -44,6 +47,7 @@ cd "$PROJECT_DIR"
 
 # --- arm 与公共参数: 与双卡脚本同源 ---
 ARM=${ARM:-w1}
+NPROC=1                       # 必须在 source 之前: 用来算 GLOBAL_BATCH 和 lr
 # shellcheck source=scripts/_arm_common.sh
 source "$PROJECT_DIR/scripts/_arm_common.sh"
 # 单卡 run 名加后缀, 免得和双卡的 run 目录撞在一起被归档掉
@@ -80,8 +84,8 @@ else
     echo "git=$(git rev-parse --short HEAD 2>/dev/null || echo unknown) (clean)"
 fi
 
-echo "per_gpu_batch=$PER_GPU_BATCH  全局 batch=$PER_GPU_BATCH (双卡是 $((2 * PER_GPU_BATCH)))"
-echo "steps=$STEPS horizon=$LR_HORIZON lr=$LR amp=$AMP_DTYPE seed=$SEED"
+echo "per_gpu_batch=$PER_GPU_BATCH  全局 batch=$GLOBAL_BATCH (双卡同 batch 时是 $((2 * PER_GPU_BATCH)))"
+echo "steps=$STEPS horizon=$LR_HORIZON lr=$LR (${LR_SCALING} 缩放自 $LR_REF @ 全局 $LR_REF_BATCH) seed=$SEED"
 echo "views=$NUM_VIEWS workers=$NUM_WORKERS val_batch=$VAL_BATCH_SIZE val_interval=$VAL_INTERVAL"
 echo "build_priors=$BUILD_PRIORS resume=$RESUME"
 echo "arm_args: ${ARM_ARGS[*]}"

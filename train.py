@@ -416,9 +416,9 @@ class TrainLogger:
 # --------------------------------------------------------------------------- #
 # Synthetic batch (for --smoke: exercises the whole path without a dataset)
 # --------------------------------------------------------------------------- #
-def _synthetic_batch(cfg, device: torch.device, batch_size: int) -> dict:
+def _synthetic_batch(cfg, device: torch.device, batch_size: int, hw=None) -> dict:
     B, V = batch_size, cfg.train.num_views
-    H, W = 256, 320
+    H, W = hw if hw is not None else (256, 320)
     dmin, interval, nd = 425.0, 2.5, 192
     dv = torch.from_numpy(np.arange(dmin, dmin + interval * nd, interval, dtype=np.float32))
     batch = {
@@ -714,6 +714,10 @@ def main_worker(
     # 也就没有"放大 -> 检查 inf -> 跳过"这一整套。开着反而多一层跳步逻辑。
     scaler = torch.amp.GradScaler(device.type, enabled=use_amp and _amp_dtype(cfg) is torch.float16)
 
+    if args.fit_batch:
+        _fit_batch(model, loss_fn, optimizer, scaler, cfg, device, args, is_main)
+        return
+
     run_name = args.name + ("_smoke" if args.smoke else "")
     logger = TrainLogger(run_name, enabled=is_main, cfg=cfg, scaler=scaler)
 
@@ -991,6 +995,91 @@ def _train_step(model, loss_fn, optimizer, scaler, batch, cfg, device, step, use
     scaler.step(optimizer)
     scaler.update()
     return logs, outputs
+
+
+def _fit_batch(model, loss_fn, optimizer, scaler, cfg, device, args, is_main) -> None:
+    """在**真实训练配置**下扫 per-GPU batch, 报每张卡的峰值显存与占用率。
+
+    为什么长在 train.py 里而不是单独一个脚本: 它必须走完全同一条 cfg 覆盖路径
+    (--axis-space / --geo-valid / --conf-head / dino / spre ...), 否则量出来的
+    是另一个模型的显存。scripts/verify_w1.py --mem 那条路把 dino 和 spre 关掉了,
+    数字系统性偏低, **不能**拿来定 batch。
+
+    量的是**多尺度里最大的那个尺度**。训练是多尺度的, 显存在最小与最大尺度之间
+    摆动 2.2 倍 —— 按平均尺度定 batch, 最大尺度那几步必 OOM; 所以只能按最大的定,
+    代价是小尺度时卡是空着的。这不是可以调掉的, 是多尺度训练的固有性质。
+    """
+    if device.type != "cuda":
+        print("[fit-batch] 需要 CUDA"); return
+    scales = cfg.augment.scales if (cfg.augment.multi_scale and cfg.augment.scales) \
+        else ((cfg.data.target_h, cfg.data.target_w),)
+    hw = max(scales, key=lambda s: s[0] * s[1])
+    if args.fit_hw:
+        # 显式指定尺度: 在放不下最大尺度的小卡上, 用小尺度测出斜率再外推
+        try:
+            _h, _w = (int(v) for v in str(args.fit_hw).lower().split("x"))
+        except ValueError:
+            raise SystemExit(f"--fit-hw 需要 HxW, 收到 {args.fit_hw!r}")
+        hw = (_h, _w)
+    total = torch.cuda.get_device_properties(device).total_memory / 2 ** 30
+    try:
+        batches = [int(x) for x in str(args.fit_batch).split(",") if x.strip()]
+    except ValueError:
+        raise SystemExit(f"--fit-batch 需要逗号分隔的整数, 收到 {args.fit_batch!r}")
+    target = float(args.fit_target)
+
+    print(f"[fit-batch] {torch.cuda.get_device_name(device)}  总显存 {total:.1f} GiB")
+    print(f"[fit-batch] 最大尺度 {hw[0]}x{hw[1]} ({hw[0]*hw[1]/1e6:.4f} Mpx), views={cfg.train.num_views}")
+    print(f"[fit-batch] 目标占用 {100*target:.0f}%  ({total*target:.1f} GiB)")
+    print(f"[fit-batch] 注意: 报的是 reserved (nvidia-smi 看到的量), 另加 ~0.5GiB CUDA context\n")
+    print(f"  {'batch':>5} {'allocated':>11} {'reserved':>10} {'占用':>8}  {'状态':<8}")
+
+    rows = []
+    for b in batches:
+        torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats()
+        try:
+            # 跑两步: 第一步之后 AdamW 才会分配 exp_avg/exp_avg_sq (约 830MB),
+            # 只跑一步会把优化器状态漏掉, 低估将近 1GiB。
+            for _ in range(2):
+                batch = _synthetic_batch(cfg, device, b, hw=hw)
+                _train_step(model, loss_fn, optimizer, scaler, batch, cfg, device,
+                            10 ** 6, cfg.train.amp)
+                del batch
+            alloc = torch.cuda.max_memory_allocated() / 2 ** 30
+            resv = torch.cuda.max_memory_reserved() / 2 ** 30
+            frac = (resv + 0.5) / total
+            rows.append((b, alloc, resv, frac))
+            flag = "OK" if frac <= target else "超目标"
+            print(f"  {b:>5} {alloc:>10.2f}G {resv:>9.2f}G {100*frac:>7.1f}%  {flag:<8}")
+        except torch.OutOfMemoryError:
+            print(f"  {b:>5} {'-':>11} {'-':>10} {'-':>8}  OOM")
+            torch.cuda.empty_cache()
+            break
+    optimizer.zero_grad(set_to_none=True)
+    torch.cuda.empty_cache()
+
+    fit = [r for r in rows if r[3] <= target]
+    print()
+    if not fit:
+        print("[fit-batch] 没有一个 batch 落在目标之下 —— 目标太低或尺度太大")
+        return
+    best = max(fit, key=lambda r: r[0])
+    print(f"[fit-batch] 目标 {100*target:.0f}% 之下最大的 per-GPU batch = {best[0]} "
+          f"(峰值 {best[2]:.1f} GiB, {100*best[3]:.1f}%)")
+    # lr 的基准必须是**未缩放**的参考值。不能拿 cfg.train.lr —— 那个已经被
+    # _arm_common.sh 按当前全局 batch 缩放过一次了, 再缩一次就是双重缩放。
+    import math as _m
+    ref_lr, ref_b = float(args.fit_lr_ref), float(args.fit_lr_ref_batch)
+    print(f"    (lr 基准 {ref_lr:.3e} @ 全局 batch {ref_b:g}; 当前 cfg.train.lr="
+          f"{cfg.train.lr:.3e} 已按当前设置缩放过, 不作基准)")
+    for nproc in (1, 2):
+        gb = best[0] * nproc
+        print(f"    {nproc} 卡 -> 全局 batch {gb}; "
+              f"sqrt 缩放 lr = {ref_lr * _m.sqrt(gb / ref_b):.3e}, "
+              f"linear = {ref_lr * gb / ref_b:.3e}")
+    print("[fit-batch] 提醒: 多尺度下这个占用只在**最大尺度**成立; 最小尺度 "
+          f"({min(scales, key=lambda s: s[0]*s[1])}) 大约只有它的 "
+          f"{100*min(s[0]*s[1] for s in scales)/max(s[0]*s[1] for s in scales):.0f}%。")
 
 
 def _run_smoke(model, loss_fn, optimizer, scaler, cfg, device, args, logger, is_main):
@@ -1719,6 +1808,17 @@ def main() -> None:
     parser.add_argument("--allow-fingerprint-mismatch", action="store_true",
                         help="resume 时即使 checkpoint 指纹与当前配置不符也继续。"
                              "只在确认无害时用 (例如仅重建过先验缓存)")
+    parser.add_argument("--fit-batch", type=str, default="",
+                        help="按真实训练配置扫 per-GPU batch 的显存占用后退出, "
+                             "如 '1,2,4,6,8'。量的是多尺度里最大的那个尺度。")
+    parser.add_argument("--fit-lr-ref", type=float, default=3e-4,
+                        help="--fit-batch 的 lr 基准 (未缩放), 默认 3e-4")
+    parser.add_argument("--fit-lr-ref-batch", type=float, default=2,
+                        help="--fit-lr-ref 对应的全局 batch, 默认 2")
+    parser.add_argument("--fit-hw", type=str, default="",
+                        help="--fit-batch 的尺度覆盖, 如 '448x576'。默认用多尺度里最大的。")
+    parser.add_argument("--fit-target", type=float, default=0.95,
+                        help="--fit-batch 的目标显存占用 (0-1), 默认 0.95")
     parser.add_argument("--smoke", action="store_true", help="run synthetic steps to validate the pipeline")
     parser.add_argument("--smoke-steps", type=int, default=3)
     args = parser.parse_args()

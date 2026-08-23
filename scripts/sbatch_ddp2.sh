@@ -26,14 +26,21 @@
 #   为的是归因清楚。
 #
 # -----------------------------------------------------------------------------
-# 关于批量: 默认 per-GPU batch = 1, **全局 batch = 2**, 与 f10 单卡 batch=2 的
-# 全局批量一致。这样 30k 步的语义、lr 3e-4 和验证曲线都能直接和基线比, 双卡
-# 只是把 wall-clock 砍一半。
+# 关于批量 (2026-08-23 改): per-GPU batch 默认 5, 全局 batch 10, 为的是把
+# A100-80GB 吃满。实测 per-GPU batch 1 只占 18.3% (reserved 14.66 GiB)。
 #
-# 80GB 的卡确实吃得下更多 (实测 0.57 + B x (0.18 + 21.9 x Mpx) GiB, 最大尺度
-# 640x896 下 B=2 约 27GiB, B=4 约 55GiB), 但**把卡吃满不是目标**: 全局 batch=4
-# 是另一个训练配置, lr 要重新标定, 30k 步也不再等价于基线的 30k 步。
-#     PER_GPU_BATCH=2 ARM=w1 sbatch scripts/sbatch_ddp2.sh    # 需自行调 lr
+# **先量再交, 不要信默认值**:  ARM=w1 bash scripts/fit_batch.sh
+#
+# 这件事要说清楚: 抬 batch 会让这一轮**不再等价于工单里的基线**。
+#   * lr 自动按 sqrt(全局batch/2) 从 3e-4 缩放 (LR_SCALING=linear/none 可改);
+#   * 30k 步现在看到 5 倍的样本, "30k 步" 这个横轴的含义变了;
+#   * BN 批量从 B*V=10 变成 25 (FPN 里是 BatchNorm2d, 且没有 SyncBN)。
+#   -> 所以 w0/w1/w3 三个 arm 必须用**同一个** PER_GPU_BATCH, 否则连互相之间
+#      都不可比。要回到工单原口径就 PER_GPU_BATCH=1 LR_SCALING=none。
+#
+# 多尺度下 "95%" 只在**最大尺度**成立。训练尺度从 448x576 到 640x896, 像素数
+# 差 2.22 倍, 所以显存也在两倍多的范围里摆 —— 按平均尺度定 batch, 最大尺度
+# 那几步必 OOM; 只能按最大尺度定, 代价是小尺度时卡是空着的。这不是可以调掉的。
 #
 # -----------------------------------------------------------------------------
 # BatchNorm 的坑 —— 决定 batch 之前先读这一段。
@@ -70,10 +77,10 @@ set -u
 # --- arm 与公共参数: 与单卡脚本 (train_umhpc_interactive.sh) 同源 ---
 # 两个脚本各抄一份 arg 列表迟早会漂, 那时候两条曲线还长得很像, 但已经不是
 # 同一个实验了。唯一该有的差别是进程数与全局 batch。
+# NPROC 必须在 source **之前**定好: _arm_common.sh 用它算 GLOBAL_BATCH 和 lr。
+NPROC=${NPROC:-2}
 # shellcheck source=scripts/_arm_common.sh
 source "$PROJECT_DIR/scripts/_arm_common.sh"
-
-NPROC=${NPROC:-2}
 
 # -------------------------------------------------------- 干净工作树是硬要求
 # 跑出来的曲线必须对得上一个 commit, 否则几周后没人能说清那条线是哪版代码。
@@ -108,7 +115,8 @@ echo "=================================================================="
 echo " arm=$ARM  run=$RUN_NAME  job=${SLURM_JOB_ID:-manual}  host=$(hostname)"
 echo " git=${GIT_SHA:0:12} (clean)"
 echo " nproc=$NPROC  per_gpu_batch=$PER_GPU_BATCH  global_batch=$((NPROC * PER_GPU_BATCH))"
-echo " steps=$STEPS  horizon=$LR_HORIZON  lr=$LR  amp=$AMP_DTYPE  seed=$SEED"
+echo " steps=$STEPS  horizon=$LR_HORIZON  amp=$AMP_DTYPE  seed=$SEED"
+echo " lr=$LR  (${LR_SCALING} 缩放自 $LR_REF @ 全局 batch $LR_REF_BATCH)"
 echo " arm_args: ${ARM_ARGS[*]}"
 echo "=================================================================="
 nvidia-smi -L

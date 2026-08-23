@@ -82,7 +82,6 @@ esac
 # ------------------------------------------- 公共部分 (四个 arm 完全一致)
 STEPS=${STEPS:-30000}
 LR_HORIZON=${LR_HORIZON:-30000}
-LR=${LR:-3e-4}
 SEED=${SEED:-20260526}
 AMP_DTYPE=${AMP_DTYPE:-bf16}
 NUM_GLOBAL=${NUM_GLOBAL:-32}
@@ -96,17 +95,55 @@ W_BRANCH=${W_BRANCH:-0}
 SPRE_BALANCE=${SPRE_BALANCE:-on}
 PRIOR=${PRIOR:-on}
 
+# =========================== batch 与 lr ===========================
 # **每张卡**的 batch。单卡脚本和双卡脚本都用这一个值 —— 这正是"每张卡的训练
-# 参数相同"的含义; 两者的全局 batch 因此差一倍 (单卡 1, 双卡 2), 调用方要自己
-# 把这件事说清楚。
-PER_GPU_BATCH=${PER_GPU_BATCH:-1}
+# 参数相同"的含义; 两者的全局 batch 因此差一倍, 调用方要自己把这件事说清楚。
+#
+# 2026-08-23: 从 1 抬到 5, 目标是把 A100-80GB 吃到 ~95%。实测 (真实配置:
+# DINOv3 all_view + SPRE + W1/W3A/C, 最大尺度 640x896, views=5):
+#     per-GPU batch 1 -> allocated 12.66 GiB / reserved 14.66 GiB  = 80GB 的 18.3%
+# 这正是之前看到的 18.1%。
+#
+# **提交 30k 之前必须先在 A100 上实测**, 不要信这里的默认值:
+#     ARM=w1 bash scripts/fit_batch.sh
+# 它走的是与训练**完全同一条** cfg 覆盖路径, 所以量的就是训练本身的显存。
+# (scripts/verify_w1.py --mem 那条路把 dino 和 spre 关掉了, 数字系统性偏低,
+#  不能拿来定 batch。)
+#
+# 为什么 5 只是估计: 显存对 batch 近似线性, 但对像素数**不是**干净的线性
+# (stage4 全分辨率代价体占了大头, 与 FPN/DINO 的缩放规律不同), 小卡上量到的
+# 斜率外推到 80GB 有 5-7 的不确定区间。所以要在目标卡上量。
+PER_GPU_BATCH=${PER_GPU_BATCH:-5}
 NUM_VIEWS=${NUM_VIEWS:-5}
 VAL_BATCH_SIZE=${VAL_BATCH_SIZE:-6}
-NUM_WORKERS=${NUM_WORKERS:-8}
+# batch 抬起来之后 dataloader 才是瓶颈: 每个样本要读 5 张图 + prior,
+# w3b 还要多读 4 张 PFM + mask。sbatch 给了 cpus-per-task=32, 双卡 2x12 用得起。
+NUM_WORKERS=${NUM_WORKERS:-12}
 VAL_INTERVAL=${VAL_INTERVAL:-500}
 LOG_INTERVAL=${LOG_INTERVAL:-10}
 BUILD_PRIORS=${BUILD_PRIORS:-skip}
 RESUME=${RESUME:-off}
+
+# --- lr 随全局 batch 缩放 ---
+# 基线: lr 3e-4 @ 全局 batch 2。全局 batch 一变, 沿用同一个 lr 就是另一回事了。
+# 默认 sqrt 缩放 —— AdamW 上比 linear 稳; linear 在 5 倍 batch 上很容易发散。
+# LR_SCALING=none 表示"我知道我在干什么, 别动我的 lr"。
+NPROC=${NPROC:-1}
+GLOBAL_BATCH=$((NPROC * PER_GPU_BATCH))
+LR_REF=${LR_REF:-3e-4}
+LR_REF_BATCH=${LR_REF_BATCH:-2}
+LR_SCALING=${LR_SCALING:-sqrt}       # sqrt / linear / none
+if [[ -z "${LR:-}" ]]; then
+    case "$LR_SCALING" in
+      sqrt)   LR=$(awk -v l="$LR_REF" -v g="$GLOBAL_BATCH" -v r="$LR_REF_BATCH" \
+                   'BEGIN{printf "%.4g", l*sqrt(g/r)}') ;;
+      linear) LR=$(awk -v l="$LR_REF" -v g="$GLOBAL_BATCH" -v r="$LR_REF_BATCH" \
+                   'BEGIN{printf "%.4g", l*(g/r)}') ;;
+      none)   LR=$LR_REF ;;
+      *) echo "LR_SCALING 只能是 sqrt / linear / none, 收到 '$LR_SCALING'" >&2
+         return 2 2>/dev/null || exit 2 ;;
+    esac
+fi
 
 COMMON_ARGS=(
     --profile "${TRAIN_PROFILE:-umhpc}"
