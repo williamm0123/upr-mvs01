@@ -85,7 +85,7 @@ echo " steps=$STEPS  horizon=$LR_HORIZON  amp=$AMP_DTYPE  seed=$SEED"
 echo " lr=$LR  (${LR_SCALING} 缩放自 $LR_REF @ 全局 batch $LR_REF_BATCH)"
 echo " arm_args: ${ARM_ARGS[*]}"
 echo "=================================================================="
-nvidia-smi -L
+nvidia-smi -L || true
 
 exec python train.py \
     --gpus 1 \
