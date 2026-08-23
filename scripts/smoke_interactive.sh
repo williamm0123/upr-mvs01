@@ -23,10 +23,10 @@ set -euo pipefail
 
 PROJECT_DIR=${PROJECT_DIR:-/scr/user/qinglong/projects/upr-mvs01}
 PYTHON_BIN=${PYTHON_BIN:-/home/user/qinglong/.conda/envs/uprmvs/bin/python}
-SMOKE_STEPS=${SMOKE_STEPS:-8}        # arm 扫描: 只问"跑不跑得起来"
-LONG_STEPS=${LONG_STEPS:-200}        # 长跑: 工单验收 (4) 要 200-500 步
+SMOKE_STEPS=${SMOKE_STEPS:-1000}        # arm 扫描: 只问"跑不跑得起来"
+LONG_STEPS=${LONG_STEPS:-2000}        # 长跑: 工单验收 (4) 要 200-500 步
 LONG_ARM=${LONG_ARM:-w1}             # 长跑用哪个 arm (就是你要提交的那个)
-BATCH_SIZE=${BATCH_SIZE:-1}          # per-GPU
+BATCH_SIZE=${BATCH_SIZE:-4}          # per-GPU
 NUM_WORKERS=${NUM_WORKERS:-4}
 NUM_VIEWS=${NUM_VIEWS:-5}
 MEM_BATCHES=${MEM_BATCHES:-"1 2 4"}  # 显存扫描的 per-GPU batch

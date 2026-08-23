@@ -67,85 +67,13 @@ source ~/.bashrc
 conda activate uprmvs
 set -u
 
-# ---------------------------------------------------------------- arm 定义
-# 三个 arm 只在这一段有差别; 下面的公共部分一个字都不要动, 否则就不是配对实验。
-case "$ARM" in
-  w0)
-    RUN_NAME=${RUN_NAME:-R32_f10_30k}
-    ARM_ARGS=(--axis-space legacy_depth --stage4-head expect)
-    ;;
-  w1)
-    RUN_NAME=${RUN_NAME:-W1_vnext}
-    ARM_ARGS=(
-      --axis-space inverse                       # A 逆深度轴 + E 非均匀轴记账
-      --axis-blend-steps "${AXIS_BLEND_STEPS:-2000}"
-      --tau-stages "${TAU_STAGES:-0.98,0.95,0.92}"   # C pinball 目标覆盖率
-      --rho-max "${RHO_MAX:-8.0}"                # B 半宽的倍率界 [h0/8, 8h0]
-      --stage4-head map                          # D 硬 MAP + 逐候选残差
-      --mode-window-stages "${MODE_WINDOW_STAGES:-2,2,1,2}"
-      --spre-cascade on                          # F SPRE 累乘门贯穿四级
-      --spre-gate-init "${SPRE_GATE_INIT:-1.0,0.60,0.35,0.20}"
-      --w-range "${W_RANGE:-1.0}" --w-center "${W_CENTER:-0.2}"
-      --w-residual "${W_RESIDUAL:-1.0}" --w-oor "${W_OOR:-0.1}"
-    )
-    ;;
-  w3|w3b)
-    RUN_NAME=${RUN_NAME:-W3_vnext}
-    ARM_ARGS=(
-      --axis-space inverse
-      --axis-blend-steps "${AXIS_BLEND_STEPS:-2000}"
-      --tau-stages "${TAU_STAGES:-0.98,0.95,0.92}"
-      --rho-max "${RHO_MAX:-8.0}"
-      --stage4-head map
-      --mode-window-stages "${MODE_WINDOW_STAGES:-2,2,1,2}"
-      --spre-cascade on
-      --spre-gate-init "${SPRE_GATE_INIT:-1.0,0.60,0.35,0.20}"
-      --w-range "${W_RANGE:-1.0}" --w-center "${W_CENTER:-0.2}"
-      --w-residual "${W_RESIDUAL:-1.0}" --w-oor "${W_OOR:-0.1}"
-      --geo-valid on                             # W3-A 逐假设几何有效聚合
-      --conf-head on --w-conf "${W_CONF:-1.0}"   # W3-C 最终重建置信度
-      --conf-tau-mm "${CONF_TAU_MM:-2.0}"
-    )
-    if [[ "$ARM" == "w3b" ]]; then
-      RUN_NAME=${RUN_NAME_B:-W3_vnext_visB}
-      # W3-B: 多标签可见性 + 源视图 GT 遮挡监督。dataset 每样本多读 N-1 张
-      # PFM + mask, 所以 workers 给足。工单把它排在最后 —— 先有 A+C 的干净
-      # 读数, 再看 B 加不加得动。
-      ARM_ARGS+=(--visibility on --vis-mode sigmoid --vis-supervise on
-                 --w-vis "${W_VIS:-0.1}" --delta-occ-mm "${DELTA_OCC_MM:-2.0}")
-      NUM_WORKERS=${NUM_WORKERS:-12}
-    fi
-    ;;
-  *)
-    echo "ARM 只能是 w0 / w1 / w3 / w3b, 收到 '$ARM'" >&2; exit 2 ;;
-esac
+# --- arm 与公共参数: 与单卡脚本 (train_umhpc_interactive.sh) 同源 ---
+# 两个脚本各抄一份 arg 列表迟早会漂, 那时候两条曲线还长得很像, 但已经不是
+# 同一个实验了。唯一该有的差别是进程数与全局 batch。
+# shellcheck source=scripts/_arm_common.sh
+source "$PROJECT_DIR/scripts/_arm_common.sh"
 
-# ------------------------------------------------- 公共部分 (三个 arm 完全一致)
-STEPS=${STEPS:-30000}
-LR_HORIZON=${LR_HORIZON:-30000}
-LR=${LR:-3e-4}
-SEED=${SEED:-20260526}
-AMP_DTYPE=bf16
-NUM_GLOBAL=32
-NUM_LOCAL=16
-RANGE_MIN_GI=0.66,0.20,0.10      # inverse 下只作为 RangeController 的初始化值
-GATE_LOCAL=off
-BRANCH_PRIOR=off
-STAGE1_WEIGHT=0.5
-W_BRANCH=0
-SPRE_BALANCE=on
-PRIOR=on
-
-PER_GPU_BATCH=${PER_GPU_BATCH:-1}
 NPROC=${NPROC:-2}
-NUM_VIEWS=${NUM_VIEWS:-5}
-VAL_BATCH_SIZE=${VAL_BATCH_SIZE:-6}
-NUM_WORKERS=${NUM_WORKERS:-8}    # per-process; 2 进程 x 8 = 16 个 loader worker
-VAL_INTERVAL=${VAL_INTERVAL:-500}
-LOG_INTERVAL=${LOG_INTERVAL:-10}
-# w3b 之外的 arm 不开 visibility (与 f10 基线一致)
-VISIBILITY=${VISIBILITY:-off}
-[[ "$ARM" == "w3b" ]] || ARM_ARGS+=(--visibility "$VISIBILITY")
 
 # -------------------------------------------------------- 干净工作树是硬要求
 # 跑出来的曲线必须对得上一个 commit, 否则几周后没人能说清那条线是哪版代码。
@@ -186,32 +114,8 @@ echo "=================================================================="
 nvidia-smi -L
 
 exec torchrun --standalone --nnodes=1 --nproc-per-node="$NPROC" train.py \
-    --profile umhpc \
     --ddp on \
-    --name "$RUN_NAME" \
-    --steps "$STEPS" \
-    --lr-schedule-steps "$LR_HORIZON" \
-    --lr "$LR" \
-    --amp-dtype "$AMP_DTYPE" \
-    --seed "$SEED" \
-    --deterministic \
     --batch-size "$PER_GPU_BATCH" \
-    --num-views "$NUM_VIEWS" \
-    --num-workers "$NUM_WORKERS" \
-    --val-batch-size "$VAL_BATCH_SIZE" \
-    --val-interval "$VAL_INTERVAL" \
-    --log-interval "$LOG_INTERVAL" \
-    --num-global "$NUM_GLOBAL" \
-    --num-local "$NUM_LOCAL" \
-    --range-min-gi "$RANGE_MIN_GI" \
-    --gate-local "$GATE_LOCAL" \
-    --branch-prior "$BRANCH_PRIOR" \
-    --stage1-weight "$STAGE1_WEIGHT" \
-    --w-branch "$W_BRANCH" \
-    --spre-balance-corrupt "$SPRE_BALANCE" \
-    --prior "$PRIOR" \
-    --spre on \
-    "${ARM_ARGS[@]}" \
-    --no-clean-lists \
-    --resume off \
-    --build-priors skip
+    --name "$RUN_NAME" \
+    "${COMMON_ARGS[@]}" \
+    "${ARM_ARGS[@]}"
