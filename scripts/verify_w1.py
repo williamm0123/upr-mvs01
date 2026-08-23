@@ -470,6 +470,23 @@ def run_ddp_precondition(device: str) -> None:
         raise SystemExit("有参数要梯度却没收到 —— 双卡 DDP 会在第二步报错")
     print("  所有配置都满足 DDP find_unused_parameters=False 的前提")
 
+    # W3-B 的投影几何只在 train() 下收集 (val 不算损失, 那份 stash 是纯浪费)。
+    # 但 _run_validation 结束时会 model.train() 回来 —— 如果哪天不回来了,
+    # L_vis 会在第一次验证之后**静默**消失, 训练照跑, 只是那一项监督没了。
+    torch.manual_seed(0)
+    cfg = _cfg(axis="inverse", stage4="map", geo_valid=True, conf_head=True,
+               vis_mode="sigmoid", vis_supervise=True)
+    net = UprMVSNet(cfg).to(device)
+    b = _batch(B, V, H, W, device)
+    seen = []
+    for mode in ("train", "eval", "train"):
+        getattr(net, mode)()
+        with torch.no_grad():
+            out = net(b, step=10 ** 6)
+        seen.append(out.get("vis_sup") is not None)
+    assert seen == [True, False, True], f"train/eval 下的几何 stash 应当是 开/关/开, 得到 {seen}"
+    print("  [ok] vis_sup 只在 train() 下收集, eval() 关闭, 回到 train() 恢复")
+
 
 def main() -> None:
     ap = argparse.ArgumentParser()

@@ -210,7 +210,10 @@ class CostVolumeBuilder(nn.Module):
         # 两遍: 先收齐每个 source 的相关体和可见性 logits, 再在 source 维竞争
         # 归一化。一遍式的 per-source sigmoid 不构成竞争。
         cvs, vlogits, valids = [], [], []
-        geoms = [] if (self.collect_vis_geom and self.use_vis) else None
+        # 只在**训练**时留投影几何: 它唯一的消费者是 losses/composite 的遮挡标签,
+        # 而 _run_validation 根本不算损失。val_batch_size=6 时这一份 stash 在
+        # stage1 就是 ~700MB 的纯浪费 (uv 是 [S,B,D,H,W,2] 的 fp32)。
+        geoms = [] if (self.collect_vis_geom and self.use_vis and self.training) else None
         for s in range(S):
             src_p = self.proj(src_feats[:, s]).to(sample_dtype)
             Probe.log(self.tag, "src_p", src_p, src=s)
