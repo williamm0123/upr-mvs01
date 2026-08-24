@@ -101,11 +101,26 @@ def main() -> None:
                     help="把拟合出的 T 写回 checkpoint 的 conf_head.log_T")
     ap.add_argument("--out", default="experiments/out/calibrate_conf.json")
     ap.add_argument("--cfg-override", default="auto")
+    ap.add_argument("--resize-scale", type=float, default=0.8,
+                    help="相对 DTU 原始 1200x1600 的缩放。0.8 整幅是 A100 的部署口径; "
+                         "16GB 卡放不下, 用 0.5 (600x800) 或 0.6 (720x960)。"
+                         "只用能被 8 整除的值 —— FPN 要下采样三次")
+    ap.add_argument("--num-views", type=int, default=None,
+                    help="视角数, 默认跟 cfg (5)。显存不够时**先降分辨率再降视角** —— "
+                         "视角数对匹配质量的影响比分辨率大")
+    ap.add_argument("--full-image", choices=["on", "off"], default="on",
+                    help="on=整幅 (只缩放不裁剪); off=按 cfg 的裁剪窗口")
+    ap.add_argument("--max-refs", type=int, default=0,
+                    help="每个 scan 最多取几个参考视图, 0=全部 (子采样用)")
     a = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     cfg = build_mvs_config(profile=a.profile)
     ns = testmod.eval_namespace(ckpt=a.ckpt, num_workers=a.num_workers, limit=a.limit,
+                                     resize_scale=a.resize_scale,
+                                     num_views=a.num_views,
+                                     full_image=(a.full_image == "on"),
+                                     max_refs=a.max_refs,
                                 cfg_override=a.cfg_override)
     ds = testmod.build_dataset(cfg, ns)
     model, ckpt_path = testmod.load_model(cfg, ns, device)
