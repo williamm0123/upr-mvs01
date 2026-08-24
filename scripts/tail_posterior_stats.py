@@ -228,16 +228,42 @@ def main() -> None:
     p = res["P_dep_mass_ok_and_gt_in"]
     print("\n---- 预注册判据 (只看 deployable) ----")
     print(f"  P(dep 峰存在 ∧ M2>=0.10 ∧ GT 在其邻域 | A∪B) = {p:.4f}")
+    gap = res["gap_dep_p50_in_s2_half"]
+    gain_pp = 100.0 * (res["P_top2_cov_dep"] - res["P_winner_only_cov"])
     if p >= 0.35:
         verdict = "做 W2 —— 尾部确实主要是可分离、可检出的第二表面"
     elif p < 0.20:
-        verdict = "放弃 W2 —— 范围控制器的中心偏移已经够, 不要为它扩模型"
+        # 放弃的**理由**要由 gap 决定, 不能硬编码。gap<1 才是"中心偏移就够";
+        # gap>2 是"只有模态切换够得着", 那时放弃的理由是没质量/不值得。
+        if gap < 1.0:
+            why = (f"第二峰离 winner 只有 {gap:.2f}x stage2 半宽 —— "
+                   f"范围控制器的中心偏移就够得着, 不需要模态切换")
+        elif gap > 2.0:
+            why = (f"第二峰远在 {gap:.2f}x stage2 半宽处 (只有模态切换够得着), "
+                   f"但它没有质量 (M2 中位数 {res['mass_dep_p50']:.4f}) 且只多盖 "
+                   f"{gain_pp:+.1f}pp —— 够得着也不值得")
+        else:
+            why = f"第二峰在 {gap:.2f}x stage2 半宽处, 质量与收益都不足"
+        verdict = f"放弃 W2 —— {why}"
     else:
         verdict = "灰区: 只保留日志与诊断, 不扩模型"
     print(f"  -> {verdict}")
+    print(f"  top-2 覆盖收益: winner-only {res['P_winner_only_cov']:.4f} -> "
+          f"top2 {res['P_top2_cov_dep']:.4f} ({gain_pp:+.1f}pp); "
+          f"oracle 上界 {res['P_top2_cov_orc']:.4f}")
     print(f"  oracle 上界 P_orc_gt_in = {res['P_orc_gt_in']:.4f}; 与 deployable 的差距"
           f" = {res['P_orc_gt_in'] - res['P_dep_gt_in']:+.4f}"
           f"  (差距大 = 峰存在但选不出来, 那是 ModeHead 的难度, 不是收益)")
+    if res["P_dep_found"] > 0.99:
+        print("  注: P_*_found ~ 1.0 不代表'总有第二个表面' —— 48 bin 的轴上, "
+              "任何离 winner 超过 2x h_sep 的局部极大都算'找到'。有没有东西看 M2, "
+              "不看 found。")
+    print(f"  rank(g): 尾部 top1 {res['rank_le1_tail']:.3f} / top3 {res['rank_le3_tail']:.3f}"
+          f"  vs 全体 top1 {res['rank_le1_all']:.3f} / top3 {res['rank_le3_all']:.3f}")
+    if res["rank_le3_tail"] > 0.6 and res["rank_le1_tail"] < 0.5:
+        print("  ^ 读法: 尾部里 GT bin 多半仍在 stage1 的 top-3, 只是不在 top-1。"
+              "信息在 stage1 就有, 丢在'只把 argmax 传给下一级'这个交接上 —— "
+              "这是范围中心/交接的问题, 不是再加一个模态能解决的。")
     print(f"\n  写入 {a.out}")
 
 
