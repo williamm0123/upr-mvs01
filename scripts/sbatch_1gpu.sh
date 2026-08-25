@@ -19,6 +19,8 @@
 #   ARM=w1 sbatch scripts/sbatch_1gpu.sh     # W1  Depth-core vNext (修订版) -> 30k
 #   ARM=w3 sbatch scripts/sbatch_1gpu.sh     # W3  UPRMVS-3D vNext -> 30k (从头)
 #   ARM=w3b sbatch scripts/sbatch_1gpu.sh    # W3 + W3-B 源视图可见性监督
+#   ARM=vnext sbatch scripts/sbatch_1gpu.sh  # 工单 v5.3 的唯一候选 -> 30k
+#                                            # (W0 基座 + CVPE + geo_valid + conf_head)
 #
 # 2026-08-23 起**只用单卡**, 双卡 DDP 路径不再使用。原因是双卡下没有哪种配置能
 # 同时对齐"全局 batch"和"BN 批量" (FPN 是 BatchNorm2d 且全网无 SyncBN), 单卡

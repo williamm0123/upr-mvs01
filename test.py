@@ -521,7 +521,7 @@ def run_inference(model, ds, cfg, args, device, out_root: Path) -> dict:
                              "(训练时需要 --conf-head on)")
         if fc is not None and args.conf_source in ("auto", "learned"):
             conf = fc["prob"].float()          # 已过温度标定
-            _conf_kind = f"learned(T={fc['T']:.3f})"
+            _conf_kind = f"learned(T={fc['T']:.3f},b={fc.get('bias', 0.0):+.3f})"
         else:
             conf = cascade_confidence(outputs, window=args.conf_window, mode=args.conf_mode)
         # 饱和自检: conf 恒为 1 意味着 --photo-thresh 门控是死的, 融合实际只跑了

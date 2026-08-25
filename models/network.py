@@ -823,6 +823,9 @@ class UprMVSNet(nn.Module):
                 "logit": logit,
                 "prob": self.conf_head.calibrated(logit.detach()),
                 "T": float(self.conf_head.log_T.exp()),
+                # bias 必须一起交出去: 标定是二参数的, 只报 T 的话
+                # "加载了标定过的 ckpt" 与 "加载了没标定的" 在日志上看不出区别。
+                "bias": float(self.conf_head.calib_bias),
             }
 
         # spre_logits 为 None 有两种情况: reliability_source != "spre", 或者
