@@ -65,6 +65,9 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 from base.config import resolve_split, ProjectPaths, build_mvs_config
 from losses import MVSLoss
+# risk@0.6 的排序信号必须与 test.py 融合门控用的是同一份实现, 所以从这里导入
+# 而不是在 train.py 里再写一份 —— 见 models/fusion_conf.py 顶部的说明。
+from models.fusion_conf import cascade_confidence
 from models.network import UprMVSNet
 
 try:
@@ -157,14 +160,22 @@ class WindowedMeter:
 
     # sums layout: [err, n, hit2, hit4, hit8, prior_err, prior_n,
     #               corrupt_err, corrupt_n, clean_err, clean_n,
-    #               body2_err, body4_err, body8_err]
+    #               body2_err, body4_err, body8_err, capped2_err]
     # body{n}_err sums the error of pixels already within n mm; divided by the
     # matching hit{n} count it gives the *precision on matched pixels*, which the
     # plain mean cannot show (a few percent of far-off pixels dominate it). This
     # is MVSFormer++'s abs_depth_thres0-{n}mm_error — their DTU-test value is
     # 0.4920 mm at 2 mm — and it is the only way to tell a refinement gain from
     # an outlier-count gain.
-    N_SLOTS = 14
+    # slot 14 = sum(min(e, 2mm)) —— 主指标 capped_2mm 的分子。**直接累加**,
+    # 不用 body_2mm x acc_2mm + 2(1-acc_2mm) 反算: 那个恒等式只在同一批像素上
+    # 成立, 拿两个已经各自平均过的日志标量去乘会引入窗口口径不一致的偏差。
+    # 为什么用它当主指标: abs_err 有 71% 来自 3.7% 的像素 (融合本该丢掉的那些),
+    # 而 body_2mm 可以被 "把 1.9mm 的像素推到 2.1mm" 改善。min(e,2) 对每个像素
+    # 的误差单调不减, 且尾部贡献被截断在 2mm, 两种操纵都不成立。
+    # 注意它是**单调不减**而不是"必然变好": 20mm -> 3mm 不计入, 所以
+    # tail_frac_8mm 必须始终并列汇报。
+    N_SLOTS = 15
 
     def __init__(self, device: torch.device, is_ddp: bool) -> None:
         self.device = device
@@ -197,6 +208,7 @@ class WindowedMeter:
                 hit = e < t
                 self.sums[2 + i] += hit.sum()
                 self.sums[11 + i] += e[hit].sum()
+            self.sums[14] += e.clamp(max=2.0).sum()
             self.batch_means.append(float(e.mean()))
             if prior is not None:
                 pm = m & (prior > 0)
@@ -235,6 +247,7 @@ class WindowedMeter:
             # the >8mm tail, measured directly instead of back-solved from the mean
             "abs_err_tail_8mm": float((s[0] - s[13]) / (n - s[4]).clamp(min=1)),
             "tail_frac_8mm": float((n - s[4]) / n),
+            "capped_2mm": float(s[14] / n),
         }
         if s[6] > 0:
             metrics["prior_abs_err"] = float(s[5] / s[6])
@@ -611,6 +624,8 @@ def main_worker(
         dec_over["fusion_conf_detach"] = args.conf_detach == "on"
     if dec_over:
         cfg = replace(cfg, decoder=replace(cfg.decoder, **dec_over))
+    if args.cvpe is not None:
+        cfg = replace(cfg, cvpe=replace(cfg.cvpe, enabled=args.cvpe == "on"))
     if args.stage1_weight is not None:
         cfg = replace(cfg, stage_weights=replace(cfg.stage_weights, stage1=args.stage1_weight))
     loss_over = {}
@@ -994,7 +1009,27 @@ def _train_step(model, loss_fn, optimizer, scaler, batch, cfg, device, step, use
 
     # error_if_nonfinite 必须是 False: 溢出那一步交给 scaler.step() 去跳过,
     # 这里抛异常就又把正常的 AMP 行为当成事故了。
-    torch.nn.utils.clip_grad_norm_(params, cfg.train.grad_clip, error_if_nonfinite=False)
+    #
+    # **分组裁剪**: conf_head 是一条自带监督的旁路, conf_detach=True 已经切断了它
+    # 对深度特征的梯度 —— 但全模型一次 clip_grad_norm_ 会把它的范数算进总范数,
+    # 于是 "旁路头梯度大" 就会等比例缩小主干的更新步长。那样 W3-C 就不再是
+    # 一个可加可减的旁路, 而是一个悄悄改变主干学习率的东西。两组分别裁剪之后,
+    # 主干的更新与 conf_head 开不开严格无关。
+    # 不拆成两个 optimizer: 那会改变 AdamW 的 state 布局与 checkpoint 结构,
+    # 而这里要解决的只是范数耦合。
+    conf_params, base_params = [], []
+    for _n, _p in named:
+        (conf_params if _n.startswith("conf_head.") or ".conf_head." in _n
+         else base_params).append(_p)
+    _nb = torch.nn.utils.clip_grad_norm_(base_params, cfg.train.grad_clip,
+                                         error_if_nonfinite=False) if base_params else None
+    _nc = torch.nn.utils.clip_grad_norm_(conf_params, cfg.train.grad_clip,
+                                         error_if_nonfinite=False) if conf_params else None
+    if not nonfinite_grad:
+        if _nb is not None and torch.isfinite(_nb):
+            logs["grad/norm_base_unclipped"] = float(_nb)
+        if _nc is not None and torch.isfinite(_nc):
+            logs["grad/norm_conf_unclipped"] = float(_nc)
     # 这条曲线是提前量: L 那次事故之前梯度范数其实已经在涨, 只是没人记录。
     # 只在有限时记: WindowedMeter 按 key 各自累计均值 (log_sums/log_counts),
     # 缺席的步不进分母。写 nan 进去会把整个窗口的均值污染成 nan, 而这条曲线正是
@@ -1139,8 +1174,9 @@ def _run_validation(model, loader, device, use_amp, is_ddp, amp_dtype=None,
     should it ever be enabled)."""
     model.eval()
     # [abs_err_sum, pixel_count, hits<2mm, hits<4mm, hits<8mm,
-    #  body2_err_sum, body4_err_sum, body8_err_sum]  (see WindowedMeter for why)
-    stats = torch.zeros(8, device=device, dtype=torch.float64)
+    #  body2_err_sum, body4_err_sum, body8_err_sum,
+    #  capped2_err_sum, risk_err_sum, risk_count]  (see WindowedMeter for why)
+    stats = torch.zeros(11, device=device, dtype=torch.float64)
     # 按归一化场景深度 (gt - dmin)/(dmax - dmin) 分 4 桶。
     # 逆深度采样、d^2 的三角测量分辨率、先验误差随深度的分布 —— 这些争论都只能
     # 靠"误差是否集中在远端"来定。整体 abs_err 把它平均掉了。
@@ -1182,6 +1218,30 @@ def _run_validation(model, loader, device, use_amp, is_ddp, amp_dtype=None,
                 hit = err < t
                 stats[2 + i] += hit.sum()
                 stats[5 + i] += err[hit].sum()
+            stats[8] += err.clamp(max=2.0).sum()
+            # ---- risk@0.6: 固定保留率下的风险 -----------------------------
+            # 点云融合本质上是一次**选择**, 所以无条件均值 (abs_err / capped_2mm)
+            # 都不是它的代理; 保留率固定时的条件均值才是。排序信号用与推理端
+            # 融合门控**完全同一份** cascade_confidence (models/fusion_conf.py),
+            # 否则训练时量的排序和融合时用的排序是两个东西。
+            # 逐图算 top-k 再按保留像素数加权 —— 各图 risk 直接平均会给小图过高
+            # 权重, 而 DTU 每张图的有效像素数差别很大。
+            try:
+                conf = cascade_confidence(outputs, window=1, mode="product")
+            except KeyError:
+                conf = None
+            if conf is not None:
+                for b in range(pred.shape[0]):
+                    mb = m[b]
+                    nb = int(mb.sum())
+                    if nb == 0:
+                        continue
+                    kb = int(math.ceil(0.6 * nb))
+                    cb = conf[b][mb].float()
+                    eb = (pred[b][mb] - gt[b][mb]).abs()
+                    idx = cb.argsort(descending=True, stable=True)[:kb]
+                    stats[9] += eb[idx].sum()
+                    stats[10] += kb
         if m.any() and "depth_values" in batch:
             lo = dv.amin(dim=1).view(-1, 1, 1)
             hi = dv.amax(dim=1).view(-1, 1, 1)
@@ -1269,6 +1329,8 @@ def _run_validation(model, loader, device, use_amp, is_ddp, amp_dtype=None,
         "abs_err_body_4mm": float(stats[6] / stats[3].clamp(min=1)),
         "abs_err_tail_8mm": float((stats[0] - stats[7]) / (n - stats[4]).clamp(min=1)),
         "tail_frac_8mm": float((n - stats[4]) / n),
+        "capped_2mm": float(stats[8] / n),
+        **({"risk_at_0.6": float(stats[9] / stats[10])} if stats[10] > 0 else {}),
     }
 
 
@@ -1451,6 +1513,18 @@ def _arch_fingerprint(cfg) -> dict:
         "vis_supervise": cfg.cost_volume.vis_supervise,
         "fusion_conf": cfg.decoder.fusion_conf,
         "fusion_conf_detach": cfg.decoder.fusion_conf_detach,
+        # CVPE。plane_space / feature_stride / align_corners 是**写死的约定**而不是
+        # 配置项, 但仍然进 fingerprint —— 将来若有人改了实现, 旧 checkpoint 必须
+        # 立刻不匹配, 而不是安静地跑出另一套几何。
+        "cvpe_enabled": cfg.cvpe.enabled,
+        "cvpe_d_model": cfg.cvpe.d_model,
+        "cvpe_num_planes": cfg.cvpe.num_planes,
+        "cvpe_n_heads": cfg.cvpe.n_heads,
+        "cvpe_cam_mid_channels": cfg.cvpe.cam_mid_channels,
+        "cvpe_layer_pattern": cfg.cvpe.layer_pattern,
+        "cvpe_feature_stride": 8,
+        "cvpe_plane_space": "inverse_global",
+        "cvpe_align_corners": True,
         "range_max_gi": cfg.depth_range.range_max_gi,
         "local_half_gi": [cfg.depth_range.local_half_min_gi, cfg.depth_range.local_half_max_gi],
         "gate_hard_conf": cfg.depth_range.gate_hard_conf,
@@ -1819,6 +1893,11 @@ def main() -> None:
                         help="四级各自的 mode_centered_regression 半窗, 逗号分隔")
     parser.add_argument("--geo-valid", choices=["on", "off"], default=None,
                         help="W3-A: 逐假设几何有效 mask + 逐 voxel 归一化 + n_valid 通道")
+    # CVPE 只暴露一个开关。d_model / num_planes / n_heads / layer_pattern 一律
+    # 走 base.config 的固定值 —— 它们一旦变成训练超参, 就又多出一条按中间指标
+    # 逐项调参的支线, 而工单 v5.3 的整个前提就是不再这么干。
+    parser.add_argument("--cvpe", choices=["on", "off"], default=None,
+                        help="CVPE: 相机感知的跨视位置编码, 注入 FPN 的 1/8 瓶颈")
     parser.add_argument("--vis-mode", choices=["softmax", "sigmoid"], default=None,
                         help="softmax=旧的 source 维竞争; sigmoid=多标签独立可见性")
     parser.add_argument("--w-range", type=float, default=None)

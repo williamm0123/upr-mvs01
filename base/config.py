@@ -364,6 +364,31 @@ class DecoderConfig:
 
 
 @dataclass(frozen=True)
+class CVPEConfig:
+    """CVPE —— 相机感知的跨视位置编码 (models/cvpe.py)。
+
+    工单 v5.3 的主线模块。它是四级级联里**唯一直接改变匹配证据**的东西: 实测
+    有效峰宽 w_k = interval/p_max 在 W0 与 W1 之间几乎不变 (stage3 差 0.7%),
+    而窗宽、覆盖率、中心策略全都是它的下游。MonoMVSNet 的消融里, 特征级先验
+    (RMF+CA+CVPE) 值 -0.015 overall, 是全表最大的单项。
+
+    注入点固定在 FPN 的 1/8 瓶颈 (DINO 之后、top-down 之前), 所以它会沿
+    p8->p4->p2->p1 传遍四级。``enabled=False`` 时模块**不构造**, 且构造顺序排在
+    所有既有模块之后 —— 于是既不占参数, 也不改变前面任何模块从全局 RNG 取到的
+    随机数。开启时 out_proj 零初始化, step 0 的输出与关闭逐位一致。
+    """
+
+    enabled: bool = False
+    d_model: int = 64
+    num_planes: int = 8          # 只服务位置编码, 与 48/16/8/4 无关
+    n_heads: int = 8
+    cam_mid_channels: int = 64
+    # 固定 ('self','cross') x 4, 与 MonoMVSNet 的 layer_names 一致。写成字符串
+    # 是为了进 fingerprint 时可读; 解析在 models/cvpe.py。
+    layer_pattern: str = "self,cross,self,cross,self,cross,self,cross"
+
+
+@dataclass(frozen=True)
 class DINOConfig:
     """Frozen DINOv3 ViT-B/16 backbone used as the SPRE 'independent witness'.
 
@@ -596,6 +621,7 @@ class MVSConfig:
     data: DataConfig = field(default_factory=DataConfig)
     prior: PriorConfig = field(default_factory=PriorConfig)
     fpn: FPNConfig = field(default_factory=FPNConfig)
+    cvpe: CVPEConfig = field(default_factory=CVPEConfig)
     depth_range: DepthRangeConfig = field(default_factory=DepthRangeConfig)
     cost_volume: CostVolumeConfig = field(default_factory=CostVolumeConfig)
     points_alignment: PointsAlignmentConfig = field(default_factory=PointsAlignmentConfig)

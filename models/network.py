@@ -264,6 +264,23 @@ class UprMVSNet(nn.Module):
             # 建了却不 forward 的参数会在 reduction 时报错。
             self.spre = SPRE(self.cfg.spre, self.dino_sva.out_dim) if self.spre_enabled else None
 
+        # ---- CVPE (工单 v5.3 的主线模块) --------------------------------------
+        # **必须构造在最后**: 关闭时不构造, 开启时也只在所有既有模块之后从全局
+        # RNG 取数, 于是 cvpe=off 的 checkpoint 与改动前逐位一致, cvpe=on 也不会
+        # 让前面任何模块拿到不同的初始权重。两者是严格配对的实验。
+        cvpe_cfg = getattr(self.cfg, "cvpe", None)
+        self.cvpe = None
+        if cvpe_cfg is not None and bool(cvpe_cfg.enabled):
+            from models.cvpe import CrossViewPE
+            self.cvpe = CrossViewPE(
+                in_channels=fpn_c,
+                d_model=int(cvpe_cfg.d_model),
+                num_planes=int(cvpe_cfg.num_planes),
+                n_heads=int(cvpe_cfg.n_heads),
+                layer_pattern=tuple(x.strip() for x in cvpe_cfg.layer_pattern.split(",")),
+                cam_mid_channels=int(cvpe_cfg.cam_mid_channels),
+            )
+
     def _resolve_depth_bounds(self, batch: dict) -> tuple[torch.Tensor, torch.Tensor]:
         if "depth_min" in batch and "depth_max" in batch:
             return batch["depth_min"].float(), batch["depth_max"].float()
@@ -464,7 +481,22 @@ class UprMVSNet(nn.Module):
 
         dino_fpn = (self.dino_sva.fpn_feature(fused, grid, coarse_hw)
                     if self.feed_fpn else None)
-        feats = self.fpn(images, dino=dino_fpn)  # {8: [B,V,C,h,w], 4: ..., 2: ..., 1: ...}
+
+        # CVPE 挂在 FPN 的 1/8 注入点上 (DINO 之后、top-down 之前), 所以它的修改
+        # 沿 p8->p4->p2->p1 传遍四级 —— 不需要另建一条平行的降维/上采样链。
+        # 模块只返回 delta, **残差相加只在这里做一次**; 用 cat 重建张量而不是
+        # 对 p8[:, 1:] 原地赋值 (原地写 autograd 叶子会静默地丢梯度)。
+        cvpe_fn = None
+        if self.cvpe is not None:
+            def cvpe_fn(p8: torch.Tensor) -> torch.Tensor:
+                delta = self.cvpe(
+                    p8=p8, K=K, E=E,
+                    depth_min=depth_min.reshape(-1), depth_max=depth_max.reshape(-1),
+                    feature_stride=s1_stride,
+                )
+                return torch.cat([p8[:, :1], p8[:, 1:] + delta], dim=1)
+
+        feats = self.fpn(images, dino=dino_fpn, cvpe_fn=cvpe_fn)  # {8: [B,V,C,h,w], ...}
 
         # ---------- Stage 1 (coarsest, 1/8): dual-branch hypotheses ----------
         feat1 = feats[s1_stride]
@@ -830,6 +862,10 @@ class UprMVSNet(nn.Module):
         # sub-dict, 把 refine_range_from_posterior 写进去的 range_stats 全冲掉。
         for _sname, _d in bimodal_diag.items():
             stage_out["range_diag"].setdefault(_sname, {}).update(_d)
+        if self.cvpe is not None and self.cvpe.last_stats is not None:
+            # 纯诊断, 不进损失。delta_rel 恒为 0 = CVPE 什么也没学到;
+            # 远大于 1 = 它在覆盖 p8 而不是修正 p8, 两头都是故障信号。
+            stage_out["range_diag"]["cvpe"] = dict(self.cvpe.last_stats)
         stage_out["range_diag"]["branch"] = {"bp_beta": float(getattr(self, "last_bp_beta", 0.0))}
         stage_out["range_diag"]["cost"] = {
             f"max_s{i + 1}": float(getattr(m, "last_cost_max", 0.0))

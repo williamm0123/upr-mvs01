@@ -35,7 +35,9 @@ python test.py --split test --max-refs 5 --no-fuse               # quick smoke c
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
+import math
 import os
 import subprocess
 import sys
@@ -118,6 +120,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--photo-thresh", type=float, default=0.3,
                    help="cascade mode-probability threshold (was inert when confidence "
                         "came from stage 4 alone — see cascade_confidence)")
+    p.add_argument("--photo-keep-ratio", type=float, default=0.0,
+                   help="固定保留率的光度门: >0 时忽略 --photo-thresh, 每个参考视角"
+                        "**精确**保留置信度最高的 ceil(r * N_valid) 个像素。"
+                        "为什么要它: 阈值扫描是一条按中间指标逐项调参的支线, 而且"
+                        "两个模型的置信度分布不同, 同一个阈值下保留率不同 —— 那时"
+                        "比较的就不只是深度质量。固定保留率把这个自由度消掉。")
     p.add_argument("--no-clean-lists", action="store_true",
                    help="不使用 audit 产出的 *_clean.txt / exclude_*.csv")
     p.add_argument("--conf-window", type=int, default=1,
@@ -333,6 +341,23 @@ def _align_cfg_to_ckpt(cfg, state: dict, override: str = "auto", fingerprint=Non
         if fingerprint.get("tau_stages"):
             cfg = replace(cfg, depth_range=replace(
                 cfg.depth_range, tau_stages=tuple(fingerprint["tau_stages"])))
+        # CVPE。全部字段都从 fingerprint 恢复, 不用当前默认值 —— 默认值一旦有人
+        # 改动, 旧 checkpoint 就会静默地跑在另一套几何上。缺字段 = 2026-08-25
+        # 之前的 checkpoint, 那时还没有 CVPE, 所以 enabled=False 是对的默认。
+        cfg = replace(cfg, cvpe=replace(
+            cfg.cvpe,
+            enabled=bool(fingerprint.get("cvpe_enabled", False)),
+            d_model=int(fingerprint.get("cvpe_d_model", cfg.cvpe.d_model)),
+            num_planes=int(fingerprint.get("cvpe_num_planes", cfg.cvpe.num_planes)),
+            n_heads=int(fingerprint.get("cvpe_n_heads", cfg.cvpe.n_heads)),
+            cam_mid_channels=int(fingerprint.get("cvpe_cam_mid_channels",
+                                                 cfg.cvpe.cam_mid_channels)),
+            layer_pattern=str(fingerprint.get("cvpe_layer_pattern", cfg.cvpe.layer_pattern))))
+        _fs = int(fingerprint.get("cvpe_feature_stride", 8))
+        if cfg.cvpe.enabled and _fs != 8:
+            raise SystemExit(
+                f"checkpoint 的 cvpe_feature_stride={_fs}, 但当前实现把 CVPE 写死在 "
+                f"FPN 的 1/8 注入点上。这个 checkpoint 与当前代码不是同一个模型。")
         if override == "auto":
             cfg = replace(cfg, spre=replace(
                 cfg.spre, enabled=fingerprint["spre_enabled"],
@@ -370,6 +395,10 @@ def load_model(cfg, args, device: torch.device) -> tuple[UprMVSNet, Path]:
               f"this is an ablation, not the trained configuration")
     model.eval()
     step = ckpt.get("step", "?")
+    # manifest 要的元数据。**不改返回签名** —— test_tt / eval_ablation /
+    # scripts 下四个调用方都在解包 2-tuple, 改成 3-tuple 会一起炸。
+    load_model.last_meta = {k: ckpt.get(k) for k in
+                            ("step", "best_metric", "best_metric_name", "fingerprint", "git")}
     print(f"[test] loaded {ckpt_path} (step {step}, best_metric {ckpt.get('best_metric', float('nan')):.4f})")
     return model, ckpt_path
 
@@ -446,63 +475,10 @@ class ScanMeter:
         }
 
 
-def _stage_mode_mass(stage: dict, window: int, target_hw) -> torch.Tensor:
-    """Posterior mass within +-``window`` bins of this stage's argmax, at ``target_hw``."""
-    prob = stage["prob"].float()
-    D = prob.shape[1]
-    w = min(2 * window + 1, D)
-    idx = stage.get("mode_idx")
-    if idx is None:
-        idx = prob.argmax(dim=1, keepdim=True)
-    # Slide the window to stay in bounds rather than clamping indices, which
-    # would gather the edge bin repeatedly and double-count its mass.
-    start = (idx - (w // 2)).clamp(0, D - w)
-    offs = torch.arange(w, device=prob.device).view(1, -1, 1, 1)
-    mass = prob.gather(1, start + offs).sum(dim=1).clamp(0.0, 1.0)
-    if tuple(mass.shape[-2:]) != tuple(target_hw):
-        mass = F.interpolate(mass.unsqueeze(1), size=tuple(target_hw),
-                             mode="bilinear", align_corners=False).squeeze(1)
-    return mass
-
-
-def cascade_confidence(outputs: dict, window: int = 1, mode: str = "product",
-                       stages=("stage1", "stage2", "stage3", "stage4")) -> torch.Tensor:
-    """Fusion confidence combined across cascade stages (ported from test_tt.py).
-
-    Why not the final stage alone: it carries ``num_depths_stage4=4`` hypotheses,
-    so the old ``mode_window=2`` window spanned the whole axis and the mass was
-    identically 1.0 — which made ``--photo-thresh`` an inert gate and fusion ran
-    on geometric consistency alone. That is what invalidated the 2026-08-08 DTU
-    numbers (0.3944/0.2482/0.3213); see the note in that run's metrics.
-
-    Stage 1 has 48 bins and is the only level where a +-1 window is genuinely
-    selective, so a pixel is trusted when *every* stage concentrated its
-    posterior, not just the last.
-
-    ``mode``:
-      ``product``  — all stages must agree; the sharpest, and the default.
-      ``geomean``  — same ordering, rescaled so a threshold tuned on one stage
-                     count still means something.
-      ``last``     — final stage only. 注意要复现修复前的失效行为需要
-                     ``--conf-mode last --conf-window 2`` (window=2 才覆盖 4 元
-                     轴的全部); ``last`` 配 window=1 是另一回事。仅用于 A/B。
-
-    阈值不可跨 mode 迁移: 实测 product 的 min 是 0.019、geomean 的 min 是 0.372,
-    同一个 ``--photo-thresh 0.3`` 在 geomean 下仍然一个像素都不过滤。换 mode
-    必须重扫 ``--photo-thresh``。
-    """
-    hw = outputs["depth_full"].shape[-2:]
-    masses = [_stage_mode_mass(outputs[s], window, hw) for s in stages if s in outputs]
-    if not masses:
-        raise KeyError(f"none of {stages} present in outputs")
-    if mode == "last":
-        return masses[-1]
-    stacked = torch.stack(masses, dim=0)
-    if mode == "product":
-        return stacked.prod(dim=0)
-    if mode == "geomean":
-        return stacked.clamp_min(1e-8).log().mean(dim=0).exp()
-    raise ValueError(f"unknown conf mode {mode!r}")
+# 级联置信度搬到 models/fusion_conf.py —— train.py 的 risk@0.6 与这里的融合门控
+# 必须共用同一份实现, 否则两边量的是不同的排序。这里只做 re-export 以保持
+# ``test.cascade_confidence`` 这个既有入口 (scripts/ 下有调用方)。
+from models.fusion_conf import _stage_mode_mass, cascade_confidence  # noqa: E402,F401
 
 
 def depth_vis(depth: np.ndarray) -> np.ndarray:
@@ -594,7 +570,13 @@ def run_inference(model, ds, cfg, args, device, out_root: Path) -> dict:
         print(f"[test] fusion confidence [{_conf_kind}] "
               f"(window={args.conf_window}, mode={args.conf_mode}): "
               f"p1 {q[0]:.4f}  p5 {q[1]:.4f}  p50 {q[2]:.4f}  p95 {q[3]:.4f}  p99 {q[4]:.4f}")
-        print(f"[test] --photo-thresh {args.photo_thresh} 保留 {100*keep:.2f}% 的像素")
+        _kr = float(getattr(args, "photo_keep_ratio", 0.0) or 0.0)
+        if _kr > 0.0:
+            print(f"[test] --photo-keep-ratio {_kr} 生效, **忽略** --photo-thresh "
+                  f"{args.photo_thresh}; 每个参考视角精确保留 ceil({_kr} x N_valid) 个像素")
+            keep = _kr        # 让下面的报警按实际生效的门来判
+        else:
+            print(f"[test] --photo-thresh {args.photo_thresh} 保留 {100*keep:.2f}% 的像素")
         # "置信度不恒定" != "阈值有效"。真正要报警的是阈值一个像素都不筛,
         # 或者把所有像素都筛掉。
         if keep > 0.999 or keep < 0.001:
@@ -739,8 +721,23 @@ def fuse_scan(scan_dir: Path, args, device: torch.device) -> tuple[np.ndarray, n
 
         n_geo = consistent.sum(dim=0)
         d_avg = (dr.squeeze(0) + (z_back * consistent).sum(dim=0)) / (n_geo + 1).float()
-        keep = ((ref["conf"].view(-1) > args.photo_thresh) & (n_geo >= args.geo_views)
-                & (dr.squeeze(0) > 0)).view(H, W)
+        valid_depth = torch.isfinite(dr.squeeze(0)) & (dr.squeeze(0) > 0)
+        conf_flat = ref["conf"].view(-1)
+        keep_ratio = float(getattr(args, "photo_keep_ratio", 0.0) or 0.0)
+        if keep_ratio > 0.0:
+            # 固定保留率: 在**有效深度**像素里取置信度最高的 ceil(r*N)。
+            # stable=True: 置信度打平时 (product 口径下 1.0 的像素很多) 顺序仍然
+            # 由像素索引决定, 同一份输入必须给出同一片点云。
+            photo_mask = torch.zeros_like(valid_depth)
+            vidx = valid_depth.nonzero(as_tuple=False).squeeze(1)
+            if vidx.numel():
+                k = int(math.ceil(keep_ratio * float(vidx.numel())))
+                k = max(1, min(k, int(vidx.numel())))
+                order = torch.argsort(conf_flat[vidx].float(), descending=True, stable=True)
+                photo_mask[vidx[order[:k]]] = True
+        else:
+            photo_mask = conf_flat > args.photo_thresh
+        keep = (photo_mask & (n_geo >= args.geo_views) & valid_depth).view(H, W)
         if dedup:
             # 已经被更早的 ref 视角认领过的像素不再输出
             keep = keep & ~consumed[ref_id]
@@ -782,6 +779,12 @@ def run_fusion(out_root: Path, ply_dir: Path, args, device: torch.device) -> Pat
                 f"找不到 fusibile: {exe}\n"
                 "先编译: bash scripts/build_fusibile.sh\n"
                 "或改用内置融合: --fusion geo (但它不做跨视角去重, 点数会是几千万)")
+        if float(getattr(args, "photo_keep_ratio", 0.0) or 0.0) > 0.0:
+            # 明确报错而不是静默退回阈值: 静默退回的话两条协议会产出名字一样、
+            # 保留率完全不同的点云, 而目录里看不出区别。
+            raise SystemExit(
+                "--photo-keep-ratio 目前只支持 --fusion geo/dedup。fusibile 的光度门在"
+                "它自己的二进制里, 这里给不出固定保留率。要用固定保留率请换 --fusion dedup。")
         print(f"[fuse] backend=gipuma exe={exe} disp={args.gipuma_disp_thresh} "
               f"num_consistent={args.gipuma_num_consistent} photo_thresh={args.photo_thresh}")
         for sd in scan_dirs:
@@ -832,6 +835,90 @@ def run_fast_eval(ply_dir: Path, scan_ids: list[int], args) -> None:
 
 
 # --------------------------------------------------------------------------- #
+
+# --------------------------------------------------------------------------- #
+# Run manifest —— 每次推理都写, 写进 out_root 和 ply_dir 两处。
+#
+# 为什么它是硬性要求: log/pred_points_R_geo_dedup/ 里那组 acc 0.3708 / overall
+# 0.3180 的点云 (2026-08-21) 只有 result.txt, 没有任何谱系记录 —— 而 W0 的
+# checkpoint 是 08-24 才存的, 所以那组数既不是 W0 也不是 W1, 却被当成 "UPRMVS
+# 当前水平" 引用了两版工单。一个 ply 目录如果说不出它是哪个 checkpoint、哪份
+# prior 缓存、哪套融合参数产出的, 它就不能当基线。
+# --------------------------------------------------------------------------- #
+def _git_info(root: Path) -> dict:
+    out = {}
+    for key, cmd in (("sha", ["git", "rev-parse", "HEAD"]),
+                     ("dirty", ["git", "status", "--porcelain"])):
+        try:
+            r = subprocess.run(cmd, cwd=str(root), capture_output=True, text=True, timeout=10)
+            out[key] = (r.stdout.strip() if key == "sha" else bool(r.stdout.strip())) \
+                if r.returncode == 0 else None
+        except Exception:
+            out[key] = None
+    return out
+
+
+def write_run_manifest(dirs, cfg, args, ckpt_path, ckpt: dict | None) -> dict:
+    """写 run_manifest.json 到给定的每个目录。返回写入的内容。"""
+    root = Path(cfg.paths.project_path)
+    prior_dir = Path(cfg.paths.prior_cache_path)
+    sig = None
+    # 缓存清单历史上落过三个位置 (缓存目录内 / 它的上一级 log/ / 项目根), 三处都找。
+    # 找不到就写 null 而不是静默省略 —— manifest 的意义是让人一眼看出"这次用的
+    # 是哪份 prior", 缺了要显式暴露。
+    for base in (prior_dir, prior_dir.parent, root):
+        for name in ("prior_cache_manifest.csv", "signature.json", "manifest.json"):
+            cand = base / name
+            if cand.exists():
+                sig = {"file": str(cand), "mtime": cand.stat().st_mtime,
+                       "bytes": cand.stat().st_size}
+                break
+        if sig:
+            break
+    man = {
+        "timestamp": datetime.datetime.now().astimezone().isoformat(),
+        "checkpoint": {
+            "path": str(Path(ckpt_path).resolve()) if ckpt_path else None,
+            "step": (ckpt or {}).get("step"),
+            "best_metric": (ckpt or {}).get("best_metric"),
+            "best_metric_name": (ckpt or {}).get("best_metric_name"),
+            "fingerprint": (ckpt or {}).get("fingerprint"),
+            "git": (ckpt or {}).get("git"),
+        },
+        "code_git": _git_info(root),
+        "prior_cache": {"path": str(prior_dir), "signature": sig,
+                        "prior_resize_scale": args.prior_resize_scale,
+                        "target_wh": [args.prior_target_w or cfg.prior.target_w,
+                                      args.prior_target_h or cfg.prior.target_h]},
+        "inference": {
+            "split": args.split, "scans": args.scans,
+            "num_views": args.num_views or cfg.train.num_views,
+            "resize_scale": args.resize_scale, "full_image": bool(args.full_image),
+            "max_refs": getattr(args, "max_refs", None),
+            "max_scans": getattr(args, "max_scans", None),
+            "device": str(args.device), "profile": args.profile,
+        },
+        "fusion": {
+            "backend": args.fusion, "conf_source": args.conf_source,
+            "conf_window": args.conf_window, "conf_mode": args.conf_mode,
+            "photo_thresh": args.photo_thresh,
+            "photo_keep_ratio": float(getattr(args, "photo_keep_ratio", 0.0) or 0.0),
+            "geo_views": args.geo_views, "geo_pix": args.geo_pix, "geo_rel": args.geo_rel,
+            "gipuma_disp_thresh": args.gipuma_disp_thresh,
+            "gipuma_num_consistent": args.gipuma_num_consistent,
+        },
+        "eval": {"tool": str(args.eval_tool), "gt_dir": str(args.eval_gt),
+                 "tool_git": _git_info(Path(args.eval_tool)) if Path(args.eval_tool).is_dir() else None},
+    }
+    blob = json.dumps(man, indent=2, default=str)
+    for d in dirs:
+        d = Path(d)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "run_manifest.json").write_text(blob, encoding="utf-8")
+        print(f"[test] wrote {d / 'run_manifest.json'}")
+    return man
+
+
 def main() -> None:
     args = parse_args()
     cfg = build_mvs_config(profile=args.profile)
@@ -864,6 +951,7 @@ def main() -> None:
             raise SystemExit(f"--fuse-only 需要已有的深度缓存, 但 {dcache} 为空。\n"
                              f"先不带 --fuse-only 跑一次推理。")
         print(f"[test] --fuse-only: 用 {dcache} 下已缓存的深度重新融合")
+        write_run_manifest([out_root, ply_dir], cfg, args, None, None)
         run_fusion(out_root, ply_dir, args, device)
         scan_ids = " ".join(str(int(s.replace("scan", ""))) for s in scans)
         print(f"\n[test] {len(scans)} clouds in {ply_dir}")
@@ -874,6 +962,10 @@ def main() -> None:
         print("[test] --priors-only: prior phase done, exiting before the MVS model")
         return
     model, ckpt_path = load_model(cfg, args, device)
+    # 在推理**之前**写: 跑到一半崩掉时, 目录里也留着谱系, 而不是留下一堆
+    # 无法归属的 npz。
+    write_run_manifest([out_root] + ([ply_dir] if args.fuse else []),
+                       cfg, args, ckpt_path, getattr(load_model, "last_meta", None))
 
     result = run_inference(model, ds, cfg, args, device, out_root)
     o = result["overall"]

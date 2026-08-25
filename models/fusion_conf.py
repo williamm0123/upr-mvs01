@@ -64,6 +64,10 @@ class FusionConfidenceHead(nn.Module):
         p = min(max(float(prior_pos), 1e-3), 1.0 - 1e-3)
         nn.init.constant_(self.head.bias, math.log(p / (1.0 - p)))
         self.register_buffer("log_T", torch.zeros(()))
+        # 二参数 Platt 标定的截距。**单参数温度不够**: 置信度损失用的是类别平衡
+        # BCE (losses/composite.py 的 conf 分支), 加权会平移最优 logit 的截距,
+        # 所以只拟合 T 时 prob=0.5 并不表示 "五成把握"。见 calibrated()。
+        self.register_buffer("calib_bias", torch.zeros(()))
 
     def forward(self, feats: torch.Tensor, ref_feat: torch.Tensor) -> torch.Tensor:
         """``feats`` [B, IN_CH, H, W]; ``ref_feat`` [B, C, H, W]。返回 logit [B, H, W]。"""
@@ -73,8 +77,91 @@ class FusionConfidenceHead(nn.Module):
         return self.head(h).squeeze(1)
 
     def calibrated(self, logit: torch.Tensor) -> torch.Tensor:
-        """部署用的概率 ``sigma(z / T)``。未标定时 T = 1, 与 sigmoid(z) 相同。"""
-        return torch.sigmoid(logit / self.log_T.exp().clamp_min(1e-3))
+        """部署用的概率 ``sigma(z / T + b)``。未标定时 T=1, b=0, 与 sigmoid(z) 相同。
+
+        正斜率仿射 ``z -> z/T + b`` (T > 0) **不改变排序**, 所以 AURC 与
+        risk@kappa 在标定前后必须逐位一致 —— scripts/calibrate_conf.py 会断言
+        这一点。标定只动 "这个数读作多少概率", 不动 "先信哪个像素"。
+        """
+        t = self.log_T.exp().clamp_min(1e-3)
+        return torch.sigmoid(logit / t + self.calib_bias)
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        # 旧 checkpoint 没有 calib_bias。补 0 而不是放宽 strict —— strict=False
+        # 会把**真正的**形状/命名错误一起放过去, 那比缺一个 buffer 危险得多。
+        key = prefix + "calib_bias"
+        if key not in state_dict:
+            state_dict[key] = torch.zeros((), dtype=self.calib_bias.dtype)
+        return super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict,
+            missing_keys, unexpected_keys, error_msgs)
+
+
+# ===========================================================================
+#  级联置信度。**训练侧 (train.py 的 risk@0.6) 与推理侧 (test.py 的融合门控)
+#  必须是同一份实现** —— 两边各写一份的话, "训练时看到的排序" 和 "融合时用的
+#  排序" 就是两个东西, 而 risk@0.6 的全部意义正是预测后者。
+# ===========================================================================
+
+
+def _stage_mode_mass(stage: dict, window: int, target_hw) -> torch.Tensor:
+    """Posterior mass within +-``window`` bins of this stage's argmax, at ``target_hw``."""
+    prob = stage["prob"].float()
+    D = prob.shape[1]
+    w = min(2 * window + 1, D)
+    idx = stage.get("mode_idx")
+    if idx is None:
+        idx = prob.argmax(dim=1, keepdim=True)
+    # Slide the window to stay in bounds rather than clamping indices, which
+    # would gather the edge bin repeatedly and double-count its mass.
+    start = (idx - (w // 2)).clamp(0, D - w)
+    offs = torch.arange(w, device=prob.device).view(1, -1, 1, 1)
+    mass = prob.gather(1, start + offs).sum(dim=1).clamp(0.0, 1.0)
+    if tuple(mass.shape[-2:]) != tuple(target_hw):
+        mass = F.interpolate(mass.unsqueeze(1), size=tuple(target_hw),
+                             mode="bilinear", align_corners=False).squeeze(1)
+    return mass
+
+
+def cascade_confidence(outputs: dict, window: int = 1, mode: str = "product",
+                       stages=("stage1", "stage2", "stage3", "stage4")) -> torch.Tensor:
+    """Fusion confidence combined across cascade stages (ported from test_tt.py).
+
+    Why not the final stage alone: it carries ``num_depths_stage4=4`` hypotheses,
+    so the old ``mode_window=2`` window spanned the whole axis and the mass was
+    identically 1.0 — which made ``--photo-thresh`` an inert gate and fusion ran
+    on geometric consistency alone. That is what invalidated the 2026-08-08 DTU
+    numbers (0.3944/0.2482/0.3213); see the note in that run's metrics.
+
+    Stage 1 has 48 bins and is the only level where a +-1 window is genuinely
+    selective, so a pixel is trusted when *every* stage concentrated its
+    posterior, not just the last.
+
+    ``mode``:
+      ``product``  — all stages must agree; the sharpest, and the default.
+      ``geomean``  — same ordering, rescaled so a threshold tuned on one stage
+                     count still means something.
+      ``last``     — final stage only. 注意要复现修复前的失效行为需要
+                     ``--conf-mode last --conf-window 2`` (window=2 才覆盖 4 元
+                     轴的全部); ``last`` 配 window=1 是另一回事。仅用于 A/B。
+
+    阈值不可跨 mode 迁移: 实测 product 的 min 是 0.019、geomean 的 min 是 0.372,
+    同一个 ``--photo-thresh 0.3`` 在 geomean 下仍然一个像素都不过滤。换 mode
+    必须重扫 ``--photo-thresh``。
+    """
+    hw = outputs["depth_full"].shape[-2:]
+    masses = [_stage_mode_mass(outputs[s], window, hw) for s in stages if s in outputs]
+    if not masses:
+        raise KeyError(f"none of {stages} present in outputs")
+    if mode == "last":
+        return masses[-1]
+    stacked = torch.stack(masses, dim=0)
+    if mode == "product":
+        return stacked.prod(dim=0)
+    if mode == "geomean":
+        return stacked.clamp_min(1e-8).log().mean(dim=0).exp()
+    raise ValueError(f"unknown conf mode {mode!r}")
 
 
 # ===========================================================================
@@ -179,3 +266,43 @@ def fit_temperature(logit: torch.Tensor, label: torch.Tensor,
             d_ = a + phi * (b - a)
             fd = nll(d_)
     return math.exp(0.5 * (a + b))
+
+
+def fit_platt(logit: torch.Tensor, label: torch.Tensor,
+              max_iter: int = 100) -> tuple[float, float]:
+    """二参数 Platt 标定 ``p = sigma(z / T + b)``, 返回 ``(log_T, bias)``。
+
+    为什么不是单参数温度: 训练用的是**类别平衡** BCE, 正负样本被重新加权之后
+    最优 logit 的截距被整体平移了, 单靠 T 只能改斜率、改不了截距, 于是
+    ``prob=0.5`` 不等于 50% 正确率。加一个 bias 才把两个自由度都补齐。
+
+    确定性: CPU + LBFGS + strong_wolfe + 固定初值 (log_T=0, bias=0)。同一份输入
+    必须给出同一组参数, 否则 "标定" 本身就成了一个不可复现的实验变量。
+
+    目标是**未加权**的 BCE —— 校准要对齐的是真实的正类频率, 不是训练时为了
+    平衡梯度而人为设定的频率。
+    """
+    z = logit.detach().float().flatten().cpu()
+    y = label.detach().float().flatten().cpu()
+    if z.numel() == 0:
+        return 0.0, 0.0
+    log_t = torch.zeros((), requires_grad=True)
+    bias = torch.zeros((), requires_grad=True)
+    opt = torch.optim.LBFGS([log_t, bias], max_iter=int(max_iter),
+                            line_search_fn="strong_wolfe")
+
+    def closure():
+        opt.zero_grad(set_to_none=True)
+        loss = F.binary_cross_entropy_with_logits(z / log_t.clamp(-5.0, 5.0).exp() + bias, y)
+        loss.backward()
+        return loss
+
+    with torch.enable_grad():
+        opt.step(closure)
+    lt = float(log_t.detach().clamp(-5.0, 5.0))
+    if not math.isfinite(lt):
+        lt = 0.0
+    bb = float(bias.detach())
+    if not math.isfinite(bb):
+        bb = 0.0
+    return lt, bb

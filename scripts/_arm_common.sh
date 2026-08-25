@@ -84,8 +84,32 @@ case "$ARM" in
       ARM_ARGS+=(--visibility "${VISIBILITY:-off}")
     fi
     ;;
+  vnext)
+    # ---- 工单 v5.3 的唯一候选模型 ------------------------------------------
+    # 基座是 W0 (legacy_depth + stage4_head=expect), 因为与 MonoMVSNet 的点云
+    # 差距是 acc 主导 (+0.058 对 comp +0.022), 而 W0 在 capped_2mm / acc_2mm
+    # 上胜过 W1。W1 那一整套 (逆深度轴 / 可学习范围 / MAP 残差头 / SPRE 逐级
+    # 注入) 全部**不启用** —— 它们改的是 w_k 的下游, 而 w_k 在 W0 与 W1 之间
+    # 几乎不变 (stage3 差 0.7%)。
+    #
+    # 三个新模块构成一条完整的因果链, 不是三个可以逐项开关的小改动:
+    #   CVPE (相机感知的 source 特征) -> geo_valid (几何有效的多视聚合)
+    #   -> conf_head (学哪些深度进点云融合)
+    # 所以它们同批进、同批判读; 中途不按某一级的中间指标开新 arm。
+    RUN_NAME=${RUN_NAME:-UPRMVS_vNext}
+    ARM_ARGS=(
+      --axis-space legacy_depth                  # 不启用 W1 的逆深度轴/范围控制器
+      --stage4-head expect                       # 不用 MAP + 有界残差
+      --spre-cascade off                         # SPRE 只留 stage1 的稳定用法
+      --cvpe on                                  # 主线: 相机感知的跨视位置编码
+      --geo-valid on                             # 出画幅的零值不再进多视平均
+      --conf-head on --conf-detach on            # 旁路置信度头 (梯度已分组裁剪)
+      --w-conf "${W_CONF:-1.0}" --conf-tau-mm "${CONF_TAU_MM:-2.0}"
+      --visibility off --vis-supervise off
+    )
+    ;;
   *)
-    echo "ARM 只能是 w0 / w1 / w3 / w3b, 收到 '$ARM'" >&2; return 2 2>/dev/null || exit 2 ;;
+    echo "ARM 只能是 w0 / w1 / w3 / w3b / vnext, 收到 '$ARM'" >&2; return 2 2>/dev/null || exit 2 ;;
 esac
 
 # ------------------------------------------- 公共部分 (四个 arm 完全一致)

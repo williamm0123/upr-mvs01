@@ -65,6 +65,17 @@ VIS=${VIS:-0}                     # 每个 scan 存前 N 张深度可视化 png
 # ---- 融合 -------------------------------------------------------------------
 FUSE=${FUSE:-1}                   # 0 = 只算深度图指标，不融合
 PHOTO_THRESH=${PHOTO_THRESH:-0.3} # stage4 众数概率阈值，调高 -> acc 好 comp 差
+PHOTO_KEEP_RATIO=${PHOTO_KEEP_RATIO:-0}
+                                  # >0 时忽略 PHOTO_THRESH，每个参考视角精确保留
+                                  # 置信度最高的 ceil(r*N_valid) 个像素。
+                                  # 工单 v5.3 的正式协议用 0.60。
+                                  # 为什么: 阈值扫描是一条按中间指标逐项调参的
+                                  # 支线；而且两个模型的置信度分布不同，同一个
+                                  # 阈值下保留率不同，那时比的就不只是深度质量。
+                                  # 固定保留率把这个自由度消掉。gipuma 不支持。
+CONF_SOURCE=${CONF_SOURCE:-auto}  # auto / cascade / learned。跨模型主比较必须
+                                  # 固定成同一个：cascade 是手工概率乘积（两个
+                                  # 模型都有），learned 需要训练过的置信度头。
 GEO_VIEWS=${GEO_VIEWS:-3}         # 最少几个源视图几何一致
 GEO_PIX=${GEO_PIX:-1.0}           # 重投影误差上限（像素）
 GEO_REL=${GEO_REL:-0.01}          # 相对深度差上限
@@ -214,6 +225,8 @@ case "$FUSE" in
         infer_args+=(
             --fuse
             --photo-thresh "$PHOTO_THRESH"
+            --photo-keep-ratio "$PHOTO_KEEP_RATIO"
+            --conf-source "$CONF_SOURCE"
             --geo-views "$GEO_VIEWS"
             --geo-pix "$GEO_PIX"
             --geo-rel "$GEO_REL"

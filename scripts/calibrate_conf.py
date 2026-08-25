@@ -5,11 +5,17 @@
 校准的意义正好没了。温度缩放的前提就是 "在一批模型没见过的数据上, 单参数地
 把 logit 拉回正确的尺度"。
 
-    python scripts/calibrate_conf.py --ckpt log/experiments/W3_vnext/model/best.pth --write
+    python scripts/calibrate_conf.py \
+        --ckpt log/experiments/UPRMVS_vNext/model/latest.pth \
+        --require-step 30000 \
+        --write-out log/experiments/UPRMVS_vNext/model/latest_calibrated.pth
 
-``--write`` 把拟合出来的 T 写回 checkpoint 的 ``conf_head.log_T`` buffer。写完
-之后 ``test.py --conf-source learned`` 输出的就是标定过的概率, ``--photo-thresh
-0.5`` 第一次真的表示 "五成把握"。
+拟合的是**二参数** Platt ``p = sigma(z/T + b)``, 不是单参数温度。原因: 置信度
+损失用的是类别平衡 BCE (losses/composite.py), 加权会平移最优 logit 的截距,
+只拟合 T 时 ``prob=0.5`` 并不表示 "五成把握"。
+
+``--write-out`` 产出**一份新的** checkpoint, 不覆盖原文件 —— 标定是可以推倒
+重来的后处理, 覆盖之后就再也拿不到未标定的 logit。
 
 报四个数, 它们回答的是**两件不同的事**:
   * ECE / Brier  —— 置信度准不准 (校准)
@@ -34,7 +40,7 @@ from torch.utils.data import DataLoader
 import test as testmod
 from base.config import build_mvs_config
 from models.fusion_conf import (
-    brier_score, expected_calibration_error, fit_temperature,
+    brier_score, expected_calibration_error, fit_platt,
     risk_at_coverage, risk_coverage,
 )
 
@@ -97,8 +103,13 @@ def main() -> None:
                     help="逐样本的像素抽样步长, 只为了装得进内存")
     ap.add_argument("--tau-mm", type=float, default=2.0,
                     help="标签阈值, 必须与训练时的 conf_tau_mm 一致")
-    ap.add_argument("--write", action="store_true",
-                    help="把拟合出的 T 写回 checkpoint 的 conf_head.log_T")
+    ap.add_argument("--write-out", default=None,
+                    help="把拟合出的 (T, bias) 写进**一份新的** checkpoint。"
+                         "不允许覆盖原 ckpt —— 标定是可以推倒重来的后处理, "
+                         "覆盖掉之后就再也拿不到未标定的 logit 了。")
+    ap.add_argument("--require-step", type=int, default=None,
+                    help="断言 checkpoint 的 step 等于该值 (正式协议用 30000)。"
+                         "防止拿一个中途的 ckpt 去标定然后当终审模型。")
     ap.add_argument("--out", default="experiments/out/calibrate_conf.json")
     ap.add_argument("--cfg-override", default="auto")
     ap.add_argument("--resize-scale", type=float, default=0.8,
@@ -125,48 +136,75 @@ def main() -> None:
     ds = testmod.build_dataset(cfg, ns)
     model, ckpt_path = testmod.load_model(cfg, ns, device)
     model.eval()
-    print(f"[calib] ckpt={ckpt_path}  样本数={len(ds)}  tau={a.tau_mm}mm")
+    meta = getattr(testmod.load_model, "last_meta", None) or {}
+    if a.require_step is not None and int(meta.get("step", -1)) != int(a.require_step):
+        raise SystemExit(
+            f"checkpoint 的 step={meta.get('step')}, 但 --require-step {a.require_step}。"
+            f"正式协议只标定跑满的最终模型 —— 拿中途的 ckpt 标定再当终审, 等于用"
+            f"另一个模型的置信度去解释这个模型。")
+    print(f"[calib] ckpt={ckpt_path} (step {meta.get('step')})  样本数={len(ds)}  tau={a.tau_mm}mm")
 
     z, y, err = collect(model, ds, cfg, ns, device, a.tau_mm, a.stride)
     print(f"[calib] 收集到 {z.numel()} 个像素, 正例比例 {float(y.mean()):.4f}")
 
-    T = fit_temperature(z, y)
-    before = _report("before(T=1)", torch.sigmoid(z), y, err)
-    after = _report(f"after(T={T:.4f})", torch.sigmoid(z / T), y, err)
+    log_T, bias = fit_platt(z, y)
+    T = float(torch.tensor(log_T).exp())
+    before = _report("before(T=1,b=0)", torch.sigmoid(z), y, err)
+    after = _report(f"after(T={T:.4f},b={bias:+.4f})", torch.sigmoid(z / T + bias), y, err)
 
     print(f"\n{'':<18}{'ECE':>9}{'Brier':>9}{'AURC(mm)':>11}{'R(0.6)mm':>11}"
           f"{'mean':>8}{'keep@.5':>9}")
     for r in (before, after):
         print(f"{r['tag']:<18}{r['ece']:>9.4f}{r['brier']:>9.4f}{r['aurc_mm']:>11.4f}"
               f"{r['risk_at_0.6_mm']:>11.4f}{r['mean_conf']:>8.3f}{r['keep_at_0.5']:>9.3f}")
-    # 温度缩放是**单调**变换, 所以它按定义不改变排序 —— AURC / R(0.6) 两行必须
-    # 完全相同。不同就说明哪里错了 (最常见的是把 T 也拿去训了)。
-    if abs(before["aurc_mm"] - after["aurc_mm"]) > 1e-6:
-        print("[calib] WARNING: 温度缩放是单调的, AURC 不该变 —— 检查实现")
-    print(f"\n[calib] T = {T:.4f}  ({'过自信, 需要压平' if T > 1 else '欠自信, 需要锐化'})")
+    # z -> z/T + b 在 T > 0 时是**严格单调**的仿射变换, 所以它按定义不改变排序
+    # —— AURC / R(0.6) 必须逐位相同。不同就说明实现错了 (最常见的是把 T 也拿去
+    # 训了, 或者拟合时 T 跑成了负数)。这里 raise 而不是 warn: 标定完之后紧跟着
+    # 就是终审点云, 一个悄悄改了排序的 "标定" 会直接污染最终结论。
+    # 容差不能取 0 或 1e-6: sigmoid 在 fp32 下会把接近的 logit 映射成**完全相等**
+    # 的概率 (|z| 大的时候尤其多), 而排序对并列不作保证, 于是并列元素的先后可能
+    # 变, AURC 随之抖动一点点。这不是错误。真正的实现错误 (T 训进了模型、T 拟合
+    # 成负数、误用了另一套 logit) 会让这两个数差好几个百分点, 相对 1e-3 足够抓。
+    for k in ("aurc_mm", "risk_at_0.6_mm"):
+        ref = max(abs(before[k]), 1e-9)
+        if abs(before[k] - after[k]) / ref > 1e-3:
+            raise SystemExit(
+                f"[calib] {k} 在标定前后不一致 ({before[k]:.6f} -> {after[k]:.6f})。"
+                f"正斜率仿射不可能改变排序 —— 实现有问题, 不要继续。")
+    print(f"\n[calib] T = {T:.4f}  bias = {bias:+.4f}  "
+          f"({'过自信, 需要压平' if T > 1 else '欠自信, 需要锐化'})")
 
     Path(a.out).parent.mkdir(parents=True, exist_ok=True)
     Path(a.out).write_text(json.dumps(
-        {"ckpt": str(ckpt_path), "T": T, "tau_mm": a.tau_mm,
+        {"ckpt": str(ckpt_path), "T": T, "log_T": log_T, "bias": bias, "tau_mm": a.tau_mm,
          "n_pixels": int(z.numel()), "before": before, "after": after},
         indent=2), encoding="utf-8")
     print(f"[calib] 写入 {a.out}")
 
-    if a.write:
+    if a.write_out:
+        dst = Path(a.write_out)
+        if dst.resolve() == Path(ckpt_path).resolve():
+            raise SystemExit("--write-out 不能等于 --ckpt: 覆盖原 checkpoint 之后就"
+                             "再也拿不到未标定的 logit, 标定也就无法重做。")
         try:
             ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
         except TypeError:
             ck = torch.load(ckpt_path, map_location="cpu")
-        key = next((k for k in ck["model"] if k.endswith("conf_head.log_T")), None)
-        if key is None:
+        kt = next((k for k in ck["model"] if k.endswith("conf_head.log_T")), None)
+        if kt is None:
             raise SystemExit("checkpoint 的 state_dict 里没有 conf_head.log_T")
-        ck["model"][key] = torch.tensor(float(torch.log(torch.tensor(T))))
-        torch.save(ck, ckpt_path)
-        print(f"[calib] 已写回 {ckpt_path} 的 {key} (T={T:.4f})")
+        ck["model"][kt] = torch.tensor(float(log_T))
+        kb = kt[: -len("log_T")] + "calib_bias"
+        ck["model"][kb] = torch.tensor(float(bias))
+        ck["calibration"] = {"log_T": log_T, "bias": bias, "tau_mm": a.tau_mm,
+                             "n_pixels": int(z.numel()), "source_ckpt": str(ckpt_path)}
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(ck, dst)
+        print(f"[calib] 写入新 checkpoint {dst} ({kt}={log_T:.4f}, {kb}={bias:+.4f})")
         print("[calib] 现在 test.py --conf-source learned 输出的是标定过的概率, "
               "--photo-thresh 0.5 才真的表示 '五成把握'。")
     else:
-        print("[calib] 只报告不写入。加 --write 才会改 checkpoint。")
+        print("[calib] 只报告不写入。加 --write-out <路径> 才会产出标定过的 checkpoint。")
 
 
 if __name__ == "__main__":
