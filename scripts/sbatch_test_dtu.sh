@@ -15,8 +15,14 @@
 # =============================================================================
 # 工单 v5.3 §7.2 / §7.5 的点云推理 —— **sbatch 提交, 不是 bash**。
 #
-#   WHICH=w0    sbatch scripts/sbatch_test_dtu.sh     # W0 基线 (§7.2)
-#   WHICH=vnext sbatch scripts/sbatch_test_dtu.sh     # vNext 终审 (§7.5)
+#   WHICH=w0    sbatch scripts/sbatch_test_dtu.sh     # W0 基线点云 (§7.2)
+#   WHICH=calib sbatch scripts/sbatch_test_dtu.sh     # Platt 标定     (§7.4)
+#   WHICH=vnext sbatch scripts/sbatch_test_dtu.sh     # vNext 终审点云 (§7.5)
+#
+# calib 也在这里而不是另起一个脚本: 它同样要 GPU (calibrate_conf.py 是
+# `cuda if available else cpu`, 在登录节点上会**静默**退回 CPU 然后跑一整个
+# val split), 而且要与 §7.5 同一份 conda / PYTHONPATH / profile。两个脚本各
+# 抄一份环境段, 迟早只改一边。
 #
 # 为什么要这个包装: scripts/test_dtu.sh **没有 #SBATCH 头**, 它是"在已经拿到卡
 # 的地方跑"的脚本。直接 `bash scripts/test_dtu.sh` 会跑在登录节点上 (没有 GPU,
@@ -33,8 +39,8 @@
 set -euo pipefail
 
 WHICH=${WHICH:-w0}
-case "$WHICH" in w0|vnext) ;; *)
-    echo "WHICH 只能是 w0 / vnext, 收到 '$WHICH'" >&2; exit 2 ;; esac
+case "$WHICH" in w0|calib|vnext) ;; *)
+    echo "WHICH 只能是 w0 / calib / vnext, 收到 '$WHICH'" >&2; exit 2 ;; esac
 
 PROJECT_DIR=${PROJECT_DIR:-/scr/user/qinglong/projects/upr-mvs01}
 cd "$PROJECT_DIR"
@@ -47,6 +53,17 @@ case "$WHICH" in
     CONF_SOURCE_DEF=cascade          # W0 没有置信度头
     OUT_DEF=log/depth_cache/W0_final
     PLY_DEF=log/pred_points_W0_final
+    ;;
+  calib)
+    # 标定跑在 **val** split 上 (calibrate_conf.py 的 eval_namespace 默认),
+    # 不是 test —— 拿终审集去拟合温度, 那个终审就不独立了。
+    CKPT_DEF=log/experiments/UPRMVS_vNext/model/latest.pth
+    CALIB_OUT=${CALIB_OUT:-log/experiments/UPRMVS_vNext/model/latest_calibrated.pth}
+    CALIB_REPORT=${CALIB_REPORT:-experiments/out/calibrate_vnext.json}
+    REQUIRE_STEP=${REQUIRE_STEP:-30000}
+    TAU_MM=${TAU_MM:-2.0}                # 必须等于训练的 --conf-tau-mm
+    CONF_SOURCE_DEF=learned              # 仅用于回显, 标定本身不走这条路
+    OUT_DEF=- ; PLY_DEF=-
     ;;
   vnext)
     # **标定过的**那份。未标定的 logit 读不成概率, 而 --conf-source learned
@@ -102,6 +119,23 @@ echo " split=$SPLIT resize=$RESIZE views=$NUM_VIEWS full_image=$FULL_IMAGE max_r
 echo " out=$OUT  ply=$PLY_DIR"
 echo " git=$(git rev-parse HEAD 2>/dev/null || echo unknown)"
 echo "======================================================================"
+
+if [[ "$WHICH" == "calib" ]]; then
+    # 与 §7.5 同一套部署口径 (0.8 整幅 + 5 视角): 标定要在**部署条件**下做,
+    # 换了分辨率 logit 的分布就变了, 拟合出来的 T/b 对不上要用它的那次推理。
+    python scripts/calibrate_conf.py \
+        --ckpt "$CKPT" \
+        --require-step "$REQUIRE_STEP" \
+        --write-out "$CALIB_OUT" \
+        --tau-mm "$TAU_MM" \
+        --resize-scale "$RESIZE" --num-views "$NUM_VIEWS" --full-image on \
+        --num-workers 8 \
+        --out "$CALIB_REPORT"
+    echo ""
+    echo "=== 完成。标定过的 ckpt -> $CALIB_OUT   报告 -> $CALIB_REPORT"
+    echo "=== 下一步:  WHICH=vnext sbatch scripts/sbatch_test_dtu.sh"
+    exit 0
+fi
 
 # 拿到卡之后才 bash 调它 —— test_dtu.sh 自己不排队。
 CKPT="$CKPT" MIN_STEP="$MIN_STEP" NUM_VIEWS="$NUM_VIEWS" RESIZE="$RESIZE" \
