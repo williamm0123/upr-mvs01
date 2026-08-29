@@ -30,6 +30,11 @@ class DTUMVSDataset(Dataset):
         # 只有 1-3%。这里做精确过滤, *_clean.txt 只负责剔掉重灾区 scan。
         # 必须在 build_list() 之前赋值。
         self.exclude_file = kwargs.get('exclude_file', None)
+        # 全部光照共用同一份先验; -1 = 每个光照各读各的 (旧行为)。见 PriorConfig。
+        # 和 exclude_file 一样必须在 build_list() 之前赋值 —— _load_exclude 要用它
+        # 决定"一个坏 prior 该毙掉几个样本"。
+        self.prior_shared_light = int(kwargs.get('prior_shared_light',
+                                                 PriorConfig().shared_light))
 
         self.metas = self.build_list()
         self.resize_scale = kwargs.get('resize_scale', 0.5)
@@ -37,9 +42,6 @@ class DTUMVSDataset(Dataset):
         self.width  = kwargs.get('width', 640)
         self.sfm_cache_dir = Path(ProjectPaths().sfm_cache_path)
         self.prior_cache_dir = Path(ProjectPaths().prior_cache_path)
-        # 全部光照共用同一份先验; -1 = 每个光照各读各的 (旧行为)。见 PriorConfig。
-        self.prior_shared_light = int(kwargs.get('prior_shared_light',
-                                                 PriorConfig().shared_light))
         # 训练默认随机裁剪做增广, 其余模式居中裁剪保证可复现; 可用 kwarg 覆盖
         self.random_crop = kwargs.get('random_crop', mode == 'train')
         # prior 失败模式增强 (仅训练): 见 data/prior_corruption.py。默认关闭,
@@ -95,7 +97,13 @@ class DTUMVSDataset(Dataset):
         with open(self.exclude_file) as fh:
             rows = list(_csv.DictReader(fh))
         out = {(r["scan"], int(r["view"]), int(r["light"])) for r in rows}
-        print(f"dataset {self.mode}: exclude list {self.exclude_file} -> {len(out)} 个坏 prior 样本")
+        if self.prior_shared_light >= 0:
+            # 光照共用时一个坏 prior 文件毒掉该 (scan, view) 的**全部** 7 个样本
+            # —— 审计表是按缓存文件出的, 只有 light 3 那一行, 不展开的话另外 6 个
+            # 光照会带着同一份坏先验照常进训练。
+            out = {(scan, view, l) for scan, view, _ in out for l in range(7)}
+        print(f"dataset {self.mode}: exclude list {self.exclude_file} -> {len(out)} 个坏 prior 样本"
+              + (f" (光照共用, 已按 (scan, view) 展开)" if self.prior_shared_light >= 0 else ""))
         return out
 
     def build_list(self):
