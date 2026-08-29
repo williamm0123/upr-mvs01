@@ -111,6 +111,18 @@ export PYTHONNOUSERSITE=1
 export PYTHONUNBUFFERED=1
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 
+# CUDA 必须真的可用。test.py 是 `cuda if torch.cuda.is_available() else cpu` ——
+# 拿不到卡时它会**静默**退回 CPU, 1078 个 960x1280 的前向在 CPU 上要跑几天,
+# 而日志看起来一切正常, 只是慢。宁可在这里直接失败。
+python - <<'PYCHK' || { echo "CUDA 不可用 —— 这个作业需要 --gres=gpu:1, 不要用 CPU 跑。" >&2; exit 1; }
+import sys, torch
+if not torch.cuda.is_available():
+    sys.exit(1)
+print(f"=== GPU: {torch.cuda.get_device_name(0)}  "
+      f"{torch.cuda.get_device_properties(0).total_memory / 2**30:.0f} GiB  "
+      f"torch {torch.__version__} ===")
+PYCHK
+
 echo "======================================================================"
 echo " 点云推理  which=$WHICH  job=${SLURM_JOB_ID:-manual}  host=$(hostname)"
 echo " ckpt=$CKPT"
