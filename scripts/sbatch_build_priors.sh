@@ -15,20 +15,23 @@
 # =============================================================================
 # 用残差场 prior (models/residual_field.py) 重建整个缓存, 支持分片并行。
 #
-#   sbatch --array=0-3 scripts/sbatch_build_priors.sh          # 4 片, 全部 split
+#   sbatch --array=0-1 scripts/sbatch_build_priors.sh          # 2 片 (umhpc 上限)
 #   SCANS=val sbatch --array=0-1 scripts/sbatch_build_priors.sh
-#   DRY=1 sbatch --array=0-0 scripts/sbatch_build_priors.sh    # 只报缺口
+#   DRY=1 SHARD_N=1 bash scripts/sbatch_build_priors.sh        # 不排队, 只报缺口
 #
-# 每片是独立进程、独立 GPU, 写的是**不相交**的 (scan, view, light) 集合, 所以可
-# 以随便并行。中断后重跑同一条命令即可续跑 (save_prior 是 tmp+os.replace 原子写,
-# 且差集扫描会跳过已完成的)。
+# 每片是独立进程、独立 GPU, 写的是**不相交**的 (scan, view) 集合, 所以可以随便
+# 并行。中断后重跑同一条命令即可续跑 (save_prior 是 tmp+os.replace 原子写, 且
+# 差集扫描会跳过已完成的)。
 #
-# 规模: train 79*49*7 + val 18*49 + test 22*49 = 29057 个样本。实测 (RTX 5060 Ti,
-# 784x588, 5 视角, resize 0.5) 约 9s/样本 —— A100 上会快一些, 但单卡仍是 40h+,
-# 所以默认就该分片。--array=0-3 大约 10~14 小时。
+# 规模: 只建 light 3 —— 训练时同一个 (scan, view) 的 7 个光照共用这一份, 见
+# PriorConfig.shared_light 和 dtu.prior_cache_path_for。于是目标全集是
+# (79+18+22)*49 = 5831 个样本, 而不是逐光照的 29057 个。实测 (RTX 5060 Ti,
+# 784x588, 5 视角, resize 0.5) 8.5s/样本 = 单卡约 14h; --array=0-1 双卡约 7h,
+# A100 上更快。磁盘约 25~30G。
 #
-# 显存: VGGT+DA3 在 784x588 / 5 视角下峰值实测 9.0 GiB。A100-80G 绰绰有余; 但
-# **不要和别的作业共卡**, 峰值撞上就 OOM (脚本里有 nvidia-smi 提醒但不拦截)。
+# 显存: VGGT+DA3 在 784x588 / 5 视角下峰值实测 8.83 GiB。A100-80G 绰绰有余,
+# 16G 卡也够; 但**不要和别的作业共卡**, 峰值撞上就 OOM (脚本里有 nvidia-smi
+# 提醒但不拦截)。
 # =============================================================================
 
 set -euo pipefail
