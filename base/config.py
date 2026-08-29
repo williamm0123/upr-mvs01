@@ -132,20 +132,33 @@ class PriorConfig:
     Both dims MUST be multiples of the backbone patch size (14); the DPT head
     reassembles on ``H//14`` patches and a non-multiple truncates / misaligns.
 
-    2026-08-30 起默认 798x602 (= 57*14 x 43*14)。这是"600x800"能取到的最近的合法
-    尺寸 —— 800 和 600 都不是 14 的倍数。相对源图 1600x1200 的 4:3 有 0.6% 的各向
-    异性, ``image_mode="resize"`` 是逐轴仿射并逐轴改内参 (fx*=sx, fy*=sy), 所以几何
-    上是精确的, 只是图被轻微拉了一点。要严格 4:3 可以用 784x588 (=56*14 x 42*14)。
+    2026-08-30 起默认 784x588 (= 56*14 x 42*14)。800 和 600 都不是 patch size 14
+    的倍数, 784x588 是**严格保持 4:3** 的最近合法尺寸 (798x602 更接近 800x600 但
+    有 0.6% 各向异性)。ViT 只在这个尺寸上跑; ``inverse_transform_map`` 之后
+    depth/conf/normal 三张图都还原到 sample 的原分辨率 (resize_scale=0.5 时
+    800x600), 缓存里存的就是 800x600。
 
-    代价: token 数 37*30=1110 -> 57*43=2451 (2.2x), VGGT 的全局注意力是 V*token 上
-    的 O(n^2), 5 视角下约 12x 于旧配置。显存不够就先降 --target-w/h。
+    代价: token 数 37*30=1110 -> 56*42=2352 (2.1x), VGGT 的全局注意力是 V*token
+    上的 O(n^2), 5 视角下约 12x 于旧配置。实测 (RTX 5060 Ti) 峰值显存 8.9 GiB。
+    显存不够就先降 --target-w/h。
     """
-    target_w: int = 798
-    target_h: int = 602
+    target_w: int = 784
+    target_h: int = 588
     # prior 生成方式, 见 models/norm_fill.generate_priors_from_sample:
     #   residual    = 思路三低频残差场 (默认)
     #   normal_fill = 旧的法向约束 Poisson 填充 (只为配对消融保留)
     method: str = "residual"
+    # 全部光照共用同一份先验 (取这个光照下建的那份)。-1 = 每个光照各建各的 (旧行为)。
+    #
+    # 训练 split 每个 (scan, view) 有 7 个光照, 逐光照建先验 = 29057 个样本 × 9s
+    # ≈ 单卡 73 小时; 共用之后只剩 5831 个 ≈ 15 小时。依据和缓存里那条"换光照重跑
+    # SfM"的回退链是同一个: 光照变了几何没变, VGGT/DA3 对光照不敏感 (见
+    # scripts/build_prior_cache_all.py 的尺度回退链说明)。
+    #
+    # 代价要认下来: 同一份先验在一个 epoch 里会被 7 个训练样本读到, 先验噪声的
+    # realization 不再逐样本独立。原来那点多样性是有正则作用的, 现在没了 ——
+    # 需要的话用 cfg.train.prior_corruption_prob 补 (data/prior_corruption.py)。
+    shared_light: int = 3
 
     @property
     def target_wh(self) -> tuple[int, int]:

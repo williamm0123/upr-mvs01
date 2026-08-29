@@ -60,14 +60,21 @@ mode='train' 才有 7 个光照, 否则只有 light 3。想补 test 就得换 li
 来源记在 npz 的 ``scale_source`` (0 自有 / 1 换光照 / 2 借邻视角) +
 ``scale_light`` + ``scale_ref_view`` 里, 也逐样本写进 CSV。
 
-## 2026-08-30: 残差场 prior + 798x602
+## 2026-08-30: 残差场 prior + 784x588 + 光照共用
 
-``--prior-method residual`` (新默认) 换掉了法向 Poisson 填充, 见
-``models/residual_field.py``; ``--target-w/h`` 默认 518x420 -> 798x602。两者都让
-旧缓存不可比, 所以**必须换输出目录** (``--cache-dir``), 训练侧用环境变量
-``UPRMVS_PRIOR_CACHE`` 指到同一个目录。实测 (RTX 5060 Ti, 5 视角, resize 0.5)
-约 9s/样本、显存峰值 9.0 GiB —— 下面表格里的"预估"列还是按旧配置的 3.3s 算的,
-只当下限看。
+三处改动, 都让旧缓存不可比, 所以**必须换输出目录** (``--cache-dir``), 训练侧用
+环境变量 ``UPRMVS_PRIOR_CACHE`` 指到同一个目录:
+
+1. ``--prior-method residual`` (新默认) 换掉法向 Poisson 填充, 见
+   ``models/residual_field.py``。
+2. ``--target-w/h`` 默认 518x420 -> 784x588 (=56*14 x 42*14, 严格 4:3)。
+3. ``--lights auto`` 现在**一律只建 light 3**: 训练时同一个 (scan, view) 的 7 个
+   光照共用这一份先验 (``PriorConfig.shared_light``, ``dtu.prior_cache_path_for``)。
+   目标全集从 29057 降到 5831 个样本。要回到逐光照用 ``--lights per-light`` 并把
+   ``shared_light`` 设 -1。
+
+实测 (RTX 5060 Ti, 5 视角, resize 0.5) 约 9s/样本、显存峰值 8.9 GiB —— 下面表格
+里的"预估"列还是按旧配置的 3.3s 算的, 只当下限看。
 
 ## 用法
 
@@ -106,7 +113,7 @@ for _p in (_ROOT, _ROOT / "models", _ROOT / "models" / "Depth-Anything-3" / "src
         sys.path.insert(0, str(_p))
 
 import models.sfm as S
-from base.config import ProjectPaths, build_mvs_config
+from base.config import PriorConfig, ProjectPaths, build_mvs_config
 from data.dtu import DTUMVSDataset
 from models.pre_prior import (PIPELINE_VERSION, PriorPrecomputer,
                               cache_signature_from_file, load_prior, save_prior)
@@ -308,9 +315,11 @@ def main() -> None:
                     help="all(磁盘上全部) | lists(train+val+test 列表) | train | val | "
                          "test | other(不在任何列表里的) | 显式 scan 名, 逗号分隔")
     ap.add_argument("--lights", default="auto",
-                    help="auto = train split 建 7 个光照, val/test/其他只建 light 3 "
-                         "(和 data/dtu.py 的 build_list 一致); all = 一律 7 个; "
-                         "也可以给 '0,3,6' 这样的显式清单")
+                    help="auto(默认) = 一律只建 PriorConfig.shared_light (light 3), "
+                         "全部光照在训练时共用这一份 —— 见 data/dtu.py 的 "
+                         "prior_cache_path_for; per-light = train split 建 7 个光照, "
+                         "val/test 只建 light 3 (旧行为, 需同时把 shared_light 设 -1); "
+                         "all = 一律 7 个; 也可以给 '0,3,6' 这样的显式清单")
     ap.add_argument("--resize", default="train:0.5,val:0.5,test:1.0,other:0.5",
                     help="每个 split 的建缓存分辨率倍率 (1.0 = 原生 1200x1600)。"
                          "ViT 恒在 target_wh 上跑, 这个只决定存图大小和 SfM 标尺"
@@ -319,10 +328,10 @@ def main() -> None:
     ap.add_argument("--num-views", type=int, default=None,
                     help="1 ref + (N-1) src, 默认取 cfg.train.num_views。只影响先验"
                          "*质量* (src 越多 SfM 三角化点越多), 不是兼容性判据")
-    ap.add_argument("--target-w", type=int, default=798,
-                    help="VGGT/DA3 实际跑的宽 (必须是 14 的倍数)。798=57*14")
-    ap.add_argument("--target-h", type=int, default=602,
-                    help="VGGT/DA3 实际跑的高 (必须是 14 的倍数)。602=43*14")
+    ap.add_argument("--target-w", type=int, default=784,
+                    help="VGGT/DA3 实际跑的宽 (必须是 14 的倍数)。784=56*14")
+    ap.add_argument("--target-h", type=int, default=588,
+                    help="VGGT/DA3 实际跑的高 (必须是 14 的倍数)。588=42*14")
     ap.add_argument("--cache-dir", default="",
                     help="缓存输出目录, 覆盖 ProjectPaths().prior_cache_path。"
                          "换 prior 生成方式/分辨率时**必须**换目录 —— 文件名两者都"
@@ -391,6 +400,12 @@ def main() -> None:
         resize[k.strip()] = float(v)
 
     if args.lights == "auto":
+        shared = int(PriorConfig().shared_light)
+        if shared < 0:                      # shared_light 关掉时退回逐光照
+            lights_for = lambda sp: ALL_LIGHTS if sp == "train" else VAL_TEST_LIGHTS
+        else:
+            lights_for = lambda sp: (shared,)
+    elif args.lights == "per-light":
         lights_for = lambda sp: ALL_LIGHTS if sp == "train" else VAL_TEST_LIGHTS
     elif args.lights == "all":
         lights_for = lambda sp: ALL_LIGHTS

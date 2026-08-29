@@ -10,7 +10,7 @@ from PIL import Image
 from .io import read_pfm
 import models.sfm as sfm
 from models import pre_prior
-from base.config import ProjectPaths
+from base.config import ProjectPaths, PriorConfig
 from .augment import PhotometricAug, resize_scale_for_crop
 from .prior_corruption import corrupt_prior
 
@@ -37,6 +37,9 @@ class DTUMVSDataset(Dataset):
         self.width  = kwargs.get('width', 640)
         self.sfm_cache_dir = Path(ProjectPaths().sfm_cache_path)
         self.prior_cache_dir = Path(ProjectPaths().prior_cache_path)
+        # 全部光照共用同一份先验; -1 = 每个光照各读各的 (旧行为)。见 PriorConfig。
+        self.prior_shared_light = int(kwargs.get('prior_shared_light',
+                                                 PriorConfig().shared_light))
         # 训练默认随机裁剪做增广, 其余模式居中裁剪保证可复现; 可用 kwarg 覆盖
         self.random_crop = kwargs.get('random_crop', mode == 'train')
         # prior 失败模式增强 (仅训练): 见 data/prior_corruption.py。默认关闭,
@@ -243,9 +246,16 @@ class DTUMVSDataset(Dataset):
         return img, K, depth, mask
 
     def prior_cache_path_for(self, idx):
-        """Prior cache file for a meta (mirrors the SfM cache naming)."""
+        """Prior cache file for a meta.
+
+        ``prior_shared_light >= 0`` 时**只按 (scan, ref_view) 对齐**, 光照维度塌掉:
+        同一个视角的 7 个光照读同一份先验。先验是几何量, 光照只改图像不改几何 ——
+        这和缓存里"换光照重跑 SfM 但不重算 VGGT/DA3"的回退链是同一个前提。
+        代价见 base/config.py PriorConfig.shared_light 的注释。
+        """
         scan, light_idx, ref_view, _ = self.metas[idx]
-        return self.prior_cache_dir / scan / f"prior_{ref_view:0>4}_{light_idx}.npz"
+        light = self.prior_shared_light if self.prior_shared_light >= 0 else light_idx
+        return self.prior_cache_dir / scan / f"prior_{ref_view:0>4}_{light}.npz"
 
     def precrop_inputs(self, idx, resize_scale=None, aug_params=None, load_src_depth=None):
         """Pre-crop multi-view inputs (before random crop), shared by both

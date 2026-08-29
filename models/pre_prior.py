@@ -178,7 +178,7 @@ class PriorPrecomputer:
         device,
         image_mode: str = "resize",
         conf_percentile: float = 10.0,
-        image_target_wh: tuple[int, int] = (798, 602),
+        image_target_wh: tuple[int, int] = (784, 588),
         prior_method: str = "residual",
     ) -> None:
 
@@ -268,7 +268,7 @@ def build_prior_cache(
     device,
     overwrite: bool = False,
     verbose: bool = True,
-    image_target_wh: tuple[int, int] = (798, 602),
+    image_target_wh: tuple[int, int] = (784, 588),
     fail_open: bool = False,
     prior_method: str = "residual",
 ) -> int:

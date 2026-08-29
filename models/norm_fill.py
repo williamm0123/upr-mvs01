@@ -746,9 +746,19 @@ def generate_priors_from_sample(
         raise ValueError(f"unknown prior_method: {prior_method!r} "
                          f"(expected 'residual' or 'normal_fill')")
 
-    depth_filled,pred_ref_k = inverse_transform_map(depth_filled, ref_transform,pred["intrinsics"][0])
-
-    conf_map = inverse_transform_map(conf_map,ref_transform)
+    # 三张图一起还原到 sample 的原分辨率 (resize_scale=0.5 时 800x600), 缓存里
+    # 因此不再有"depth/conf 是 800x600 但 normal 还停在 target_wh"的混用 ——
+    # 那会让 dtu.py 每次读样本都对法向多做一次 cv2.resize (_match_hw)。
+    depth_filled, pred_ref_k = inverse_transform_map(
+        depth_filled, ref_transform, pred["intrinsics"][0])
+    conf_map = inverse_transform_map(conf_map, ref_transform, interp="bilinear")
+    # 法向逐通道重采样后要重新单位化 —— 双线性插值不保范数。
+    norm_filled = np.moveaxis(
+        inverse_transform_map(np.moveaxis(norm_filled, -1, 0), ref_transform,
+                              interp="bilinear"), 0, -1)
+    norm_filled = norm_filled / np.maximum(
+        np.linalg.norm(norm_filled, axis=-1, keepdims=True), 1e-8)
+    norm_filled = norm_filled.astype(np.float32)
 
 
     # 用 SfM 公制稀疏深度给 (归一化尺度的) depth_filled 标定绝对尺度.
@@ -769,6 +779,7 @@ def generate_priors_from_sample(
         "extrinsics": pred["extrinsics"][0],
         "intrinsics": pred_ref_k,
         "normal": norm_filled,
+        # norm_da3 只做可视化/诊断, 留在 target_wh 上, 不参与缓存
         "norm_da3": norm_da3,
         "depth_filled": depth_filled,
         "conf_map": conf_map,

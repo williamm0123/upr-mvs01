@@ -24,10 +24,10 @@
 # 且差集扫描会跳过已完成的)。
 #
 # 规模: train 79*49*7 + val 18*49 + test 22*49 = 29057 个样本。实测 (RTX 5060 Ti,
-# 798x602, 5 视角, resize 0.5) 约 9s/样本 —— A100 上会快一些, 但单卡仍是 40h+,
+# 784x588, 5 视角, resize 0.5) 约 9s/样本 —— A100 上会快一些, 但单卡仍是 40h+,
 # 所以默认就该分片。--array=0-3 大约 10~14 小时。
 #
-# 显存: VGGT+DA3 在 798x602 / 5 视角下峰值实测 9.0 GiB。A100-80G 绰绰有余; 但
+# 显存: VGGT+DA3 在 784x588 / 5 视角下峰值实测 9.0 GiB。A100-80G 绰绰有余; 但
 # **不要和别的作业共卡**, 峰值撞上就 OOM (脚本里有 nvidia-smi 提醒但不拦截)。
 # =============================================================================
 
@@ -53,8 +53,8 @@ SHARD_ID=${SLURM_ARRAY_TASK_ID:-0}
 SHARD_N=${SHARD_N:-${SLURM_ARRAY_TASK_COUNT:-1}}
 SCANS=${SCANS:-all}
 NUM_VIEWS=${NUM_VIEWS:-5}
-TARGET_W=${TARGET_W:-798}
-TARGET_H=${TARGET_H:-602}
+TARGET_W=${TARGET_W:-784}
+TARGET_H=${TARGET_H:-588}
 EXTRA=()
 [[ -n "${DRY:-}" ]] && EXTRA+=(--dry-run)
 
