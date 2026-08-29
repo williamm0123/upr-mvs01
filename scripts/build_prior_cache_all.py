@@ -94,6 +94,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import re
 import os
 import subprocess
 import sys
@@ -136,6 +137,9 @@ def _fmt(sec: float) -> str:
     h, r = divmod(int(sec), 3600)
     m, s = divmod(r, 60)
     return f"{h}h{m:02d}m{s:02d}s"
+
+
+RANGE_RE = re.compile(r"\d+-\d+")
 
 
 def _scan_key(name: str) -> tuple[int, str]:
@@ -296,6 +300,12 @@ def resolve_scan_set(spec: str, splits: dict[str, list[str]], disk: list[str]) -
         elif tok == "other":
             listed = set(splits["train"]) | set(splits["val"]) | set(splits["test"])
             sel += [s for s in disk if s not in listed]
+        elif RANGE_RE.fullmatch(tok):
+            # "1-80" / "81-128": 按 scan 编号取闭区间。分机器切任务用的 ——
+            # 编号区间是稳定的, 不随 listfile 或磁盘内容变化, 两台机器各跑一半
+            # 时不会因为一边的列表改了就重叠或漏掉。
+            lo, hi = (int(x) for x in tok.split("-"))
+            sel += [f"scan{i}" for i in range(min(lo, hi), max(lo, hi) + 1)]
         else:
             sel.append(tok)
     seen, out = set(), []
@@ -313,7 +323,8 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--scans", default="all",
                     help="all(磁盘上全部) | lists(train+val+test 列表) | train | val | "
-                         "test | other(不在任何列表里的) | 显式 scan 名, 逗号分隔")
+                         "test | other(不在任何列表里的) | '1-80' 这样的 scan 编号闭区间 "
+                         "(分机器切任务用) | 显式 scan 名。可逗号组合, 如 '1-40,scan99'")
     ap.add_argument("--lights", default="auto",
                     help="auto(默认) = 一律只建 PriorConfig.shared_light (light 3), "
                          "全部光照在训练时共用这一份 —— 见 data/dtu.py 的 "
@@ -371,7 +382,9 @@ def main() -> None:
     ap.add_argument("--shard", default="0/1", help="i/N, 只做第 i 片")
     ap.add_argument("--limit", type=int, default=0, help="只做前 N 个 (调试)")
     ap.add_argument("--dry-run", action="store_true", help="只报缺口和预估, 不建")
-    ap.add_argument("--log-every", type=int, default=20)
+    ap.add_argument("--log-every", type=int, default=20,
+                    help="每多少个样本打一行**汇总**。逐样本一行是恒定打的, "
+                         "不受这个控制")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--profile", choices=["local", "umhpc"], default=None)
     ap.add_argument("--report", default="",
@@ -741,13 +754,20 @@ def main() -> None:
                          src_tag, int(float(prior.get("scale_light", 0.0))),
                          int(float(prior.get("scale_ref_view", view))), tries,
                          f"{time.time()-ts:.1f}"])
+            # 逐样本一行 —— 长跑作业最需要的是"它还活着、刚做完哪个"。汇总行按
+            # --log-every 单独给, 不要让进度信息被 20 个样本的间隔吞掉。
+            el = time.time() - t0
+            eta = el / n * (len(todo) - n)
+            src_name = ("自有", "换光照", "借邻视角")[min(src_tag, 2)] if ok else "待回退"
+            print(f"[build] {n:>5}/{len(todo)}  {scan:>8} v{view:0>2} l{light}  "
+                  f"{time.time()-ts:5.1f}s  "
+                  f"{'ok ' if ok else 'FAIL'} scale={prior['sfm_scale']:7.1f} "
+                  f"({src_name}, pairs={int(prior['sfm_num_pairs'])})  "
+                  f"depth中位={med:6.1f}mm  剩余 {_fmt(eta)}", flush=True)
             if n % args.log_every == 0 or n == len(todo):
                 rpt.flush()
-                el = time.time() - t0
-                eta = el / n * (len(todo) - n)
-                print(f"[build] {n}/{len(todo)}  {scan} v{view} l{light}  "
-                      f"{el/n:.2f}s/个  已用 {_fmt(el)}  剩余 {_fmt(eta)}  "
-                      f"换光照救回 {n_light}  借邻视角 {n_neighbor}  "
+                print(f"[build] --- {n}/{len(todo)}  {el/n:.2f}s/个  已用 {_fmt(el)}  "
+                      f"剩余 {_fmt(eta)}  换光照救回 {n_light}  借邻视角 {n_neighbor}  "
                       f"待借 {len(deferred)}  无解 {n_unresolved}  异常 {failed}", flush=True)
         resolve_deferred(cur_scan or "")
     except KeyboardInterrupt:
