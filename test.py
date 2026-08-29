@@ -578,7 +578,13 @@ def run_inference(model, ds, cfg, args, device, out_root: Path) -> dict:
             np.savez_compressed(
                 d / f"{ref_view:08d}.npz",
                 depth=pred[0].cpu().numpy().astype(np.float32),
-                conf=conf[0].cpu().numpy().astype(np.float16),
+                # **float32, 不是 float16。** photo_keep_ratio 是按 conf 排序取前 r,
+                # 而 fp16 把 prob >= 0.99976 全部舍入成 1.0 —— 标定把概率整体推高
+                # (bias=+1.88) 之后并列会更多。并列一旦超过保留率, "取最高的 60%"
+                # 就退化成"按像素索引取前 60%", 也就是图像上的一条水平带。
+                # 2026-08-08 那次基线作废就是同一类故障 (光度门恒为 1.0)。
+                # 代价: 每个 scan 的 conf 多约 120MB (npz 压缩前), 可以接受。
+                conf=conf[0].cpu().numpy().astype(np.float32),
                 K=batch["intrinsics"][0, 0].float().cpu().numpy(),
                 E=batch["extrinsics"][0, 0].float().cpu().numpy(),
                 image=batch["images"][0, 0].permute(1, 2, 0).to(torch.uint8).cpu().numpy(),
@@ -678,6 +684,27 @@ def save_ply(path: Path, points: np.ndarray, colors: np.ndarray) -> None:
 
 
 @torch.no_grad()
+def _tie_report(scan_name: str, keep_ratio: float) -> None:
+    """报告固定保留率的门有多少名额是"并列后按索引发的"。
+
+    这个门要有意义, 前提是 conf 在被保留的那一档上**分得开**。全 1.0 的
+    置信度配 keep_ratio=0.6, 等于在图像上截一条水平带 —— 而且从点数、从
+    最终 acc/comp 上都看不出来。
+    """
+    den = getattr(fuse_scan, "tie_den", 0)
+    if not den:
+        return
+    frac = getattr(fuse_scan, "tie_num", 0) / den
+    fuse_scan.tie_num = fuse_scan.tie_den = 0
+    tag = "OK" if frac < 0.05 else ("注意" if frac < 0.30 else "**门是死的**")
+    print(f"[fuse] {scan_name}: 保留名额中 {100 * frac:.1f}% 落在并列组里 ({tag})")
+    if frac >= 0.30:
+        print(f"[fuse] WARNING: --photo-keep-ratio {keep_ratio} 的名额有 {100 * frac:.1f}% "
+              f"是按像素索引发的, 不是按置信度。这个门实际是死的, 点云只反映光栅"
+              f"顺序 —— 与 2026-08-08 那次基线作废 (光度门恒为 1.0) 同类。"
+              f"先查 conf 的分布再决定要不要用这批点云。")
+
+
 def fuse_scan(scan_dir: Path, args, device: torch.device) -> tuple[np.ndarray, np.ndarray]:
     """几何+光度一致性融合。``args.fusion == "dedup"`` 时额外做跨视角去重。
 
@@ -764,8 +791,16 @@ def fuse_scan(scan_dir: Path, args, device: torch.device) -> tuple[np.ndarray, n
             if vidx.numel():
                 k = int(math.ceil(keep_ratio * float(vidx.numel())))
                 k = max(1, min(k, int(vidx.numel())))
-                order = torch.argsort(conf_flat[vidx].float(), descending=True, stable=True)
+                cv_ = conf_flat[vidx].float()
+                order = torch.argsort(cv_, descending=True, stable=True)
                 photo_mask[vidx[order[:k]]] = True
+                # 选择边界落在并列组里的名额比例。conf 若大面积并列 (例如全 1.0),
+                # 这些名额实际是按像素索引发的, 而不是按置信度 —— 那样这个门就是
+                # 死的, 点云只反映光栅顺序。逐 ref 累计, 由调用方汇总报警。
+                thr = cv_[order[k - 1]]
+                n_above = int((cv_ > thr).sum())
+                fuse_scan.tie_num = getattr(fuse_scan, "tie_num", 0) + (k - n_above)
+                fuse_scan.tie_den = getattr(fuse_scan, "tie_den", 0) + k
         else:
             photo_mask = conf_flat > args.photo_thresh
         keep = (photo_mask & (n_geo >= args.geo_views) & valid_depth).view(H, W)
@@ -834,6 +869,7 @@ def run_fusion(out_root: Path, ply_dir: Path, args, device: torch.device) -> Pat
         out = ply_dir / f"mvsnet{scan_id:03d}_l3.ply"
         save_ply(out, pts, cols)
         print(f"[fuse] {sd.name}: {len(pts):,} points -> {out}")
+        _tie_report(sd.name, float(getattr(args, "photo_keep_ratio", 0.0) or 0.0))
     return ply_dir
 
 
