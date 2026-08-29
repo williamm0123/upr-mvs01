@@ -360,13 +360,18 @@ def run_compat() -> None:
         torch.save(_ck, _p)
         _ns = testmod.eval_namespace(ckpt=str(_p))
         _caller_cfg = replace(_cf, train=replace(_cf.train, amp_dtype="fp16"))
-        testmod.load_model(_caller_cfg, _ns, torch.device("cpu"))
+        _model, _ = testmod.load_model(_caller_cfg, _ns, torch.device("cpu"))
         _aligned = getattr(testmod.load_model, "last_cfg", None)
         assert _aligned is not None, "load_model 没有交出对齐后的 cfg"
         assert testmod.amp_dtype_of(_caller_cfg) is torch.float16
         assert testmod.amp_dtype_of(_aligned) is torch.bfloat16, \
             "load_model.last_cfg 的 amp_dtype 没跟着 checkpoint —— 这是 job 415228 的死因"
-    ok("load_model 交出对齐后的 cfg: 调用方 fp16 -> 对齐后 bf16")
+        # **这条才是真正管用的**: dtype 挂在 model 上, 调用方不可能忘了换。
+        # 415273 就是因为 test.py 自己的 main() 仍把没对齐的 cfg 传给
+        # run_inference —— 只断言 last_cfg 是抓不到那次的。
+        assert getattr(_model, "inference_amp_dtype", None) is torch.bfloat16, \
+            "load_model 没把 inference_amp_dtype 挂到 model 上 —— 这是 job 415273 的死因"
+    ok("load_model: last_cfg 与 model.inference_amp_dtype 都跟着 checkpoint 解析成 bf16")
 
 
 # ======================================================================== 10, 11

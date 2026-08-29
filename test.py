@@ -420,6 +420,11 @@ def load_model(cfg, args, device: torch.device) -> tuple[UprMVSNet, Path]:
     # dtype, 而它的 cfg 是原始 build_mvs_config (amp_dtype='fp16'), 于是"跟着
     # checkpoint 走"的修复对它完全没生效, 又跑了一次全 nan。
     load_model.last_cfg = cfg
+    # **dtype 挂在 model 上**, 而不是只靠调用方记得去取对齐后的 cfg。
+    # 同一个 bug 已经咬了三次 (415038 / 415228 / 415273): 每次都是某个调用方
+    # 把没对齐的 cfg 往下传。model 是所有调用方**必然**持有的那个对象, 挂在
+    # 它身上就不会再有"某处忘了换"。
+    model.inference_amp_dtype = amp_dtype_of(cfg)
     print(f"[test] loaded {ckpt_path} (step {step}, best_metric {ckpt.get('best_metric', float('nan')):.4f})")
     return model, ckpt_path
 
@@ -525,9 +530,13 @@ def run_inference(model, ds, cfg, args, device, out_root: Path) -> dict:
     loader = DataLoader(ds, batch_size=1, shuffle=False,
                         num_workers=args.num_workers, collate_fn=_collate, pin_memory=True)
     use_amp = cfg.train.amp and device.type == "cuda"
-    amp_dtype = amp_dtype_of(cfg)
+    # 优先用 model 上那份 —— 它是 load_model 按 checkpoint fingerprint 定的。
+    # 退回 cfg 只是为了兼容不经 load_model 构造模型的调用方。
+    amp_dtype = getattr(model, "inference_amp_dtype", None) or amp_dtype_of(cfg)
     if use_amp:
-        print(f"[test] autocast dtype = {amp_dtype} (来自 checkpoint 的 amp_dtype)")
+        src = "model (来自 checkpoint fingerprint)" if hasattr(model, "inference_amp_dtype") \
+            else "调用方的 cfg —— 未经 load_model, 可能与训练不符"
+        print(f"[test] autocast dtype = {amp_dtype}  <- {src}")
     meter = ScanMeter()
     vis_count: dict[str, int] = defaultdict(int)
     mw = cfg.depth_range.mode_window
@@ -1029,6 +1038,9 @@ def main() -> None:
         print("[test] --priors-only: prior phase done, exiting before the MVS model")
         return
     model, ckpt_path = load_model(cfg, args, device)
+    # load_model 内部按 fingerprint 重建了 cfg, 但那只是它的局部名字。这里必须
+    # 换过来, 否则 manifest 记的是"调用方以为的配置"而不是实际跑的那份。
+    cfg = getattr(load_model, "last_cfg", cfg)
     # 在推理**之前**写: 跑到一半崩掉时, 目录里也留着谱系, 而不是留下一堆
     # 无法归属的 npz。
     write_run_manifest([out_root] + ([ply_dir] if args.fuse else []),

@@ -54,8 +54,10 @@ def collect(model, ds, cfg, args, device, tau_mm: float, stride: int):
     for i, batch in enumerate(loader):
         batch = {k: (v.to(device, non_blocking=True) if torch.is_tensor(v) else v)
                  for k, v in batch.items()}
-        # dtype 必须跟 checkpoint 走 (cfg 是 load_model 对齐过的那份, 见 main)。
-        with torch.autocast(device_type=device.type, dtype=testmod.amp_dtype_of(cfg),
+        # dtype 从 model 上取 —— load_model 按 checkpoint fingerprint 挂上去的。
+        with torch.autocast(device_type=device.type,
+                            dtype=getattr(model, "inference_amp_dtype", None)
+                            or testmod.amp_dtype_of(cfg),
                             enabled=(cfg.train.amp and device.type == "cuda")):
             out = model(batch)
         fc = out.get("fusion_conf")
@@ -69,7 +71,7 @@ def collect(model, ds, cfg, args, device, tau_mm: float, stride: int):
                                   ("fusion_conf.logit", fc["logit"]))
                    if not torch.isfinite(t).all()]
             if bad:
-                dt = testmod.amp_dtype_of(cfg)
+                dt = getattr(model, "inference_amp_dtype", None) or testmod.amp_dtype_of(cfg)
                 raise SystemExit(
                     f"第一个样本的 {', '.join(bad)} 含非有限值 (autocast dtype={dt})。\n"
                     f"不要继续标定 —— 先定位:\n"
