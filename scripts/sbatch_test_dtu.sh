@@ -6,8 +6,8 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=96G
-#SBATCH --qos=long
-#SBATCH --time=12:00:00
+#SBATCH --qos=normal
+#SBATCH --time=3:00:00
 #SBATCH --chdir=/scr/user/qinglong/projects/upr-mvs01
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err
