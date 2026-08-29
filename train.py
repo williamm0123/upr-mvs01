@@ -475,7 +475,9 @@ def _ensure_priors(cfg, device, overwrite: bool = False) -> None:
             mode=mode,
         )
         print(f"[pre_prior] ensuring priors for {split} split ({len(ds)} samples)")
-        build_prior_cache(ds, device, overwrite=overwrite, image_target_wh=cfg.prior.target_wh)
+        build_prior_cache(ds, device, overwrite=overwrite,
+                          image_target_wh=cfg.prior.target_wh,
+                          prior_method=getattr(cfg.prior, 'method', 'residual'))
 
 
 # --------------------------------------------------------------------------- #
@@ -1816,11 +1818,11 @@ def main() -> None:
                         help="余弦退火 horizon (默认=实际训练步数)。12k 筛选应设 30000, "
                              "这样选中的 checkpoint 能无 lr 跳变续训到 30k。")
     parser.add_argument("--prior-target-w", type=int, default=None,
-                        help="VGGT/DA3 prior width override (default 518; must be a multiple of 14). "
+                        help="VGGT/DA3 prior width override (default 798; must be a multiple of 14). "
                              "Raises true depth-prior resolution at VGGT compute/memory cost. "
                              "Changing it needs --build-priors force to rebuild the cache.")
     parser.add_argument("--prior-target-h", type=int, default=None,
-                        help="VGGT/DA3 prior height override (default 420; must be a multiple of 14)")
+                        help="VGGT/DA3 prior height override (default 602; must be a multiple of 14)")
     parser.add_argument("--master-port", type=str, default="29500")
     parser.add_argument("--resume", choices=["auto", "off"], default="auto",
                         help="auto: continue from log/experiments/<run>/model/latest.pth; off: always start fresh")

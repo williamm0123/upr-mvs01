@@ -60,6 +60,15 @@ mode='train' 才有 7 个光照, 否则只有 light 3。想补 test 就得换 li
 来源记在 npz 的 ``scale_source`` (0 自有 / 1 换光照 / 2 借邻视角) +
 ``scale_light`` + ``scale_ref_view`` 里, 也逐样本写进 CSV。
 
+## 2026-08-30: 残差场 prior + 798x602
+
+``--prior-method residual`` (新默认) 换掉了法向 Poisson 填充, 见
+``models/residual_field.py``; ``--target-w/h`` 默认 518x420 -> 798x602。两者都让
+旧缓存不可比, 所以**必须换输出目录** (``--cache-dir``), 训练侧用环境变量
+``UPRMVS_PRIOR_CACHE`` 指到同一个目录。实测 (RTX 5060 Ti, 5 视角, resize 0.5)
+约 9s/样本、显存峰值 9.0 GiB —— 下面表格里的"预估"列还是按旧配置的 3.3s 算的,
+只当下限看。
+
 ## 用法
 
     python scripts/build_prior_cache_all.py --dry-run          # 只报缺口和预估
@@ -105,6 +114,9 @@ from models.pre_prior import (PIPELINE_VERSION, PriorPrecomputer,
 # 每样本耗时/体积的经验值 (RTX 5060 Ti, nviews=5, 2026-08-15 实测), 只用来给
 # --dry-run 报预估; 真实 ETA 跑起来后按实际速率算。体积几乎和 resize 无关 ——
 # 先验是从 518x420 升采样上来的平滑图, 存 1200x1600 也就比 600x800 大一点点。
+# 518x420 / 3 视角 / 法向 Poisson 填充下的实测值。798x602 + 5 视角 + 残差场
+# 会明显更慢 (VGGT token 数 2.2x, 全局注意力 ~O((V*token)^2)), 预估只当下限看,
+# 真实速度以跑起来后 [build] 行里的 s/个 为准。
 SEC_PER_SAMPLE = {0.5: 3.3, 1.0: 4.2}
 MB_PER_SAMPLE = {0.5: 3.7, 1.0: 3.8}
 ALL_LIGHTS = tuple(range(7))
@@ -307,8 +319,18 @@ def main() -> None:
     ap.add_argument("--num-views", type=int, default=None,
                     help="1 ref + (N-1) src, 默认取 cfg.train.num_views。只影响先验"
                          "*质量* (src 越多 SfM 三角化点越多), 不是兼容性判据")
-    ap.add_argument("--target-w", type=int, default=518)
-    ap.add_argument("--target-h", type=int, default=420)
+    ap.add_argument("--target-w", type=int, default=798,
+                    help="VGGT/DA3 实际跑的宽 (必须是 14 的倍数)。798=57*14")
+    ap.add_argument("--target-h", type=int, default=602,
+                    help="VGGT/DA3 实际跑的高 (必须是 14 的倍数)。602=43*14")
+    ap.add_argument("--cache-dir", default="",
+                    help="缓存输出目录, 覆盖 ProjectPaths().prior_cache_path。"
+                         "换 prior 生成方式/分辨率时**必须**换目录 —— 文件名两者都"
+                         "不编码。训练侧用环境变量 UPRMVS_PRIOR_CACHE 指向同一个目录")
+    ap.add_argument("--prior-method", choices=["residual", "normal_fill"],
+                    default="residual",
+                    help="residual(默认)=低频残差场 (models/residual_field.py); "
+                         "normal_fill=旧的法向约束 Poisson 填充, 只为配对消融保留")
     ap.add_argument("--redo-unscaled", action="store_true",
                     help="把已存在但 sfm_valid=0 的样本也重建 (当前 2336 个)")
     ap.add_argument("--force", action="store_true", help="忽略已有文件, 全部重算")
@@ -350,7 +372,7 @@ def main() -> None:
     cfg = build_mvs_config(profile=args.profile)
     paths = ProjectPaths()
     root = Path(cfg.paths.dtu_train_root)
-    cache = Path(paths.prior_cache_path)
+    cache = Path(args.cache_dir) if args.cache_dir else Path(paths.prior_cache_path)
     nviews = args.num_views or cfg.train.num_views
     twh = (args.target_w, args.target_h)
     si, sn = (int(x) for x in args.shard.split("/"))
@@ -391,6 +413,7 @@ def main() -> None:
 
     print(f"[build] === prior cache 补全 ===")
     print(f"[build] 缓存目录 {cache}")
+    print(f"[build] prior 生成方式 = {args.prior_method}")
     print(f"[build] scans={len(scans)}  ref_views={len(pairs)}  num_views={nviews} "
           f"(1 ref + {nviews-1} src)  target_wh={twh}  pipeline_version={PIPELINE_VERSION}")
     print(f"[build] 光照策略={args.lights}  分辨率倍率={resize}  检查方式={args.check}"
@@ -532,7 +555,8 @@ def main() -> None:
     print(f"[build] 尺度回退: {args.scale_fallback}  min_pairs={args.min_pairs}")
     print(f"[build] 装 VGGT + DA3 ...", flush=True)
 
-    pre = PriorPrecomputer(torch.device(args.device), image_target_wh=twh)
+    pre = PriorPrecomputer(torch.device(args.device), image_target_wh=twh,
+                           prior_method=args.prior_method)
     n_own = n_light = n_neighbor = n_unresolved = n_rejected = failed = 0
     errors: list[str] = []
     # 本 scan 里换光照也救不回来的, 攒到 scan 结束再借邻视角 (那时前后视角都建好了)

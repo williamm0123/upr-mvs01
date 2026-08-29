@@ -30,7 +30,8 @@ from depth_anything_3.api import DepthAnything3
 from base.config import ProjectPaths
 from data.camera_utils import  project_world_points_to_depth, backproject_depth_to_world_points
 
-from models.conf import compute_confidence,camera_rays
+from models.conf import compute_confidence, compute_confidence_residual, camera_rays
+import models.residual_field as RF
 import data.camera_utils as C
 import models.sfm as S
 
@@ -664,7 +665,17 @@ def generate_priors_from_sample(
     vggt_model=None,
     da3_model=None,
     scale_mode: str = "scale",
+    prior_method: str = "residual",
+    residual_config: "RF.ResidualFieldConfig | None" = None,
 ):
+    """``prior_method``:
+
+    * ``"residual"`` (默认, 2026-08-30 起): 思路三 —— 全局鲁棒 affine 把 DA3 对齐
+      到 VGGT, 再在 1/8 网格上解一个归一化逆深度域的低频残差场。VGGT 的高频噪声
+      在表达能力上就进不了输出。见 :mod:`models.residual_field`。
+    * ``"normal_fill"``: 旧的法向约束 Poisson 填充 (anchor_weight=100 +
+      hard_keep_sparse)。保留只为做配对消融, 不建议再用来建缓存。
+    """
     paths = ProjectPaths()
     # Preloaded models can be passed in (offline precompute loads them once);
     # otherwise fall back to loading per call as before.
@@ -681,47 +692,60 @@ def generate_priors_from_sample(
     pred = _run_vggt(vggt_model, images_resized.clamp(0,255)/255.0, device)
     pred["images_uint8"] = images_uint8
     
-    ## conf filtering
-    points = np.asarray(pred["world_points"])
-    conf = np.asarray(pred["world_points_conf"])
-    colors = np.asarray(pred.get("images_uint8", np.zeros(points.shape[:-1] + (3,), dtype=np.uint8)))
-    ref_points = points[0]
-
-    flat_ref_points = ref_points.reshape(-1, 3)
-    flat_ref_conf = conf[0].reshape(-1)
-   
-    threshold_ref    = float(np.percentile(flat_ref_conf, conf_percentile))
-    keep_ref = flat_ref_conf >= threshold_ref
-  
-    points_ref_kept = flat_ref_points[keep_ref].astype(np.float32)
-    
-    voxel_size = _estimate_voxel_size(points_ref_kept,VoxelDedupConfig.auto_scale,VoxelDedupConfig.auto_sample)
-    points_ref_denoised,conf_ref_denoised,info = voxel_dedup_pointcloud(points_ref_kept, 
-        flat_ref_conf[keep_ref],  voxel_size)
-
-    # depth_denoised
-    depth_ref_denoised , conf_ref_denoised = project_world_points_to_depth(
-        points_ref_denoised,conf_ref_denoised, pred["intrinsics"][0] ,pred["extrinsics"][0], image_target_wh)
-    #depth_da3
-
+    points = np.asarray(pred["world_points"])          # [V,H,W,3] 世界系
+    conf = np.asarray(pred["world_points_conf"])       # [V,H,W]
     depth_da3 = _get_depth_da3(images_resized[0], da3_model, max(image_target_wh))
+    method_info: dict[str, Any] = {}
 
-    depth_filled,norm_da3 = fill_vggt_depth_by_da3_normals(depth_ref_denoised, depth_da3, pred["intrinsics"][0])
-    norm_filled = depth_to_camera_normals(depth_filled, pred["intrinsics"][0])
-    # points_filled = backproject_depth_to_world_points(depth_filled, pred["intrinsics"][0], pred["extrinsics"][0])
-    
-    conf_map,conf_info = compute_confidence(
-        depth_v=depth_ref_denoised,
-        conf_v=conf_ref_denoised,
-        depth_f=depth_filled,
-        normal_a= norm_da3,
-        normal_f=norm_filled,
-        intrinsic=pred["intrinsics"][0],
-        rgb=images_uint8[0],
-    )
-    
-  
-  
+    if prior_method == "residual":
+        # 思路三: VGGT 只能通过低频残差场影响 DA3, 不写回任何像素。
+        # 这里把**全部 V 个视角**的世界点投到参考相机 —— 旧路径只用 points[0],
+        # 其余 V-1 个视角整个丢掉, 而它们是这条管线里唯一独立于参考视角 VGGT
+        # 预测的几何证据 (跨视角一致性权重 + 按视角切的 held-out 都靠它)。
+        rf = RF.build_residual_field_prior(
+            points_world=points,
+            conf=conf,
+            depth_da3=depth_da3,
+            K_ref=pred["intrinsics"][0],
+            E_ref=pred["extrinsics"][0],
+            rgb=images_uint8[0],
+            target_wh=image_target_wh,
+            config=residual_config,
+        )
+        depth_filled = rf["depth"]
+        norm_da3 = rf["normal_da3"]
+        norm_filled = rf["normal_out"]
+        conf_map, conf_info = compute_confidence_residual(depth_filled, rf["info"])
+        method_info = {k: v for k, v in rf["info"].items()
+                       if np.isscalar(v) or isinstance(v, (int, float, str, bool))}
+    elif prior_method == "normal_fill":
+        flat_ref_points = points[0].reshape(-1, 3)
+        flat_ref_conf = conf[0].reshape(-1)
+        keep_ref = flat_ref_conf >= float(np.percentile(flat_ref_conf, conf_percentile))
+        points_ref_kept = flat_ref_points[keep_ref].astype(np.float32)
+        voxel_size = _estimate_voxel_size(points_ref_kept, VoxelDedupConfig.auto_scale,
+                                          VoxelDedupConfig.auto_sample)
+        points_ref_denoised, conf_ref_denoised, _ = voxel_dedup_pointcloud(
+            points_ref_kept, flat_ref_conf[keep_ref], voxel_size)
+        depth_ref_denoised, conf_ref_denoised = project_world_points_to_depth(
+            points_ref_denoised, conf_ref_denoised, pred["intrinsics"][0],
+            pred["extrinsics"][0], image_target_wh)
+        depth_filled, norm_da3 = fill_vggt_depth_by_da3_normals(
+            depth_ref_denoised, depth_da3, pred["intrinsics"][0])
+        norm_filled = depth_to_camera_normals(depth_filled, pred["intrinsics"][0])
+        conf_map, conf_info = compute_confidence(
+            depth_v=depth_ref_denoised,
+            conf_v=conf_ref_denoised,
+            depth_f=depth_filled,
+            normal_a=norm_da3,
+            normal_f=norm_filled,
+            intrinsic=pred["intrinsics"][0],
+            rgb=images_uint8[0],
+        )
+    else:
+        raise ValueError(f"unknown prior_method: {prior_method!r} "
+                         f"(expected 'residual' or 'normal_fill')")
+
     depth_filled,pred_ref_k = inverse_transform_map(depth_filled, ref_transform,pred["intrinsics"][0])
 
     conf_map = inverse_transform_map(conf_map,ref_transform)
@@ -754,4 +778,6 @@ def generate_priors_from_sample(
         # 未标尺先验。见 sfm.metric_scale_from_sparse。
         "sfm_scale": float(sfm_scale),
         "sfm_info": sfm_out["info"].get("scale", {}),
+        "prior_method": prior_method,
+        "method_info": method_info,
     }

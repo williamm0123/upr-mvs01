@@ -44,8 +44,23 @@ META_KEYS = ("sfm_valid", "sfm_scale", "sfm_num_pairs", "pipeline_version",
              # 只在 source>0 时有意义。**不 bump PIPELINE_VERSION**: 这几个键是
              # 增量的, 旧缓存缺了按 0.0 读 = "自有尺度", 语义正确; bump 会让全部
              # 28k 个缓存被判过期, 触发一次没必要的整轮重建。
-             "scale_source", "scale_light", "scale_ref_view")
-PIPELINE_VERSION = 3
+             "scale_source", "scale_light", "scale_ref_view",
+             # --- 2026-08-30 残差场 prior (pipeline_version=4) ---
+             # prior_method_id: 0 = 旧的法向约束 Poisson 填充 (旧缓存读到 0.0,
+             # 语义正确), 1 = 思路三低频残差场。其余 rf_* 是逐样本诊断量, 让
+             # scripts/audit_prior_cache.py 不用重跑 VGGT 就能判断这一版好不好:
+             #   rf_n_anchor  投进参考视角、过完遮挡剔除的锚点数
+             #   rf_n_fit     分层 FPS 选中做拟合的锚点数 (其余是 held-out)
+             #   rf_views     实际贡献锚点的视角数 (multiview 关掉时恒为 1)
+             #   rf_fit_mad   残差场拟合后的 MAD (归一化逆深度单位)
+             #   rf_support   控制网格上的平均支撑强度 [0,1]
+             #   rf_clamped   被正性/幅度守卫夹住的像素比例 —— 应当接近 0
+             "prior_method_id", "rf_n_anchor", "rf_n_fit", "rf_views",
+             "rf_fit_mad", "rf_support", "rf_clamped")
+# 4: 低频残差场取代法向 Poisson 填充 (models/residual_field.py), 且默认分辨率
+#    518x420 -> 798x602。两者都让旧缓存彻底不可比, 所以必须换 prior_cache_path
+#    (见 base/config.py 的 UPRMVS_PRIOR_CACHE)。
+PIPELINE_VERSION = 4
 
 
 def cache_signature(prior: dict) -> dict:
@@ -163,7 +178,8 @@ class PriorPrecomputer:
         device,
         image_mode: str = "resize",
         conf_percentile: float = 10.0,
-        image_target_wh: tuple[int, int] = (518, 420),
+        image_target_wh: tuple[int, int] = (798, 602),
+        prior_method: str = "residual",
     ) -> None:
 
 
@@ -182,6 +198,7 @@ class PriorPrecomputer:
         self.image_mode = image_mode
         self.conf_percentile = conf_percentile
         self.image_target_wh = image_target_wh
+        self.prior_method = prior_method
 
     def compute(self, precrop_sample: dict) -> dict:
         """precrop_sample needs ``images`` [V,C,H,W], ``intrinsics`` [V,3,3],
@@ -203,8 +220,10 @@ class PriorPrecomputer:
             image_target_wh=self.image_target_wh,
             vggt_model=self.vggt_model,
             da3_model=self.da3_model,
+            prior_method=self.prior_method,
         )
         info = priors.get("sfm_info", {}) or {}
+        mi = priors.get("method_info", {}) or {}
         return {
             "depth_prior": np.asarray(priors["depth_filled"], np.float32),
             "conf_prior": np.asarray(priors["conf_map"], np.float32),
@@ -219,6 +238,13 @@ class PriorPrecomputer:
             "target_h": float(self.image_target_wh[1]),
             "prior_h": float(priors["depth_filled"].shape[0]),
             "prior_w": float(priors["depth_filled"].shape[1]),
+            "prior_method_id": 1.0 if self.prior_method == "residual" else 0.0,
+            "rf_n_anchor": float(mi.get("n_anchor", 0)),
+            "rf_n_fit": float(mi.get("n_fit", 0)),
+            "rf_views": float(mi.get("n_views", 0)),
+            "rf_fit_mad": float(mi.get("fit_mad", 0.0)),
+            "rf_support": float(mi.get("support_mean", 0.0)),
+            "rf_clamped": float(mi.get("clamped_frac", 0.0)),
         }
 
 
@@ -242,8 +268,9 @@ def build_prior_cache(
     device,
     overwrite: bool = False,
     verbose: bool = True,
-    image_target_wh: tuple[int, int] = (518, 420),
+    image_target_wh: tuple[int, int] = (798, 602),
     fail_open: bool = False,
+    prior_method: str = "residual",
 ) -> int:
     """Populate the prior cache for every meta in ``dataset`` (run once, main process).
 
@@ -291,7 +318,8 @@ def build_prior_cache(
     if verbose:
         print(f"[pre_prior] building {len(pending)}/{n} priors at target_wh={image_target_wh} "
               f"(loading VGGT + DA3 once) ...")
-    precomputer = PriorPrecomputer(device, image_target_wh=image_target_wh)
+    precomputer = PriorPrecomputer(device, image_target_wh=image_target_wh,
+                                   prior_method=prior_method)
     built = failed = 0
     quarantine_log = []
     for idx in pending:

@@ -59,7 +59,12 @@ def _default_paths() -> dict[str, Path]:
             # VGGT/DA3 depth+conf priors, one npz per (scan, ref_view, light).
             # The filename encodes none of the resolutions it was built at, so a
             # changed --prior-resize-scale / --prior-target-* needs a force rebuild.
-            "prior_cache_path": project_path / "log/prior_cache",
+            # UPRMVS_PRIOR_CACHE 覆盖它 —— 建缓存 / 训练 / 审计 / test 全部从这里
+            # 取路径, 所以换一次环境变量四条路径同时改, 不会出现"用新缓存建、用旧
+            # 缓存训"的错配。换 prior 生成方式时**必须**换目录: 文件名不编码方法,
+            # 也不编码分辨率。
+            "prior_cache_path": Path(os.environ["UPRMVS_PRIOR_CACHE"])
+            if os.environ.get("UPRMVS_PRIOR_CACHE") else project_path / "log/prior_cache",
             # per-view depth/conf/K/E/image that fusion consumes, plus metrics.json,
             # under a <split>/ subdir. Kept after the run on purpose: re-fusing at
             # different --photo-thresh/--geo-* costs nothing while re-running
@@ -126,10 +131,21 @@ class PriorConfig:
 
     Both dims MUST be multiples of the backbone patch size (14); the DPT head
     reassembles on ``H//14`` patches and a non-multiple truncates / misaligns.
-    Defaults 518=37*14, 420=30*14.
+
+    2026-08-30 起默认 798x602 (= 57*14 x 43*14)。这是"600x800"能取到的最近的合法
+    尺寸 —— 800 和 600 都不是 14 的倍数。相对源图 1600x1200 的 4:3 有 0.6% 的各向
+    异性, ``image_mode="resize"`` 是逐轴仿射并逐轴改内参 (fx*=sx, fy*=sy), 所以几何
+    上是精确的, 只是图被轻微拉了一点。要严格 4:3 可以用 784x588 (=56*14 x 42*14)。
+
+    代价: token 数 37*30=1110 -> 57*43=2451 (2.2x), VGGT 的全局注意力是 V*token 上
+    的 O(n^2), 5 视角下约 12x 于旧配置。显存不够就先降 --target-w/h。
     """
-    target_w: int = 518
-    target_h: int = 420
+    target_w: int = 798
+    target_h: int = 602
+    # prior 生成方式, 见 models/norm_fill.generate_priors_from_sample:
+    #   residual    = 思路三低频残差场 (默认)
+    #   normal_fill = 旧的法向约束 Poisson 填充 (只为配对消融保留)
+    method: str = "residual"
 
     @property
     def target_wh(self) -> tuple[int, int]:

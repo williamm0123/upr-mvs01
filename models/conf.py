@@ -360,3 +360,77 @@ def compute_confidence(
         out["hypotheses"] = (1.0 / u_i).astype(np.float32)   # (N, H, W)
 
     return conf, out
+
+
+# ---------------------------------------------------------------------------
+# 残差场 prior 的置信度 (思路三)
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class ResidualConfConfig:
+    """``compute_confidence_residual`` 的超参。
+
+    旧的 :func:`compute_confidence` 整个建立在 M(anchor)/F(fill) 二分上:
+    ``c0[M]`` 给 anchor 一个 [0.5,1] 的高基带, ``c0[F]`` 给填充区 [0,0.5]。
+    残差场路径里**每个像素都是"填充"** —— 输出的高频全部来自 DA3, 锚点像素并不
+    比别处更可信 —— 那套划分没有意义了。这里换成四个连续因子。
+    """
+    support_n0: float = 4.0      # n_eff -> C_support 的尺度
+    lam: float = 4.0             # 测地距离衰减 (像素)
+    tau_fit: float = 0.08        # 归一化 rho 单位 (= 4 * huber_delta)
+    tau_hold: float = 0.10       # held-out 残差容忍
+    conf_floor: float = 0.02     # 全零 conf 会让下游 rho_eff 顶到上限, 留个地板
+    # 逆深度搜索半宽 (与 ConfidenceConfig 同义, 供下游沿用)
+    rho_min: float = 0.02
+    rho_max: float = 0.30
+    gamma: float = 1.75
+
+
+def compute_confidence_residual(
+    depth_r: np.ndarray,
+    diag: dict,
+    config: "ResidualConfConfig | None" = None,
+):
+    """C_prior = (C_support * C_distance * C_fit * C_holdout)^(1/4)。
+
+    ``diag`` 是 :func:`models.residual_field.build_residual_field_prior` 返回的
+    ``info``: ``n_eff_map`` / ``fit_err_map`` / ``holdout_err_map`` /
+    ``holdout_w_map`` / ``anchor_mask`` / ``edge_map``。
+
+    注意这里**不含** C_metric。标尺来源 (自有 / 换光照 / 借邻视角) 是整张图共享
+    的一个标量, 已经记在 npz 的 ``sfm_valid`` / ``scale_source`` 里, 网络按那个
+    走; 把它乘进逐像素 conf 会和 dtu.py 的固定保留率守卫互相干扰。
+    """
+    cfg = config or ResidualConfConfig()
+    d = np.asarray(depth_r, np.float32)
+    h, w = d.shape
+
+    c_support = (1.0 - np.exp(-np.asarray(diag["n_eff_map"], np.float32)
+                              / cfg.support_n0)).astype(np.float32)
+
+    g = _geodesic_to_anchor(np.asarray(diag["anchor_mask"], bool),
+                            np.asarray(diag["edge_map"], np.float32), cfg.lam)
+    c_dist = (1.0 / (1.0 + g / cfg.lam)).astype(np.float32)
+
+    c_fit = np.exp(-((np.asarray(diag["fit_err_map"], np.float32) / cfg.tau_fit) ** 2)
+                   ).astype(np.float32)
+
+    hold_w = np.asarray(diag["holdout_w_map"], np.float32)
+    c_hold = np.exp(-((np.asarray(diag["holdout_err_map"], np.float32) / cfg.tau_hold) ** 2)
+                    ).astype(np.float32)
+    # 没有 held-out 覆盖的地方它什么也没说 —— 置中性 1.0, 而不是 0
+    c_hold = np.where(hold_w > 1e-6, c_hold, 1.0).astype(np.float32)
+
+    conf = np.clip(c_support * c_dist * c_fit * c_hold, 0.0, 1.0) ** 0.25
+    conf = np.clip(conf, cfg.conf_floor, 1.0).astype(np.float32)
+
+    rho_eff = (cfg.rho_min + (cfg.rho_max - cfg.rho_min)
+               * (1.0 - conf) ** cfg.gamma).astype(np.float32)
+    d_safe = np.where(np.isfinite(d) & (d > 0), d, 1.0).astype(np.float32)
+    out = {
+        "d_min": (d_safe / (1.0 + rho_eff)).astype(np.float32),
+        "d_max": (d_safe / (1.0 - rho_eff)).astype(np.float32),
+        "rho_eff": rho_eff,
+        "factors": {"C_support": c_support, "C_distance": c_dist,
+                    "C_fit": c_fit, "C_holdout": c_hold, "g": g},
+    }
+    return conf, out
