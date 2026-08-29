@@ -414,6 +414,12 @@ def load_model(cfg, args, device: torch.device) -> tuple[UprMVSNet, Path]:
     # scripts 下四个调用方都在解包 2-tuple, 改成 3-tuple 会一起炸。
     load_model.last_meta = {k: ckpt.get(k) for k in
                             ("step", "best_metric", "best_metric_name", "fingerprint", "git")}
+    # **对齐后的 cfg 也必须交出来。** 上面那句 `cfg, has_spre = _align_cfg_to_ckpt(...)`
+    # 只是重新绑定了本函数的局部名字; 调用方手里的 cfg 仍是没对齐的那份。
+    # 2026-08-26 的 job 415228 就死在这: calibrate_conf 用 `amp_dtype_of(cfg)` 取
+    # dtype, 而它的 cfg 是原始 build_mvs_config (amp_dtype='fp16'), 于是"跟着
+    # checkpoint 走"的修复对它完全没生效, 又跑了一次全 nan。
+    load_model.last_cfg = cfg
     print(f"[test] loaded {ckpt_path} (step {step}, best_metric {ckpt.get('best_metric', float('nan')):.4f})")
     return model, ckpt_path
 

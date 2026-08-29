@@ -54,9 +54,7 @@ def collect(model, ds, cfg, args, device, tau_mm: float, stride: int):
     for i, batch in enumerate(loader):
         batch = {k: (v.to(device, non_blocking=True) if torch.is_tensor(v) else v)
                  for k, v in batch.items()}
-        # dtype 必须跟 checkpoint 走, 理由同 test.py: 默认 fp16 会让 CVPE 的
-        # 线性注意力在部署分辨率上溢出成 nan, 而 fit_platt 遇到 nan 会静默回退到
-        # (log_T=0, bias=0) —— 于是产出一个"标定过"却其实是恒等的 checkpoint。
+        # dtype 必须跟 checkpoint 走 (cfg 是 load_model 对齐过的那份, 见 main)。
         with torch.autocast(device_type=device.type, dtype=testmod.amp_dtype_of(cfg),
                             enabled=(cfg.train.amp and device.type == "cuda")):
             out = model(batch)
@@ -64,6 +62,19 @@ def collect(model, ds, cfg, args, device, tau_mm: float, stride: int):
         if fc is None:
             raise SystemExit(
                 "这个 checkpoint 没有融合置信度头 —— 训练时要加 --conf-head on。")
+        if i == 0:
+            # **第一个样本就查**, 不要跑完 833 个再报一屏 nan (job 415228 就是
+            # 跑满 40 分钟才在最后一步失败)。顺带把链上第一处非有限的位置指出来。
+            bad = [k for k, t in (("depth_full", out["depth_full"]),
+                                  ("fusion_conf.logit", fc["logit"]))
+                   if not torch.isfinite(t).all()]
+            if bad:
+                dt = testmod.amp_dtype_of(cfg)
+                raise SystemExit(
+                    f"第一个样本的 {', '.join(bad)} 含非有限值 (autocast dtype={dt})。\n"
+                    f"不要继续标定 —— 先定位:\n"
+                    f"  python scripts/probe_nonfinite.py --ckpt {args.ckpt} --compare\n"
+                    f"它会打印链上第一处非有限的张量, 并对同一批依次跑 fp16/bf16/fp32。")
         gt = batch["depth_gt"].float()
         m = batch["mask"].bool() & (gt > 0)
         dv = batch["depth_values"].float()
@@ -139,6 +150,10 @@ def main() -> None:
                                 cfg_override=a.cfg_override)
     ds = testmod.build_dataset(cfg, ns)
     model, ckpt_path = testmod.load_model(cfg, ns, device)
+    # **必须换成对齐后的 cfg**: load_model 内部按 fingerprint 重建了 cfg (amp_dtype
+    # 等), 但它只改了自己的局部名字。不换的话下面 collect() 里的 autocast dtype
+    # 用的还是 profile 默认的 fp16 —— job 415228 的直接死因。
+    cfg = getattr(testmod.load_model, "last_cfg", cfg)
     model.eval()
     meta = getattr(testmod.load_model, "last_meta", None) or {}
     if a.require_step is not None and int(meta.get("step", -1)) != int(a.require_step):

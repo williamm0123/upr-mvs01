@@ -319,6 +319,7 @@ def run_compat() -> None:
     # --- #9 fingerprint 往返 --------------------------------------------------
     import train as trainmod
     import test as testmod
+    from pathlib import Path
     cfg_on = _cfg(cvpe=True, conf_head=True)
     fp = trainmod._arch_fingerprint(cfg_on)
     for k in ("cvpe_enabled", "cvpe_d_model", "cvpe_num_planes", "cvpe_n_heads",
@@ -342,6 +343,30 @@ def run_compat() -> None:
                                        "auto", fingerprint=legacy)
     assert r2.cvpe.enabled is False, "没有 cvpe_* 字段的旧 fingerprint 必须恢复成 off"
     ok("旧 fingerprint (无 cvpe_* 字段) 恢复成 cvpe=off")
+
+    # --- load_model 必须把**对齐后**的 cfg 交出来 -----------------------------
+    # job 415228: load_model 内部 `cfg, has_spre = _align_cfg_to_ckpt(...)` 只重新
+    # 绑定了自己的局部名字, 调用方 (calibrate_conf) 手里的 cfg 仍是 profile 默认的
+    # amp_dtype='fp16'。于是"推理跟着 checkpoint 的 dtype 走"这条修复对它完全没
+    # 生效, 又白跑了一次 833 样本的全 nan。
+    import tempfile
+    with tempfile.TemporaryDirectory() as _d:
+        _cf = _cfg(cvpe=False, conf_head=True)
+        _net = UprMVSNet(_cf)
+        _fp = dict(trainmod._arch_fingerprint(_cf))
+        _fp["amp_dtype"] = "bf16"
+        _ck = {"model": _net.state_dict(), "step": 30000, "fingerprint": _fp}
+        _p = Path(_d) / "latest.pth"
+        torch.save(_ck, _p)
+        _ns = testmod.eval_namespace(ckpt=str(_p))
+        _caller_cfg = replace(_cf, train=replace(_cf.train, amp_dtype="fp16"))
+        testmod.load_model(_caller_cfg, _ns, torch.device("cpu"))
+        _aligned = getattr(testmod.load_model, "last_cfg", None)
+        assert _aligned is not None, "load_model 没有交出对齐后的 cfg"
+        assert testmod.amp_dtype_of(_caller_cfg) is torch.float16
+        assert testmod.amp_dtype_of(_aligned) is torch.bfloat16, \
+            "load_model.last_cfg 的 amp_dtype 没跟着 checkpoint —— 这是 job 415228 的死因"
+    ok("load_model 交出对齐后的 cfg: 调用方 fp16 -> 对齐后 bf16")
 
 
 # ======================================================================== 10, 11
