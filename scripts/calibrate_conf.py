@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 from pathlib import Path
@@ -53,7 +54,10 @@ def collect(model, ds, cfg, args, device, tau_mm: float, stride: int):
     for i, batch in enumerate(loader):
         batch = {k: (v.to(device, non_blocking=True) if torch.is_tensor(v) else v)
                  for k, v in batch.items()}
-        with torch.autocast(device_type=device.type,
+        # dtype 必须跟 checkpoint 走, 理由同 test.py: 默认 fp16 会让 CVPE 的
+        # 线性注意力在部署分辨率上溢出成 nan, 而 fit_platt 遇到 nan 会静默回退到
+        # (log_T=0, bias=0) —— 于是产出一个"标定过"却其实是恒等的 checkpoint。
+        with torch.autocast(device_type=device.type, dtype=testmod.amp_dtype_of(cfg),
                             enabled=(cfg.train.amp and device.type == "cuda")):
             out = model(batch)
         fc = out.get("fusion_conf")
@@ -165,6 +169,12 @@ def main() -> None:
     # 的概率 (|z| 大的时候尤其多), 而排序对并列不作保证, 于是并列元素的先后可能
     # 变, AURC 随之抖动一点点。这不是错误。真正的实现错误 (T 训进了模型、T 拟合
     # 成负数、误用了另一套 logit) 会让这两个数差好几个百分点, 相对 1e-3 足够抓。
+    for k in ("aurc_mm", "risk_at_0.6_mm", "ece", "brier"):
+        # nan 的比较恒为 False, 所以下面那条相对误差判据对全 nan 是**空的** ——
+        # 必须先单独查有限性, 否则一份全 nan 的报告会一路通过。
+        for tag, r in (("before", before), ("after", after)):
+            if not math.isfinite(r[k]):
+                raise SystemExit(f"[calib] {tag}[{k}] = {r[k]} —— 模型输出非有限, 先修那个。")
     for k in ("aurc_mm", "risk_at_0.6_mm"):
         ref = max(abs(before[k]), 1e-9)
         if abs(before[k] - after[k]) / ref > 1e-3:

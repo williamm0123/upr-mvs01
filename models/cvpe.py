@@ -117,18 +117,34 @@ class CamParamEncoder(nn.Module):
 
 
 class _LinearAttention(nn.Module):
-    """ELU(x)+1 的线性注意力。**不显式构造注意力矩阵**, 所以 8960 个 token 也放得下。"""
+    """ELU(x)+1 的线性注意力。**不显式构造注意力矩阵**, 所以 19200 个 token 也放得下。
+
+    **必须在 fp32 里算, 不能跟着外层 autocast。** ELU(x)+1 恒为正, 所以
+    ``k.sum(dim=1)`` 是 S 个正数相加 —— S 就是 token 数, 部署分辨率 (0.8 整幅)
+    下 p8 是 120x160 = 19200。接着 ``einsum(q, k.sum)`` 再对 d 求和, 量级约
+    8 x 19200 ~ 1.5e5, **超过 fp16 的 65504** 直接变 inf, 然后 ``inf * 0`` -> nan
+    传遍整个网络。2026-08-26 的 job 415038 就是这样: 22 个 scan 全 nan、点云 0 点。
+
+    根因已在 test.py 修掉 (推理跟着 checkpoint 的 amp_dtype 走 = bf16), 这里再
+    加一道: 这个求和的**量级正比于 token 数**, 换分辨率就换量级, 不该依赖外层
+    恰好给了哪个 dtype。代价可以忽略 —— [B,S,H,d] 在 fp32 下也就几 MB, 而同一
+    张卡上的 stage4 代价体是几个 GB。
+    """
 
     def __init__(self, eps: float = 1e-6) -> None:
         super().__init__()
         self.eps = eps
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-        q = F.elu(q) + 1.0
-        k = F.elu(k) + 1.0
-        kv = torch.einsum("nshd,nshm->nhmd", k, v)
-        z = 1.0 / (torch.einsum("nlhd,nhd->nlh", q, k.sum(dim=1)) + self.eps)
-        return torch.einsum("nlhd,nhmd,nlh->nlhm", q, kv, z).contiguous()
+        out_dtype = q.dtype
+        with torch.autocast(device_type=q.device.type, enabled=False):
+            q = F.elu(q.float()) + 1.0
+            k = F.elu(k.float()) + 1.0
+            v = v.float()
+            kv = torch.einsum("nshd,nshm->nhmd", k, v)
+            z = 1.0 / (torch.einsum("nlhd,nhd->nlh", q, k.sum(dim=1)) + self.eps)
+            y = torch.einsum("nlhd,nhmd,nlh->nlhm", q, kv, z)
+        return y.to(out_dtype).contiguous()
 
 
 class _AttentionLayer(nn.Module):

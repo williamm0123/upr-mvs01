@@ -72,6 +72,12 @@ def _cfg(cvpe: bool = False, conf_head: bool = False, geo_valid: bool = False) -
     return c
 
 
+def _arch_fp_min() -> dict:
+    """_align_cfg_to_ckpt 必读的那几个字段 (其余都有 .get 默认值)。"""
+    import train as trainmod
+    return trainmod._arch_fingerprint(_cfg())
+
+
 def _batch(B, V, H, W, device="cpu"):
     K = torch.eye(3).view(1, 1, 3, 3).repeat(B, V, 1, 1)
     K[:, :, 0, 0] = K[:, :, 1, 1] = 2.8 * W
@@ -432,10 +438,61 @@ def run_smoke(cuda: bool = False) -> None:
     ok("cascade_confidence 在 train / test / models 三处是同一个对象")
 
     if not cuda:
-        print("  [--] 跳过 CUDA BF16 smoke (加 --cuda 开启)")
+        print("  [--] 跳过 CUDA smoke (加 --cuda 开启)")
         return
     if not torch.cuda.is_available():
         raise SystemExit("--cuda 但没有可用的 GPU")
+
+    # ---- 回归守卫: **部署 token 数**下的三种 dtype ---------------------------
+    # job 415038 (2026-08-26): 22 个 scan 全 nan、点云 0 点。根因是 test.py 的
+    # autocast 没传 dtype (CUDA 上默认 fp16) 而模型是 bf16 训的, CVPE 的线性
+    # 注意力对 S 个 token 求和, 0.8 整幅下 S=19200, einsum(q, k.sum) 约 1.5e5
+    # **溢出 fp16** -> inf -> nan。
+    # 之所以没被之前的 smoke 抓到: 那里是 64x80 -> p8 = 8x10 = 80 个 token,
+    # 比部署少 240 倍。**这条必须用真实的部署尺寸**, 小张量在这里是测不出来的。
+    _h, _w = (1200 * 8 // 10) // 8, (1600 * 8 // 10) // 8      # 0.8 整幅的 p8
+    _cv = CrossViewPE(in_channels=128).to("cuda").eval()
+    torch.nn.init.xavier_uniform_(_cv.out_proj.weight)          # 跨出零初始化
+    _p8 = torch.randn(1, 3, 128, _h, _w, device="cuda")
+    _K = torch.eye(3, device="cuda").view(1, 1, 3, 3).repeat(1, 3, 1, 1)
+    _K[:, :, 0, 0] = _K[:, :, 1, 1] = 1200.0
+    _K[:, :, 0, 2], _K[:, :, 1, 2] = _w * 8 / 2, _h * 8 / 2
+    _E = torch.eye(4, device="cuda").view(1, 1, 4, 4).repeat(1, 3, 1, 1)
+    _E[:, 1:, 0, 3] = torch.tensor([40.0, -55.0], device="cuda")
+    _kw = dict(K=_K, E=_E, depth_min=torch.full((1,), D_MIN, device="cuda"),
+               depth_max=torch.full((1,), D_MAX, device="cuda"), feature_stride=8)
+    _ref = None
+    for _nm, _dt in (("fp32", None), ("bf16", torch.bfloat16), ("fp16", torch.float16)):
+        with torch.no_grad():
+            if _dt is None:
+                _d = _cv(p8=_p8, **_kw)
+            else:
+                with torch.autocast("cuda", dtype=_dt):
+                    _d = _cv(p8=_p8, **_kw)
+        _d = _d.float()
+        assert torch.isfinite(_d).all(), \
+            f"CVPE 在部署 token 数 ({_h}x{_w}={_h * _w}) 下 {_nm} 出现非有限值"
+        if _ref is None:
+            _ref = _d
+        else:
+            assert float((_d - _ref).abs().max() / _ref.abs().max()) < 0.05, f"{_nm} 与 fp32 偏差过大"
+    ok(f"CVPE 在部署 token 数 {_h}x{_w}={_h * _w} 下 fp32/bf16/fp16 全部有限且互相一致")
+    del _cv, _p8, _d, _ref
+    torch.cuda.empty_cache()
+
+    # ---- 推理侧的 autocast dtype 必须跟 checkpoint 走 -----------------------
+    import test as _tm
+    from dataclasses import replace as _rep
+    for _tag, _want in (("bf16", torch.bfloat16), ("fp16", torch.float16)):
+        _c = _rep(_cfg(), train=_rep(_cfg().train, amp_dtype=_tag))
+        assert _tm.amp_dtype_of(_c) is _want, f"amp_dtype_of({_tag}) != {_want}"
+    _fp = {"amp_dtype": "bf16"}
+    _restored, _ = _tm._align_cfg_to_ckpt(_rep(_cfg(), train=_rep(_cfg().train, amp_dtype="fp16")),
+                                          UprMVSNet(_cfg()).state_dict(), "auto",
+                                          fingerprint={**_arch_fp_min(), **_fp})
+    assert _tm.amp_dtype_of(_restored) is torch.bfloat16, \
+        "fingerprint 里的 amp_dtype=bf16 没有恢复到推理侧 —— 这正是 job 415038 的根因"
+    ok("推理的 autocast dtype 从 checkpoint fingerprint 恢复 (bf16), 不再用 CUDA 默认的 fp16")
     dev = torch.device("cuda")
     net = net.to(dev).train()
     batch = _batch(1, 3, 64, 80, device=dev)

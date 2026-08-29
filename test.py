@@ -281,6 +281,12 @@ def _resolve_ckpt(args) -> Path:
     )
 
 
+def amp_dtype_of(cfg) -> torch.dtype:
+    """与 train.py 的 ``_amp_dtype`` 同一口径。推理侧必须和训练侧用同一个。"""
+    return torch.bfloat16 if str(getattr(cfg.train, "amp_dtype", "fp16")).lower() == "bf16" \
+        else torch.float16
+
+
 def _align_cfg_to_ckpt(cfg, state: dict, override: str = "auto", fingerprint=None):
     """Checkpoints store weights only, never the config they were trained with,
     so architecture switches must be recovered from the key set. Currently that
@@ -338,6 +344,15 @@ def _align_cfg_to_ckpt(cfg, state: dict, override: str = "auto", fingerprint=Non
                                       fusion_conf=fingerprint.get("fusion_conf", False),
                                       fusion_conf_detach=fingerprint.get(
                                           "fusion_conf_detach", True)))
+        # **推理必须用训练时的 amp dtype。** torch.autocast 在 CUDA 上默认 fp16, 而
+        # 这些 checkpoint 是 bf16 训的。两者指数范围差了一个量级 (fp16 max 65504,
+        # bf16 与 fp32 同为 ~3.4e38), CVPE 的线性注意力要对 S 个 token 求和 ——
+        # 0.8 整幅下 p8 是 120x160 = 19200 个 token, `einsum(q, k.sum)` 再对 d=8
+        # 求和约 1.5e5, **直接溢出 fp16 变 inf**, 然后 inf*0 -> nan 传遍全网。
+        # 2026-08-26 的 job 415038 就是这样: 22 个 scan 全 nan、点云 0 点, 而训练
+        # 侧的 val 一切正常。
+        cfg = replace(cfg, train=replace(
+            cfg.train, amp_dtype=str(fingerprint.get("amp_dtype", "fp16"))))
         if fingerprint.get("tau_stages"):
             cfg = replace(cfg, depth_range=replace(
                 cfg.depth_range, tau_stages=tuple(fingerprint["tau_stages"])))
@@ -504,6 +519,9 @@ def run_inference(model, ds, cfg, args, device, out_root: Path) -> dict:
     loader = DataLoader(ds, batch_size=1, shuffle=False,
                         num_workers=args.num_workers, collate_fn=_collate, pin_memory=True)
     use_amp = cfg.train.amp and device.type == "cuda"
+    amp_dtype = amp_dtype_of(cfg)
+    if use_amp:
+        print(f"[test] autocast dtype = {amp_dtype} (来自 checkpoint 的 amp_dtype)")
     meter = ScanMeter()
     vis_count: dict[str, int] = defaultdict(int)
     mw = cfg.depth_range.mode_window
@@ -512,9 +530,16 @@ def run_inference(model, ds, cfg, args, device, out_root: Path) -> dict:
         scan, light_idx, ref_view, src_views = ds.metas[i]
         batch = {k: (v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v)
                  for k, v in batch.items()}
-        with torch.autocast(device_type=device.type, enabled=use_amp):
+        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
             outputs = model(batch)
         pred = outputs["depth_full"].float()
+        if i == 0 and not torch.isfinite(pred).any():
+            # 早停在第一个样本, 而不是跑完 1078 个再报一屏 nan。
+            raise SystemExit(
+                "第一个样本的 depth_full 全部非有限。常见原因: autocast dtype 与训练"
+                f" 不符 (当前 {amp_dtype}), 或 checkpoint 本身含 nan。\n"
+                "  先查权重: python -c \"import torch;ck=torch.load(...,weights_only=False);"
+                "print([k for k,v in ck['model'].items() if not torch.isfinite(v).all()][:5])\"")
         fc = outputs.get("fusion_conf")
         if args.conf_source == "learned" and fc is None:
             raise SystemExit("--conf-source learned 但这个 checkpoint 没有融合置信度头 "

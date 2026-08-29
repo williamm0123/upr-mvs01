@@ -286,6 +286,14 @@ def fit_platt(logit: torch.Tensor, label: torch.Tensor,
     y = label.detach().float().flatten().cpu()
     if z.numel() == 0:
         return 0.0, 0.0
+    # 非有限输入必须**报错**而不是回退。回退到 (0, 0) 会产出一个"标定过"却其实是
+    # 恒等的 checkpoint, 下游 test.py 打印 `learned(T=1.000,b=+0.000)` 看起来完全
+    # 正常 —— job 415038 就是这么过去的。
+    nz = int((~torch.isfinite(z)).sum())
+    if nz:
+        raise ValueError(
+            f"fit_platt 收到 {nz}/{z.numel()} 个非有限 logit。模型在这个口径下输出了 "
+            f"nan/inf, 先修那个, 不要标定。常见原因: 推理的 autocast dtype 与训练不符。")
     log_t = torch.zeros((), requires_grad=True)
     bias = torch.zeros((), requires_grad=True)
     opt = torch.optim.LBFGS([log_t, bias], max_iter=int(max_iter),
