@@ -6,8 +6,8 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
-#SBATCH --qos=long
-#SBATCH --time=2-00:00:00
+#SBATCH --qos=normal
+#SBATCH --time=8:00:00
 #SBATCH --chdir=/scr/user/qinglong/projects/upr-mvs01
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err
@@ -58,7 +58,7 @@ export PRIOR_CACHE=${PRIOR_CACHE:-$PROJECT_DIR/log/prior_cache_DA_vggt}
 export UPRMVS_PRIOR_CACHE="$PRIOR_CACHE"
 export PYTHONPATH="$PROJECT_DIR/models:${PYTHONPATH:-}"
 
-SCANS=${SCANS:-81-128}
+SCANS=${SCANS:-90-128}
 NUM_VIEWS=${NUM_VIEWS:-5}
 TARGET_W=${TARGET_W:-784}
 TARGET_H=${TARGET_H:-588}
