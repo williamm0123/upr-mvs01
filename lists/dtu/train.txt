@@ -8,6 +8,9 @@ scan18
 scan19
 scan20
 scan22
+scan25
+scan26
+scan27
 scan30
 scan31
 scan36
@@ -22,6 +25,7 @@ scan50
 scan51
 scan52
 scan53
+scan54
 scan55
 scan57
 scan58
@@ -35,6 +39,7 @@ scan69
 scan70
 scan71
 scan72
+scan73
 scan74
 scan76
 scan83
