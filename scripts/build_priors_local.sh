@@ -34,7 +34,7 @@ PY="${PY:-$HOME/miniconda3/envs/$CONDA_ENV/bin/python}"
 export UPRMVS_PRIOR_CACHE="${PRIOR_CACHE:-$REPO_ROOT/log/prior_cache_DA_vggt}"
 export PYTHONPATH="$REPO_ROOT/models:${PYTHONPATH:-}"
 
-SCANS="${SCANS:-1-128}"
+SCANS="${SCANS:-1-89}"
 NUM_VIEWS="${NUM_VIEWS:-5}"
 TARGET_W="${TARGET_W:-784}"
 TARGET_H="${TARGET_H:-588}"
