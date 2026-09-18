@@ -258,11 +258,10 @@ class DinoSVA(nn.Module):
 
     DINOv3 stays frozen: gradients start at ``fusion.in_proj``.
 
-    ``sva_cfg.full`` switches on MVSFormer++'s complete SVA (models/sva.py): the
-    projection to the FPN width becomes proj + two deconvs instead of a 1x1
-    conv, and a 1/8-scale ``hr`` stage (normalized 2D-PE + self/cross linear
-    attention) is added, which the network hooks onto the FPN's p8 injection
-    point via ``refine_p8``.
+    ``sva_cfg.full`` switches the projection to the FPN width from a 1x1 conv to
+    MVSFormer++'s proj + two deconvs (``models/sva.SVADeconv``). The rest of the
+    complete SVA — FMT on the 1/8 FPN output plus the second pathway — lives in
+    ``models/sva.SVAPathway`` and runs after the FPN, as in MVSFormer++.
     """
 
     def __init__(self, cfg: SPREConfig, dino_cfg: DINOConfig, weights_file,
@@ -283,16 +282,10 @@ class DinoSVA(nn.Module):
         self.full_sva = bool(sva_cfg is not None and sva_cfg.full)
         if self.full_sva and not fpn_channels:
             raise ValueError("sva.full 需要 feed_fpn (第二段 SVA 作用在融合了 DINO 的 1/8 特征上)")
-        self.to_fpn = self.deconv = self.hr = None
+        self.to_fpn = self.deconv = None
         if self.full_sva:
-            from models.sva import HighResSVA, SVADeconv
+            from models.sva import SVADeconv
             self.deconv = SVADeconv(self.out_dim, fpn_channels)
-            self.hr = HighResSVA(
-                fpn_channels, heads=int(sva_cfg.hr_heads),
-                layer_names=tuple(x.strip() for x in str(sva_cfg.hr_layers).split(",")),
-                mlp_ratio=float(sva_cfg.hr_mlp_ratio),
-                pe_max_shape=tuple(sva_cfg.pe_max_shape),
-            )
         elif fpn_channels:
             # 1x1 to the FPN's width, applied on the patch grid: a pointwise conv
             # commutes exactly with bilinear upsampling, so projecting 26x32 instead
@@ -338,10 +331,6 @@ class DinoSVA(nn.Module):
         if tuple(x.shape[-2:]) != tuple(target_hw):
             x = F.interpolate(x, size=target_hw, mode="bilinear", align_corners=False)
         return x.reshape(B, V, -1, *target_hw)
-
-    def refine_p8(self, p8: torch.Tensor) -> torch.Tensor:
-        """完整 SVA 的第二段: [B, V, C, h8, w8] -> 同形状。只在 ``full_sva`` 时有意义。"""
-        return self.hr(p8)
 
 
 class SPRE(nn.Module):

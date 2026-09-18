@@ -20,8 +20,8 @@
 #   sbatch scripts/sbatch_1gpu.sh                 # 默认 ARM=sva, 30k 步
 #
 # 当前主线 ARM=sva (2026-09-18, 定义在 scripts/_arm_common.sh):
-#   * MVSFormer++ 完整 SVA: DINO SVA -> deconv -> + FPN p8 -> normalized 2D-PE
-#     -> self/cross x2 -> FPN top-down
+#   * MVSFormer++ 完整 SVA: DINO SVA -> deconv -> + FPN 1/8 -> 普通 FPN (out0 头)
+#     -> FMT_with_pathway (1/8 上 2D-PE + self/cross x2, 再加第二条逐级路径)
 #   * stage1 候选 44 global + 4 local (RANGE_MIN_GI 已按 43/31 换算)
 #   * CVPE 已卸载; 其余沿用 vNext 基座 (legacy_depth / expect / geo_valid / conf_head)
 # 其它 arm (w0/w1/w3/w3b) 仍可用: ARM=w0 sbatch scripts/sbatch_1gpu.sh
@@ -31,11 +31,13 @@
 #
 # -----------------------------------------------------------------------------
 # 批量: per-GPU = 全局 = 4 (PER_GPU_BATCH)。lr 按 sqrt(全局/2) 自 3e-4 缩放 = 4.243e-4。
-# 本机 (5060 Ti) 在 320x448 上实测: 完整 SVA 让每样本显存 +10.5%
-# (3.49 -> 3.86 GiB); 外推到 640x896 x batch 4 约 60 GiB allocated, 80GB 卡够用。
+# 本机 (5060 Ti) 在 320x448 上实测: 完整 SVA 让每样本显存 +17%
+# (3.49 -> 4.09 GiB; 大头是第二条路径在全分辨率上的 128 通道 3x3 conv)。
+# 外推到 640x896 x batch 4 约 63 GiB allocated (~80%), 80GB 卡够用但余量不大 ——
+# 以 smoke_interactive.sh 的 [3] 实测为准, 超过 90% 就 PER_GPU_BATCH=3。
 #
 # 速度参考: 旧 W0 基座 batch 4 单卡 30k 约 18.6 h; 完整 SVA 多了 1/8 上四层线性
-# 注意力, 预计慢 10-20%。--time 给 2 天, --qos=long。
+# 注意力和一条全分辨率路径, 预计慢 10-25%。--time 给 2 天, --qos=long。
 #
 # 输出: log/experiments/$RUN_NAME/{model,tensorboard}; 已存在的同名目录会被
 # **归档** (移到 log/experiments/_archive/, 不删除)。

@@ -84,9 +84,14 @@ class UprMVSNet(nn.Module):
                 f"depth_range.num_global+num_local={expected_d1}"
             )
 
+        # 完整 SVA 时普通 FPN 的 1/8 输出头换成 MVSFormer++ 的 out0 (1x1+BN+SiLU),
+        # 它就是 FMT 的输入; 关闭时构造与改动前逐位一致。
+        _sva = getattr(self.cfg, "sva", None)
+        self.full_sva = bool(_sva is not None and _sva.full)
         self.fpn = MultiViewFPN(
             out_channels=fpn_cfg.out_channels,
             base_channel=fpn_cfg.base_channel,
+            stage1_head="out0" if self.full_sva else "smooth",
         )
         fpn_c = fpn_cfg.out_channels
 
@@ -254,11 +259,10 @@ class UprMVSNet(nn.Module):
                 "dino_mode != 'off' 但 feed_fpn=False 且 reliability_source != 'spre' "
                 "—— DINO 会被加载却无人使用。请设 dino_mode='off'。"
             )
-        # MVSFormer++ 完整 SVA (deconv + 1/8 的 2D-PE + self/cross)。第二段作用在
-        # 融合了 DINO 的 p8 上, 所以必须有 DINO 且喂 FPN; 否则直接报错而不是静默
-        # 退回旧的 1x1 投影。
+        # MVSFormer++ 完整 SVA: DINO SVA -> deconv -> + FPN 1/8 -> 普通 FPN (out0)
+        # -> SVAPathway (FMT + 第二条逐级路径)。DINO 特征要先进 FPN, 所以必须有
+        # DINO 且喂 FPN; 否则直接报错而不是静默退回旧的 1x1 投影。
         sva_cfg = getattr(self.cfg, "sva", None)
-        self.full_sva = bool(sva_cfg is not None and sva_cfg.full)
         if self.full_sva and not (self.dino_enabled and self.feed_fpn):
             raise ValueError(
                 "sva.full=True 需要 dino_mode != 'off' 且 feed_fpn=True "
@@ -273,10 +277,20 @@ class UprMVSNet(nn.Module):
             # 只在真的要用时实例化: 多卡 DDP 用 find_unused_parameters=False,
             # 建了却不 forward 的参数会在 reduction 时报错。
             self.spre = SPRE(self.cfg.spre, self.dino_sva.out_dim) if self.spre_enabled else None
+        self.sva_pathway = None
+        if self.full_sva:
+            from models.sva import SVAPathway
+            self.sva_pathway = SVAPathway(
+                fpn_c, heads=int(sva_cfg.hr_heads),
+                layer_names=tuple(x.strip() for x in str(sva_cfg.hr_layers).split(",")),
+                mlp_ratio=float(sva_cfg.hr_mlp_ratio),
+                pe_max_shape=tuple(sva_cfg.pe_max_shape),
+                strides=self.fpn_stage_strides,
+            )
 
         # ---- CVPE: 2026-09-18 已卸载 ------------------------------------------
-        # models/cvpe.py 保留, 但网络不再构造也不再调用它; p8 注入点现在给完整
-        # SVA 的第二段用。enabled=True 直接报错 —— 静默忽略的话, 旧 vNext 的
+        # models/cvpe.py 保留, 但网络不再构造也不再调用它, FPN 上给它开的 p8 回调
+        # 也已删除。enabled=True 直接报错 —— 静默忽略的话, 旧 vNext 的
         # checkpoint 会被当成"没有 CVPE 的模型"加载, 跑出另一个模型的点云。
         cvpe_cfg = getattr(self.cfg, "cvpe", None)
         if cvpe_cfg is not None and bool(cvpe_cfg.enabled):
@@ -485,11 +499,12 @@ class UprMVSNet(nn.Module):
         dino_fpn = (self.dino_sva.fpn_feature(fused, grid, coarse_hw)
                     if self.feed_fpn else None)
 
-        # 完整 SVA 的第二段挂在 FPN 的 1/8 注入点上 (DINO 之后、top-down 之前):
-        # p8 (= FPN 1/8 + deconv 上来的 DINO) -> 2D-PE -> self/cross 注意力, 然后
-        # 沿 p8->p4->p2->p1 传遍四级, 与 MVSFormer++ 的 FMT_with_pathway 同构。
-        p8_fn = self.dino_sva.refine_p8 if self.full_sva else None
-        feats = self.fpn(images, dino=dino_fpn, p8_fn=p8_fn)  # {8: [B,V,C,h,w], ...}
+        feats = self.fpn(images, dino=dino_fpn)  # 普通 FPN {8: [B,V,C,h,w], ...}
+        if self.sva_pathway is not None:
+            # MVSFormer++ 的 FMT_with_pathway: 1/8 普通输出 (out0) -> 2D-PE ->
+            # self/cross 注意力; 再从它出发建第二条逐级路径, 叠加到普通 FPN 的
+            # 1/4、1/2、1/1 输出上。四级 cost volume 都用这一套。
+            feats = self.sva_pathway(feats)
 
         # ---------- Stage 1 (coarsest, 1/8): dual-branch hypotheses ----------
         feat1 = feats[s1_stride]
@@ -858,10 +873,10 @@ class UprMVSNet(nn.Module):
         # sub-dict, 把 refine_range_from_posterior 写进去的 range_stats 全冲掉。
         for _sname, _d in bimodal_diag.items():
             stage_out["range_diag"].setdefault(_sname, {}).update(_d)
-        if self.full_sva and self.dino_sva.hr.last_stats is not None:
+        if self.sva_pathway is not None and self.sva_pathway.fmt.last_stats is not None:
             # 纯诊断, 不进损失。delta_rel 恒为 ~0 = 1/8 的注意力什么也没学到;
             # 远大于 1 = 它在覆盖 FPN 特征而不是修正, 两头都是故障信号。
-            stage_out["range_diag"]["sva"] = dict(self.dino_sva.hr.last_stats)
+            stage_out["range_diag"]["sva"] = dict(self.sva_pathway.fmt.last_stats)
         stage_out["range_diag"]["branch"] = {"bp_beta": float(getattr(self, "last_bp_beta", 0.0))}
         stage_out["range_diag"]["cost"] = {
             f"max_s{i + 1}": float(getattr(m, "last_cost_max", 0.0))

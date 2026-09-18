@@ -402,14 +402,18 @@ class SVAConfig:
     """MVSFormer++ 的完整 SVA (models/sva.py + models/spre.py 的 SVAFusion)。
 
     ``full=False``: 旧行为 —— DINO token 上一段 SVA, 1x1 conv 投到 FPN 宽度,
-    双线性上采样后加到 p8。
-    ``full=True``: 第一段 SVA 之后 proj + 两层 deconv (x4) 上采样, 加到 p8,
-    再在 1/8 上加 normalized 2D-PE、做 (self, cross, self, cross) 四层线性注意力,
-    然后沿 FPN top-down 传到 1/4、1/2、1/1。
+    双线性上采样后加到 FPN 的 1/8 特征, 普通 FPN 输出直接进 cost volume。
+    ``full=True`` (与 MVSFormer++ 的数据流一一对应):
+      1. DINO SVA -> proj + 两层 deconv (x4) -> 加到 FPN 1/8 特征 (conv31 + vit_feat)
+      2. 普通 FPN: 1/8 输出头换成 out0 (1x1 conv + BN + SiLU); 普通 top-down 从 out0
+         之前的特征出发, 产出 1/4、1/2、1/1
+      3. SVAPathway (FMT_with_pathway): 1/8 输出 -> normalized 2D-PE ->
+         (self, cross, self, cross) 线性注意力; 再建第二条逐级路径
+         smooth(up(reduce(上一级)) + 普通 FPN 这一级), 四级都换成它的输出
 
-    需要 ``dino.mode != off`` 且 ``dino.feed_fpn=True`` (第二段作用在融合了 DINO
-    的 1/8 特征上)。注意力类型固定为线性注意力 (MVSFormer++ 的 FMT_config), 不是
-    配置项: 它对序列长度不敏感, 而推理时 p8 的 token 数是训练的 2-4 倍。
+    需要 ``dino.mode != off`` 且 ``dino.feed_fpn=True``。注意力类型固定为线性注意力
+    (MVSFormer++ 的 FMT_config), 不是配置项: 它对序列长度不敏感, 而推理时 1/8 的
+    token 数是训练的 2-4 倍。
     """
 
     full: bool = False

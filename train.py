@@ -1453,6 +1453,11 @@ def _config_snapshot(cfg) -> dict:
     return conv(cfg)
 
 
+def _sva_layout() -> str:
+    from models.sva import SVA_LAYOUT
+    return SVA_LAYOUT
+
+
 def _arch_fingerprint(cfg) -> dict:
     """决定 state_dict 是否可加载 / 推理语义是否一致的那些开关。"""
     return {
@@ -1536,6 +1541,9 @@ def _arch_fingerprint(cfg) -> dict:
         "sva_hr_mlp_ratio": cfg.sva.hr_mlp_ratio,
         "sva_pe_max_shape": list(cfg.sva.pe_max_shape),
         "sva_hr_attention": "linear_elu",
+        # 数据流结构标签 (models/sva.SVA_LAYOUT)。cdaa5d5 那版是"FMT 直接改 p8、单一
+        # top-down", 这个标签不同, test 端会明确拒绝那种 checkpoint。
+        "sva_layout": _sva_layout() if cfg.sva.full else None,
         "range_max_gi": cfg.depth_range.range_max_gi,
         "local_half_gi": [cfg.depth_range.local_half_min_gi, cfg.depth_range.local_half_max_gi],
         "gate_hard_conf": cfg.depth_range.gate_hard_conf,

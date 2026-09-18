@@ -375,6 +375,14 @@ def _align_cfg_to_ckpt(cfg, state: dict, override: str = "auto", fingerprint=Non
         if cfg.sva.full and fingerprint.get("sva_hr_attention", "linear_elu") != "linear_elu":
             raise SystemExit(f"checkpoint 的 sva_hr_attention={fingerprint.get('sva_hr_attention')}, "
                              "当前实现只有 linear_elu。")
+        if cfg.sva.full:
+            from models.sva import SVA_LAYOUT
+            if fingerprint.get("sva_layout") != SVA_LAYOUT:
+                raise SystemExit(
+                    f"checkpoint 的 sva_layout={fingerprint.get('sva_layout')!r}, 当前实现是 "
+                    f"{SVA_LAYOUT!r}。缺这个字段的是 cdaa5d5 那版 (FMT 直接改 p8、单一 "
+                    "top-down, 没有 out0 与第二条路径), 与当前结构不是同一个模型; "
+                    "要推理它请切回 cdaa5d5。")
         # 级联窗口几何。这些不改 state_dict 的形状, 所以对不上时 load 不会报错 ——
         # 推理会**静默地**跑在另一套窗口上。2026-09-18 之前这里一个都没恢复:
         # 训练 RANGE_MIN_GI=0.66,0.20,0.10 的 checkpoint 推理时用的是 config 默认的

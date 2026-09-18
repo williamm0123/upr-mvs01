@@ -5,13 +5,15 @@
 
    1  NormalizedPE2D 与 MVSFormer++ PositionEncodingSineNorm 逐元素一致
    2  线性注意力与 MVSFormer++ CrossLinearAttention 一致
-   3  HighResSVA 把 V-1 个 source 拼在 token 维上查 reference, 与逐视角循环一致
-   4  sva.full=off 时 DinoSVA 仍是旧结构 (to_fpn 1x1, 没有 deconv/hr)
-   5  stage1 = 44 global + 4 local, 候选轴升序
-   6  全网前向 + 反向: 每个可训练参数都有梯度, depth 有限
-   7  fingerprint 往返: test._align_cfg_to_ckpt 恢复出 sva.full / 44/4 /
-      range_min_gi, 按它重建的模型能 strict 加载
-   8  CVPE 已卸载: cvpe.enabled=True 构造网络直接报错; 带 cvpe 的旧 fingerprint 被 test 拒绝
+   3  HighResSVA (FMT) 把 V-1 个 source 拼在 token 维上查 reference, 与逐视角循环一致
+   4  SVAPathway 与 FMT_with_pathway 的逐视角参考实现 (同一组权重) 一致
+   5  FPN stage1_head=out0: 1/8 输出 = out0(p8), 普通 top-down 从 out0 之前的 p8 出发
+   6  sva.full=off 时是旧结构 (to_fpn 1x1 / smooth_p8 / 没有 deconv、out0、sva_pathway)
+   7  stage1 = 44 global + 4 local, 候选轴升序
+   8  全网前向 + 反向: 每个可训练参数都有梯度, depth 有限
+   9  fingerprint 往返: test._align_cfg_to_ckpt 恢复出 sva.full / sva_layout / 44/4 /
+      range_min_gi, 按它重建的模型能 strict 加载; 缺 sva_layout 的 (cdaa5d5) 被拒绝
+  10  CVPE 已卸载: cvpe.enabled=True 构造网络直接报错; 带 cvpe 的旧 fingerprint 被 test 拒绝
 
 需要 DINOv3 权重 (cfg.paths.dinov3_weights_file)。有 GPU 就在 GPU 上跑。
 
@@ -33,7 +35,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from base.config import build_mvs_config
-from models.sva import HighResSVA, NormalizedPE2D, _linear_attn
+from models.sva import HighResSVA, NormalizedPE2D, SVAPathway, _linear_attn
 
 _OK: list[str] = []
 
@@ -117,6 +119,40 @@ def check_modules() -> None:
     assert d < 1e-5, f"批量 cross 与逐视角循环不一致: {d}"
     ok(f"HighResSVA 批量 cross == 逐视角循环 (max|diff| {d:.1e})")
 
+    # 4  FMT_with_pathway 的逐视角写法, 原样照抄其 forward 的数据流, 共用同一组权重
+    pw = SVAPathway(32, heads=4).double().eval()
+    fs = {8: torch.randn(2, 3, 32, 6, 8, dtype=torch.float64),
+          4: torch.randn(2, 3, 32, 12, 16, dtype=torch.float64),
+          2: torch.randn(2, 3, 32, 24, 32, dtype=torch.float64),
+          1: torch.randn(2, 3, 32, 48, 64, dtype=torch.float64)}
+    got = pw(fs)
+    s1 = pw.fmt(fs[8])                      # FMT 已由 3 单独核对, 这里核对 pathway
+
+    def up_add(x, y):
+        return F.interpolate(x, size=y.shape[-2:], mode="bilinear") + y
+    for v in range(3):
+        r2 = pw.smooth[0](up_add(pw.reduce[0](s1[:, v]), fs[4][:, v]))
+        r3 = pw.smooth[1](up_add(pw.reduce[1](r2), fs[2][:, v]))
+        r4 = pw.smooth[2](up_add(pw.reduce[2](r3), fs[1][:, v]))
+        for st, ref in ((8, s1[:, v]), (4, r2), (2, r3), (1, r4)):
+            d = float((got[st][:, v] - ref).abs().max())
+            assert d < 1e-9, f"SVAPathway stride {st} view {v} 与 FMT_with_pathway 不一致: {d}"
+    ok("SVAPathway == FMT_with_pathway 的逐视角数据流 (四级, 同一组权重)")
+
+    # 5  普通 FPN: out0 头 + 从 out0 之前出发的 top-down
+    from models.fpn import FPNFeatureExtractor
+    f = FPNFeatureExtractor(out_channels=32, base_channel=8, stage1_head="out0").eval()
+    x = torch.rand(2, 3, 64, 80)
+    dn = torch.randn(2, 32, 8, 10)
+    o = f(x, dino=dn)
+    fh = f.tower_half(x); fq = f.tower_quarter(fh); fe = f.tower_eighth(fq)
+    p8 = f.lateral_eighth(fe) + dn
+    p4 = f.lateral_quarter(fq) + F.interpolate(p8, size=fq.shape[-2:], mode="bilinear", align_corners=False)
+    assert torch.equal(o[8], f.out0(p8)), "1/8 输出不是 out0(p8)"
+    assert torch.equal(o[4], f.smooth_p4(p4)), "1/4 的普通 top-down 没有从 out0 之前的 p8 出发"
+    assert not hasattr(f, "smooth_p8"), "out0 模式下不该再有 smooth_p8 (不前向的参数)"
+    ok("FPN stage1_head=out0: 1/8 = out0(p8), 普通 top-down 从 out0 之前的 p8 出发")
+
 
 def _sva_cfg(full: bool = True):
     cfg = build_mvs_config()
@@ -144,14 +180,15 @@ def check_network(device: torch.device) -> None:
     import train as trainmod
     import test as testmod
 
-    # 4
+    # 6
     net_off = UprMVSNet(_sva_cfg(full=False))
     assert net_off.dino_sva.to_fpn is not None and net_off.dino_sva.deconv is None \
-        and net_off.dino_sva.hr is None, "sva.full=off 不是旧结构"
-    ok("sva.full=off: DinoSVA 仍是 1x1 to_fpn, 没有 deconv / hr")
+        and net_off.sva_pathway is None and hasattr(net_off.fpn.fpn, "smooth_p8") \
+        and not hasattr(net_off.fpn.fpn, "out0"), "sva.full=off 不是旧结构"
+    ok("sva.full=off: 1x1 to_fpn + smooth_p8, 没有 deconv / out0 / sva_pathway")
     del net_off
 
-    # 5, 6
+    # 7, 8
     cfg = _sva_cfg(full=True)
     torch.manual_seed(0)
     model = UprMVSNet(cfg).to(device).train()
@@ -170,16 +207,16 @@ def check_network(device: torch.device) -> None:
     loss.backward()
     missing = [n for n, p in model.named_parameters() if p.requires_grad and p.grad is None]
     assert not missing, f"这些可训练参数没收到梯度: {missing[:8]} (共 {len(missing)})"
+    _sva_prefix = ("sva_pathway.", "dino_sva.deconv.", "fpn.fpn.out0.")
     hr_grad = [n for n, p in model.named_parameters()
-               if n.startswith(("dino_sva.hr.", "dino_sva.deconv.")) and float(p.grad.abs().max()) == 0]
+               if n.startswith(_sva_prefix) and float(p.grad.abs().max()) == 0]
     assert not hr_grad, f"完整 SVA 的参数梯度恒为 0: {hr_grad[:8]}"
     assert torch.isfinite(out["depth_full"]).all() and torch.isfinite(loss), "前向出现非有限值"
-    n_new = sum(p.numel() for n, p in model.named_parameters()
-                if n.startswith(("dino_sva.hr.", "dino_sva.deconv."))) / 1e6
+    n_new = sum(p.numel() for n, p in model.named_parameters() if n.startswith(_sva_prefix)) / 1e6
     ok(f"前向 + 反向: 每个可训练参数都有梯度, 完整 SVA 新增 {n_new:.2f}M 参数, "
        f"sva/delta_rel={out['range_diag']['sva']['delta_rel']:.3f}")
 
-    # 7
+    # 9
     fp = trainmod._arch_fingerprint(cfg)
     state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
     restored, _ = testmod._align_cfg_to_ckpt(build_mvs_config(), state, "auto", fingerprint=fp)
@@ -189,9 +226,17 @@ def check_network(device: torch.device) -> None:
         f"range_min_gi 没恢复: {restored.depth_range.range_min_gi}"
     assert restored.decoder.fusion_conf and restored.cost_volume.geo_valid_aggregation
     UprMVSNet(restored).load_state_dict(state, strict=True)
-    ok("fingerprint 往返: sva.full / 44/4 / range_min_gi / conf_head / geo_valid 恢复, strict 加载通过")
+    try:
+        testmod._align_cfg_to_ckpt(build_mvs_config(), state, "auto",
+                                   fingerprint={k: v for k, v in fp.items() if k != "sva_layout"})
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError("缺 sva_layout 的 (cdaa5d5 单路径) fingerprint 没有被 test 拒绝")
+    ok("fingerprint 往返: sva.full / sva_layout / 44/4 / range_min_gi / conf_head / geo_valid "
+       "恢复, strict 加载通过; cdaa5d5 的单路径 checkpoint 被拒绝")
 
-    # 8
+    # 10
     try:
         UprMVSNet(replace(cfg, cvpe=replace(cfg.cvpe, enabled=True)))
     except ValueError as e:

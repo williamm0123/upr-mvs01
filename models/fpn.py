@@ -74,8 +74,19 @@ class FPNFeatureExtractor(nn.Module):
         self,
         out_channels: int = 128,
         base_channel: int = 32,
+        stage1_head: str = "smooth",
     ) -> None:
+        """``stage1_head``: 1/8 那一级普通 FPN 输出的头。
+
+        * ``smooth`` —— 3x3 conv (原有行为, 构造顺序与改动前逐位一致)。
+        * ``out0``   —— MVSFormer++ ``FPNDecoder.out0``: 1x1 conv + BN + SiLU。完整
+          SVA 用它: 第二段注意力 (FMT) 的输入就是这一级的 out0 输出, 而普通 top-down
+          仍从 out0 **之前**的 p8 出发 (他们的 ``intra_feat``)。
+        """
         super().__init__()
+        if stage1_head not in ("smooth", "out0"):
+            raise ValueError(f"stage1_head 只能是 smooth / out0, 收到 {stage1_head!r}")
+        self.stage1_head = stage1_head
         c_half = base_channel * 2      # 1/2 尺度内部通道
         c_quarter = base_channel * 4   # 1/4 尺度内部通道
         c_eighth = base_channel * 8    # 1/8 尺度内部通道
@@ -97,27 +108,28 @@ class FPNFeatureExtractor(nn.Module):
         )
 
         # ---- 输出平滑：消除上采样混叠 ----
-        self.smooth_p8 = nn.Conv2d(out_channels, out_channels, 3, padding=1)
+        # out0 占 smooth_p8 的构造位置: 不用的那个干脆不建 (建了不前向 = 要梯度
+        # 却收不到), smooth 模式下构造顺序与改动前完全相同。
+        if stage1_head == "out0":
+            self.out0 = nn.Sequential(nn.Conv2d(out_channels, out_channels, 1),
+                                      nn.BatchNorm2d(out_channels), nn.SiLU())
+        else:
+            self.smooth_p8 = nn.Conv2d(out_channels, out_channels, 3, padding=1)
         self.smooth_p1 = nn.Conv2d(out_channels, out_channels, 3, padding=1)
         self.smooth_p2 = nn.Conv2d(out_channels, out_channels, 3, padding=1)
         self.smooth_p4 = nn.Conv2d(out_channels, out_channels, 3, padding=1)
         self.out_channels = out_channels
 
-    def forward(self, x: torch.Tensor, dino: torch.Tensor | None = None,
-                mid_hook=None) -> dict[int, torch.Tensor]:
+    def forward(self, x: torch.Tensor, dino: torch.Tensor | None = None) -> dict[int, torch.Tensor]:
         """``dino``: 可选的 [B, out_channels, H/8, W/8] 语义特征, 注入 1/8 瓶颈。
 
         注入点选在 top-down 之前而不是之后 —— 这样 DINO 的语义会沿 p8->p4->p2->p1
         传遍所有尺度, 和 MVSFormer++ 的 ``conv31 = conv31 + vit_feat`` 位置一致
         (他们也是加在 encoder 的 1/8 输出上, 再进 decoder)。
 
-        ``mid_hook``: 可选的 ``p8 -> p8'`` 回调, 挂在**同一个注入点**上 (DINO 之后、
-        top-down 之前)。完整 SVA 的第二段 (1/8 上的 2D-PE + self/cross 注意力,
-        models/sva.py) 用它做跨视图交互 —— 跨视图需要 [B, V, ...] 而这里是
-        [B*V, ...], 所以由调用方 (MultiViewFPN) 负责 reshape。放在这个点上, 它的
-        修改就和 DINO 一样沿 top-down 传遍四级, 等价于 MVSFormer++ 的
-        FMT_with_pathway (upsample-add-smooth), 不需要另建一条平行链。
-        ``mid_hook=None`` 时前向逐位不变。
+        返回的是**普通** FPN 的四级输出。完整 SVA 的第二段 (FMT + 第二条逐级融合
+        路径) 不在这里, 在 ``models/sva.SVAPathway``, 由网络接在本函数之后 ——
+        与 MVSFormer++ ``FPNDecoder`` -> ``FMT_with_pathway`` 的分工相同。
         """
         # 自底向上
         f_half = self.tower_half(x)          # [B, c_half, H/2, W/2]
@@ -130,8 +142,6 @@ class FPNFeatureExtractor(nn.Module):
             if dino.shape[-2:] != p8.shape[-2:]:
                 dino = F.interpolate(dino, size=p8.shape[-2:], mode="bilinear", align_corners=False)
             p8 = p8 + dino
-        if mid_hook is not None:
-            p8 = mid_hook(p8)
         p4 = self.lateral_quarter(f_quarter) + F.interpolate(
             p8, size=f_quarter.shape[-2:], mode="bilinear", align_corners=False
         )                                        # [B, out_channels, H/4, W/4]
@@ -143,7 +153,7 @@ class FPNFeatureExtractor(nn.Module):
         )                                        # [B, out_channels, H, W]
 
         return {
-            8: self.smooth_p8(p8),
+            8: self.out0(p8) if self.stage1_head == "out0" else self.smooth_p8(p8),
             4: self.smooth_p4(p4),
             2: self.smooth_p2(p2),
             1: self.smooth_p1(p1),
@@ -155,29 +165,19 @@ class MultiViewFPN(nn.Module):
         self,
         out_channels: int = 128,
         base_channel: int = 32,
+        stage1_head: str = "smooth",
     ) -> None:
         super().__init__()
         self.fpn = FPNFeatureExtractor(
             out_channels=out_channels,
             base_channel=base_channel,
+            stage1_head=stage1_head,
         )
         self.out_channels = out_channels
 
-    def forward(self, imgs: torch.Tensor, dino: torch.Tensor | None = None,
-                p8_fn=None) -> dict[int, torch.Tensor]:
-        """``dino``: 可选 [B, V, out_channels, h8, w8], 每个视角一份。
-
-        ``p8_fn``: 可选的 ``[B, V, C, h, w] -> [B, V, C, h, w]`` 回调, 在 1/8 注入点
-        上做跨视图交互 (见 ``FPNFeatureExtractor.forward`` 的 ``mid_hook``)。这里只
-        负责 [B*V, ...] <-> [B, V, ...] 的形状转换, 模型在调用方。
-        ``p8_fn=None`` 时前向逐位不变。
-        """
+    def forward(self, imgs: torch.Tensor, dino: torch.Tensor | None = None) -> dict[int, torch.Tensor]:
+        """``dino``: 可选 [B, V, out_channels, h8, w8], 每个视角一份。"""
         B, V, C, H, W = imgs.shape
         d = dino.reshape(B * V, *dino.shape[2:]) if dino is not None else None
-        hook = None
-        if p8_fn is not None:
-            def hook(p8: torch.Tensor) -> torch.Tensor:
-                c8, h8, w8 = p8.shape[-3:]
-                return p8_fn(p8.view(B, V, c8, h8, w8)).reshape(B * V, c8, h8, w8)
-        feats = self.fpn(imgs.view(B * V, C, H, W), dino=d, mid_hook=hook)
+        feats = self.fpn(imgs.view(B * V, C, H, W), dino=d)
         return {s: f.view(B, V, f.shape[1], f.shape[2], f.shape[3]) for s, f in feats.items()}

@@ -10,8 +10,9 @@
 #
 # 四步, 回答的都是 "跑不跑得通 / 占多少显存", **不是**性能实验:
 #   [1] env    GPU / torch / git / 数据集与先验缓存路径
-#   [2] synth  scripts/verify_sva.py (8 条实现校验: PE / 线性注意力与 MVSFormer++
-#              逐元素一致、44+4 候选、梯度覆盖、fingerprint 往返、CVPE 已卸载),
+#   [2] synth  scripts/verify_sva.py (10 条实现校验: PE / 线性注意力 / FMT_with_pathway
+#              与 MVSFormer++ 一致、out0 + 普通 top-down、44+4 候选、梯度覆盖、
+#              fingerprint 往返、CVPE 已卸载),
 #              然后合成数据 train.py --smoke: 构造 + 前向 + 反向 + 存 checkpoint。
 #              不碰数据集, 几分钟内出结果。这一步挂了后面不用看。
 #   [3] mem    train.py --fit-batch: 在多尺度里**最大**的训练尺度 (640x896) 上

@@ -1,12 +1,25 @@
-"""MVSFormer++ 完整 SVA 的后半段: deconv 上采样 + 1/8 尺度的 normalized 2D-PE
-与 self/cross 注意力。前半段 (DINOv3 1/16 token 上的 SVA) 在 ``models/spre.py``
-的 ``SVAFusion``。
+"""MVSFormer++ 完整 SVA 的后半段: deconv 上采样 + FMT (1/8 尺度的 normalized 2D-PE
+与 self/cross 注意力) + 第二条逐级融合路径。前半段 (DINOv3 token 上的 SVA) 在
+``models/spre.py`` 的 ``SVAFusion``。
 
-对应 MVSFormer++ 的 Fig. 2(a):
+数据流与 MVSFormer++ (``DINOv2MVSNet.forward``) 一一对应:
 
-    DINO 多层 token --SVA(self: ref / cross: src)--> proj + 2x deconv (x4 上采样)
-        --> 与 FPN 的 1/8 特征相加 --> + normalized 2D-PE
-        --> SVA(self, cross, self, cross) --> 沿 FPN top-down 传到 1/4、1/2、1/1
+    DINO 多层 token --SVAFusion (self: ref / cross: src)--> SVADeconv (proj + 2x deconv)
+        --> 加到 FPN 的 1/8 特征上                         (conv31 = conv31 + vit_feat)
+    普通 FPN (models/fpn.py, stage1_head="out0"):
+        1/8 输出 = out0(p8) = 1x1 conv + BN + SiLU          (FPNDecoder.out0)
+        普通 top-down 从 out0 **之前**的 p8 出发, 产出 1/4、1/2、1/1   (intra_feat 链)
+    SVAPathway (FMT_with_pathway):
+        s8 = FMT(1/8 输出)       FMT = normalized 2D-PE + (self, cross, self, cross)
+        s4 = smooth(up(reduce(s8)) + 普通 1/4 输出)
+        s2 = smooth(up(reduce(s4)) + 普通 1/2 输出)
+        s1 = smooth(up(reduce(s2)) + 普通 1/1 输出)
+    四级 cost volume 用的是 (s8, s4, s2, s1)。
+
+所以细尺度拿到的是**两条**路径的和: 不经过注意力的普通 FPN top-down, 加上从 FMT
+输出逐级传下来的第二条路径。2026-09-18 的第一版 (cdaa5d5) 把 FMT 直接插在唯一的
+top-down 之前改 p8, 既没有 out0, 也没有第二条路径 —— 那是另一个结构, 由
+``SVA_LAYOUT`` 进 fingerprint 区分开。
 
 代码对应关系 (reference/MVSFormerPlusPlus):
   * ``SVADeconv``      <- ``CrossVITDecoder.proj / upsampler0 / upsampler1``
@@ -15,25 +28,19 @@
                           ``pre_norm_query=False``: key/value 与 query 共用 norm1)
   * ``_linear_attn``   <- ``dino/layers/attention.CrossLinearAttention``
   * ``HighResSVA``     <- ``FMT.FMT`` (``FMT_config.layer_names = self,cross,self,cross``)
-
-论文的原话是 "after the upsampling to the 1/8 scale, we further incorporate two
-additional SVA blocks to high-resolution features with normalized 2D-PE", 以及
-"SVA performs cross-view learning for both DINOv2 (1/32) and coarse MVS (1/8)
-features" —— 第二段注意力作用在**融合了 DINO 的 FPN 1/8 特征**上, 不是只作用
-在 DINO 分支上。代码 (``DINOv2MVSNet.forward``) 也是先 ``conv31 + vit_feat``、
-过 FPN decoder, 再进 ``FMT_with_pathway``。这里的 FPN 把 DINO 注入在 p8 上、
-top-down 之前, 所以 ``HighResSVA`` 挂在同一个注入点上, 它的输出由现有的
-lateral/smooth 传遍四级 —— 与 ``FMT_with_pathway`` 的 upsample-add-smooth
-是同一件事, 不需要再建一条平行链。
+  * ``SVAPathway``     <- ``FMT.FMT_with_pathway``
 
 与 MVSFormer++ 的差别 (都是适配, 不是改设计):
-  * 宽度: 它们的 1/8 特征是 64 通道 (``feat_chs[3]``), 这里 FPN 是 128 通道, 所以
-    d_model=128; 头数沿用它们的 nhead=4。
-  * 线性注意力的 key/value 长度可以与 query 不同 (它们的实现里 k 按 query 的 N
-    reshape, 只在等长时成立)。于是 cross 把 V-1 个 source 视角**拼在 token 维上**
-    一次查 reference —— 注意力对每个 query 独立, 这与逐视角循环逐位同义。
+  * 宽度: 它们的四级是 64/32/16/8 通道, pathway 的 1x1 顺带逐级减半; 这里 FPN
+    四级都是 128 通道 (cost volume 的 warp 投影在各级 builder 里做), 所以
+    reduce 是 128->128 的 1x1。FMT 的 d_model=128, 头数沿用 nhead=4。
+  * 普通 FPN 的 1/4、1/2、1/1 输出头仍是本仓库 FPN 自己的 3x3 conv, 不是它们
+    FPNDecoder 的 3x3 + BN + SiLU —— 那属于 backbone, 不属于 SVA。
+  * 线性注意力的 key/value 长度可以与 query 不同。cross 把 V-1 个 source 视角
+    **拼在 token 维上**一次查 reference —— 注意力对每个 query 独立, 与逐视角循环
+    逐位同义; pathway 的卷积按样本独立, 把视角并进 batch 维同样逐位同义。
   * 注意力的数值部分固定 fp32 并关掉 autocast。线性注意力要对全部 key 求和
-    (0.8 整幅推理时 p8 有 120x160 = 19200 个 token), fp16 会溢出 (job 415038
+    (0.8 整幅推理时 1/8 有 120x160 = 19200 个 token), fp16 会溢出 (job 415038
     就是 CVPE 的同一个问题: 22 个 scan 全 nan)。
 """
 
@@ -44,6 +51,10 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+# 进 fingerprint 的结构标签。实现的数据流一变就改它, 旧 checkpoint 会在 test 端
+# 被明确拒绝, 而不是 load 失败时只报一串 missing/unexpected key。
+SVA_LAYOUT = "fpn_out0+fmt_pathway"
 
 
 class SVADeconv(nn.Module):
@@ -234,3 +245,40 @@ class HighResSVA(nn.Module):
                 "ls1_mean": float(torch.stack([l.ls1.abs().mean() for l in self.layers]).mean()),
             }
         return y.transpose(2, 3).reshape(B, V, C, h, w)
+
+
+class SVAPathway(nn.Module):
+    """``FMT_with_pathway``: 1/8 上跑 FMT, 再建一条从 FMT 输出出发的逐级融合路径,
+    叠加到普通 FPN 的 1/4、1/2、1/1 输出上。
+
+    每一级: ``smooth(upsample(reduce(上一级)) + 普通 FPN 这一级)``, reduce 为
+    无 bias 的 1x1, smooth 为无 bias 的 3x3 —— 与原实现相同 (那两组卷积用 PyTorch
+    默认初始化, 只有 FMT 自己做 xavier)。
+    """
+
+    def __init__(self, channels: int, heads: int = 4,
+                 layer_names: tuple[str, ...] = ("self", "cross", "self", "cross"),
+                 mlp_ratio: float = 4.0, pe_max_shape: tuple[int, int] = (128, 128),
+                 strides: tuple[int, ...] = (8, 4, 2, 1)) -> None:
+        super().__init__()
+        self.strides = tuple(int(s) for s in strides)
+        self.fmt = HighResSVA(channels, heads=heads, layer_names=layer_names,
+                              mlp_ratio=mlp_ratio, pe_max_shape=pe_max_shape)
+        n = len(self.strides) - 1
+        self.reduce = nn.ModuleList(nn.Conv2d(channels, channels, 1, bias=False) for _ in range(n))
+        self.smooth = nn.ModuleList(nn.Conv2d(channels, channels, 3, padding=1, bias=False)
+                                    for _ in range(n))
+
+    def forward(self, feats: dict[int, torch.Tensor]) -> dict[int, torch.Tensor]:
+        """feats: 普通 FPN 输出 {stride: [B, V, C, h, w]} -> 同结构的 SVA 输出。"""
+        s0 = self.strides[0]
+        prev = self.fmt(feats[s0])
+        out = {s0: prev}
+        for stride, red, sm in zip(self.strides[1:], self.reduce, self.smooth):
+            f = feats[stride]
+            B, V, C, h, w = f.shape
+            x = F.interpolate(red(prev.flatten(0, 1)), size=(h, w), mode="bilinear",
+                              align_corners=False)
+            prev = sm(x + f.flatten(0, 1)).view(B, V, C, h, w)
+            out[stride] = prev
+        return out

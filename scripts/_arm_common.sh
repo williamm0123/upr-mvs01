@@ -95,8 +95,10 @@ case "$ARM" in
     # ---- 2026-09-18: vNext 去掉 CVPE + MVSFormer++ 完整 SVA + stage1 44/4 ----
     # 三处改动 (一次训练, 一次点云终审):
     #   1. 特征: MVSFormer++ 完整 SVA —— DINO token 上 self/cross (SVAFusion)
-    #      -> proj + 2x deconv 上采样到 1/8 -> 加到 FPN p8 -> normalized 2D-PE
-    #      -> (self, cross, self, cross) 线性注意力 -> 沿 FPN top-down 传到四级
+    #      -> proj + 2x deconv 上采样到 1/8 -> 加到 FPN 1/8 特征 -> 普通 FPN
+    #      (1/8 头为 out0 = 1x1+BN+SiLU) -> FMT_with_pathway: 1/8 上 normalized
+    #      2D-PE + (self, cross, self, cross) 线性注意力, 再建第二条逐级路径
+    #      叠加到普通 FPN 的 1/4、1/2、1/1 输出上 (models/sva.py)
     #   2. stage1 候选 32 global + 16 local -> 44 global + 4 local
     #   3. CVPE 卸载 (模块代码保留, 网络不再构造/调用)
     # 其余沿用 vNext 的基座: legacy_depth + stage4 expect + geo_valid + conf_head。
