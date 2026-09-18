@@ -1,5 +1,5 @@
 #!/bin/bash -l
-#SBATCH --job-name=uprmvs_1gpu
+#SBATCH --job-name=uprmvs_sva
 #SBATCH --partition=gpu-a100
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -13,34 +13,38 @@
 #SBATCH --error=logs/%x_%j.err
 
 # =============================================================================
-# UPRMVS 改造工单 v3 —— **单卡 A100-80GB** 训练。一个脚本四个 arm。
+# UPRMVS —— **单卡 A100-80GB 正式训练** (sbatch 排队, 不是 bash)。
 #
-#   ARM=w0 sbatch scripts/sbatch_1gpu.sh     # W0-A 基线 R32_f10 -> 30k
-#   ARM=w1 sbatch scripts/sbatch_1gpu.sh     # W1  Depth-core vNext (修订版) -> 30k
-#   ARM=w3 sbatch scripts/sbatch_1gpu.sh     # W3  UPRMVS-3D vNext -> 30k (从头)
-#   ARM=w3b sbatch scripts/sbatch_1gpu.sh    # W3 + W3-B 源视图可见性监督
-#   ARM=vnext sbatch scripts/sbatch_1gpu.sh  # 工单 v5.3 的唯一候选 -> 30k
-#                                            # (W0 基座 + CVPE + geo_valid + conf_head)
+#   cd /scr/user/qinglong/projects/upr-mvs01
+#   git pull
+#   sbatch scripts/sbatch_1gpu.sh                 # 默认 ARM=sva, 30k 步
 #
-# 2026-08-23 起**只用单卡**, 双卡 DDP 路径不再使用。原因是双卡下没有哪种配置能
-# 同时对齐"全局 batch"和"BN 批量" (FPN 是 BatchNorm2d 且全网无 SyncBN), 单卡
-# 反而口径干净。DDP 代码保留可用, 只是不再是默认路径。
+# 当前主线 ARM=sva (2026-09-18, 定义在 scripts/_arm_common.sh):
+#   * MVSFormer++ 完整 SVA: DINO SVA -> deconv -> + FPN p8 -> normalized 2D-PE
+#     -> self/cross x2 -> FPN top-down
+#   * stage1 候选 44 global + 4 local (RANGE_MIN_GI 已按 43/31 换算)
+#   * CVPE 已卸载; 其余沿用 vNext 基座 (legacy_depth / expect / geo_valid / conf_head)
+# 其它 arm (w0/w1/w3/w3b) 仍可用: ARM=w0 sbatch scripts/sbatch_1gpu.sh
 #
-# 顺序是工单排的, 不要跳:
-#   w0 跑完 -> best.pth -> scripts/tail_posterior_stats.py 出 deployable 判据
-#   -> 决定 W2 做不做 -> w1 -> w3。W3 **从头训练**而不是在 W1 权重上续训,
-#   为的是归因清楚。
+# 提交之前先在 interactive 分配里跑一遍 scripts/smoke_interactive.sh (实现校验 +
+# 显存实测)。它会告诉你 batch 4 在最大训练尺度 640x896 上的峰值显存。
 #
 # -----------------------------------------------------------------------------
-# 批量: per-GPU = 全局 = 4 (PER_GPU_BATCH)。lr 按 sqrt(全局/2) 自 3e-4 缩放。
-# 换卡或换 arm 之后先量显存:  ARM=w1 bash scripts/fit_batch.sh
+# 批量: per-GPU = 全局 = 4 (PER_GPU_BATCH)。lr 按 sqrt(全局/2) 自 3e-4 缩放 = 4.243e-4。
+# 本机 (5060 Ti) 在 320x448 上实测: 完整 SVA 让每样本显存 +10.5%
+# (3.49 -> 3.86 GiB); 外推到 640x896 x batch 4 约 60 GiB allocated, 80GB 卡够用。
 #
-# 速度参考: batch 5 单卡实测约 3.6 s/step, 30k 步约 30 小时 (--time 给了 48h)。
+# 速度参考: 旧 W0 基座 batch 4 单卡 30k 约 18.6 h; 完整 SVA 多了 1/8 上四层线性
+# 注意力, 预计慢 10-20%。--time 给 2 天, --qos=long。
+#
+# 输出: log/experiments/$RUN_NAME/{model,tensorboard}; 已存在的同名目录会被
+# **归档** (移到 log/experiments/_archive/, 不删除)。
+# 训练完之后的推理 + fusibile 融合: scripts/test_dtu_fusibile.sh
 # =============================================================================
 
 set -euo pipefail
 
-ARM=${ARM:-w1}
+ARM=${ARM:-sva}
 PROJECT_DIR=${PROJECT_DIR:-/scr/user/qinglong/projects/upr-mvs01}
 cd "$PROJECT_DIR"
 
@@ -85,9 +89,13 @@ echo " git=${GIT_SHA:0:12}"
 echo " 单卡  per_gpu_batch=$PER_GPU_BATCH  global_batch=$GLOBAL_BATCH"
 echo " steps=$STEPS  horizon=$LR_HORIZON  amp=$AMP_DTYPE  seed=$SEED"
 echo " lr=$LR  (${LR_SCALING} 缩放自 $LR_REF @ 全局 batch $LR_REF_BATCH)"
+echo " stage1: global=$NUM_GLOBAL local=$NUM_LOCAL  range_min_gi=$RANGE_MIN_GI"
 echo " arm_args: ${ARM_ARGS[*]}"
 echo "=================================================================="
 nvidia-smi -L || true
+# 拿不到卡时 train.py 会退回 CPU 然后慢到看不出是出错 —— 在这里直接失败。
+python -c 'import sys, torch; sys.exit(0 if torch.cuda.is_available() else 1)' \
+    || { echo "CUDA 不可用 —— 这个作业需要 --gres=gpu:1" >&2; exit 1; }
 
 exec python train.py \
     --gpus 1 \

@@ -27,7 +27,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from base.config import DINOConfig, SPREConfig
+from base.config import DINOConfig, SPREConfig, SVAConfig
 from models.dinov3.extractor import compute_patch_aligned_size, load_dinov3_vit_base
 from utils.geometry import make_pixel_grid
 
@@ -257,10 +257,16 @@ class DinoSVA(nn.Module):
     ViT was paid for and then used only to predict one scalar per pixel.
 
     DINOv3 stays frozen: gradients start at ``fusion.in_proj``.
+
+    ``sva_cfg.full`` switches on MVSFormer++'s complete SVA (models/sva.py): the
+    projection to the FPN width becomes proj + two deconvs instead of a 1x1
+    conv, and a 1/8-scale ``hr`` stage (normalized 2D-PE + self/cross linear
+    attention) is added, which the network hooks onto the FPN's p8 injection
+    point via ``refine_p8``.
     """
 
     def __init__(self, cfg: SPREConfig, dino_cfg: DINOConfig, weights_file,
-                 fpn_channels: int | None = None) -> None:
+                 fpn_channels: int | None = None, sva_cfg: SVAConfig | None = None) -> None:
         super().__init__()
         self.layers = tuple(dino_cfg.layers)
         self.patch_size = int(dino_cfg.patch_size)
@@ -274,10 +280,24 @@ class DinoSVA(nn.Module):
 
         self.fusion = SVAFusion(768, cfg, n_layers=len(self.layers))
         self.out_dim = self.fusion.out_dim
-        # 1x1 to the FPN's width, applied on the patch grid: a pointwise conv
-        # commutes exactly with bilinear upsampling, so projecting 26x32 instead
-        # of the target grid is identical arithmetic and far cheaper.
-        self.to_fpn = nn.Conv2d(self.out_dim, fpn_channels, 1) if fpn_channels else None
+        self.full_sva = bool(sva_cfg is not None and sva_cfg.full)
+        if self.full_sva and not fpn_channels:
+            raise ValueError("sva.full 需要 feed_fpn (第二段 SVA 作用在融合了 DINO 的 1/8 特征上)")
+        self.to_fpn = self.deconv = self.hr = None
+        if self.full_sva:
+            from models.sva import HighResSVA, SVADeconv
+            self.deconv = SVADeconv(self.out_dim, fpn_channels)
+            self.hr = HighResSVA(
+                fpn_channels, heads=int(sva_cfg.hr_heads),
+                layer_names=tuple(x.strip() for x in str(sva_cfg.hr_layers).split(",")),
+                mlp_ratio=float(sva_cfg.hr_mlp_ratio),
+                pe_max_shape=tuple(sva_cfg.pe_max_shape),
+            )
+        elif fpn_channels:
+            # 1x1 to the FPN's width, applied on the patch grid: a pointwise conv
+            # commutes exactly with bilinear upsampling, so projecting 26x32 instead
+            # of the target grid is identical arithmetic and far cheaper.
+            self.to_fpn = nn.Conv2d(self.out_dim, fpn_channels, 1)
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -309,13 +329,19 @@ class DinoSVA(nn.Module):
     def fpn_feature(self, fused: torch.Tensor, grid: tuple[int, int],
                     target_hw: tuple[int, int]) -> torch.Tensor:
         """[B, V, N, dim] -> [B, V, fpn_channels, target_hw] for FPN injection."""
-        assert self.to_fpn is not None, "DinoSVA built without fpn_channels"
+        assert self.to_fpn is not None or self.deconv is not None, \
+            "DinoSVA built without fpn_channels"
         B, V, _, C = fused.shape
         gh, gw = grid
         x = fused.reshape(B * V, gh, gw, C).permute(0, 3, 1, 2)
-        x = self.to_fpn(x)
-        x = F.interpolate(x, size=target_hw, mode="bilinear", align_corners=False)
-        return x.view(B, V, -1, *target_hw)
+        x = self.deconv(x) if self.full_sva else self.to_fpn(x)
+        if tuple(x.shape[-2:]) != tuple(target_hw):
+            x = F.interpolate(x, size=target_hw, mode="bilinear", align_corners=False)
+        return x.reshape(B, V, -1, *target_hw)
+
+    def refine_p8(self, p8: torch.Tensor) -> torch.Tensor:
+        """完整 SVA 的第二段: [B, V, C, h8, w8] -> 同形状。只在 ``full_sva`` 时有意义。"""
+        return self.hr(p8)
 
 
 class SPRE(nn.Module):

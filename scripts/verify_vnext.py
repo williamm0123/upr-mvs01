@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """UPRMVS vNext 的实现校验 —— **不是性能实验**。
 
+**2026-09-18: CVPE 已从网络卸载**, 依赖它的第 1、3-9、12 组不再能跑 (UprMVSNet
+对 cvpe.enabled=True 直接报错), main() 会跳过它们并说明。仍然有效的只有
+``--fusion`` (第 10、11 组: 固定保留率 + Platt 标定)。当前主线的校验在
+``scripts/verify_sva.py``。
+
 工单 v5.3 只跑一次 30k 训练, 所以代码必须在提交作业之前就是对的。这里的每一条
 都只回答 "代码跑不跑得对", 不回答 "模型好不好"; 任何一条挂掉都不允许通过调参
 或改模型来"绕过"。
@@ -552,6 +557,12 @@ def main() -> None:
                compat=a.compat, fusion=a.fusion, smoke=a.smoke)
     if a.all or not any(sel.values()):
         sel = {k: True for k in sel}
+    retired = [k for k in ("cvpe", "equivalence", "grad", "compat", "smoke") if sel[k]]
+    if retired:
+        print(f"[verify_vnext] 跳过 {retired}: 它们依赖 CVPE, 而 CVPE 已从网络卸载 "
+              f"(2026-09-18)。当前主线用 scripts/verify_sva.py。")
+        for k in retired:
+            sel[k] = False
 
     torch.use_deterministic_algorithms(False)
     if sel["cvpe"]:

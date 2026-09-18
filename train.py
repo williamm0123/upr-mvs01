@@ -624,8 +624,11 @@ def main_worker(
         dec_over["fusion_conf_detach"] = args.conf_detach == "on"
     if dec_over:
         cfg = replace(cfg, decoder=replace(cfg.decoder, **dec_over))
-    if args.cvpe is not None:
-        cfg = replace(cfg, cvpe=replace(cfg.cvpe, enabled=args.cvpe == "on"))
+    if args.cvpe == "on":
+        raise SystemExit("--cvpe on: CVPE 已从网络卸载 (2026-09-18), 只接受 --cvpe off。"
+                         "要复现旧 vNext 请切回 f6de5b4。")
+    if args.sva_full is not None:
+        cfg = replace(cfg, sva=replace(cfg.sva, full=args.sva_full == "on"))
     if args.stage1_weight is not None:
         cfg = replace(cfg, stage_weights=replace(cfg.stage_weights, stage1=args.stage1_weight))
     loss_over = {}
@@ -1525,6 +1528,14 @@ def _arch_fingerprint(cfg) -> dict:
         "cvpe_feature_stride": 8,
         "cvpe_plane_space": "inverse_global",
         "cvpe_align_corners": True,
+        # 完整 SVA (models/sva.py)。注意力类型固定为线性注意力 —— 是写死的约定而
+        # 不是配置项, 但照样进 fingerprint, 将来改了实现旧 checkpoint 会立刻不匹配。
+        "sva_full": cfg.sva.full,
+        "sva_hr_layers": cfg.sva.hr_layers,
+        "sva_hr_heads": cfg.sva.hr_heads,
+        "sva_hr_mlp_ratio": cfg.sva.hr_mlp_ratio,
+        "sva_pe_max_shape": list(cfg.sva.pe_max_shape),
+        "sva_hr_attention": "linear_elu",
         "range_max_gi": cfg.depth_range.range_max_gi,
         "local_half_gi": [cfg.depth_range.local_half_min_gi, cfg.depth_range.local_half_max_gi],
         "gate_hard_conf": cfg.depth_range.gate_hard_conf,
@@ -1669,6 +1680,10 @@ def _run_training(model, loss_fn, optimizer, scaler, cfg, device, args, world_si
     # 所以不必存进 checkpoint, 这里重新算出来跳过即可。跳过仍要走一遍 DataLoader
     # (拿不到"直接 seek 到第 k 个 batch"的接口), 代价是几分钟 IO, 换的是顺序精确。
     skip_in_epoch = start_step % max(len(loader), 1)
+    # 控制台行里的 s/step 与峰值显存: 显存实测 (smoke_interactive.sh) 和 30k 的
+    # ETA 都靠它, tensorboard 里没有这两项。
+    import time as _time
+    _t_log, _step_log = _time.time(), step
     while step < max_steps:
         sampler.set_epoch(epoch)
         # 逐样本增广的种子含 epoch, 所以每个 epoch 是一组新的、但可复现的增广。
@@ -1714,11 +1729,18 @@ def _run_training(model, loss_fn, optimizer, scaler, cfg, device, args, world_si
                 win_metrics, win_logs = meter.flush()
                 if is_main:
                     logger.log_scalars(win_logs, lr, win_metrics, step)
+                    _now = _time.time()
+                    _sps = (_now - _t_log) / max(step - _step_log, 1)
+                    _t_log, _step_log = _now, step
+                    _mem = (f" mem_peak={torch.cuda.max_memory_allocated(device) / 2 ** 30:.1f}G"
+                            f"/{torch.cuda.max_memory_reserved(device) / 2 ** 30:.1f}G(resv)"
+                            if device.type == "cuda" else "")
                     print(
                         f"[step {step}] loss={win_logs.get('loss', float('nan')):.4f} "
                         f"abs_err={win_metrics.get('abs_err', float('nan')):.2f} "
                         f"prior_err={win_metrics.get('prior_abs_err', float('nan')):.2f} "
-                        f"rescue_err={win_metrics.get('abs_err_prior_corrupted', float('nan')):.2f}"
+                        f"rescue_err={win_metrics.get('abs_err_prior_corrupted', float('nan')):.2f} "
+                        f"{_sps:.2f}s/step{_mem}"
                     )
             if is_main and cfg.train.vis_interval > 0 and step % cfg.train.vis_interval == 0:
                 logger.log_images(batch, outputs, step)
@@ -1893,11 +1915,13 @@ def main() -> None:
                         help="四级各自的 mode_centered_regression 半窗, 逗号分隔")
     parser.add_argument("--geo-valid", choices=["on", "off"], default=None,
                         help="W3-A: 逐假设几何有效 mask + 逐 voxel 归一化 + n_valid 通道")
-    # CVPE 只暴露一个开关。d_model / num_planes / n_heads / layer_pattern 一律
-    # 走 base.config 的固定值 —— 它们一旦变成训练超参, 就又多出一条按中间指标
-    # 逐项调参的支线, 而工单 v5.3 的整个前提就是不再这么干。
+    # CVPE 已卸载; 开关只留着给旧脚本一个明确的报错。完整 SVA 同样只暴露一个
+    # 开关, 头数/层数/PE 尺度走 base.config 的固定值 (MVSFormer++ 的取值)。
     parser.add_argument("--cvpe", choices=["on", "off"], default=None,
-                        help="CVPE: 相机感知的跨视位置编码, 注入 FPN 的 1/8 瓶颈")
+                        help="已卸载 (2026-09-18): 只接受 off, on 直接报错")
+    parser.add_argument("--sva-full", choices=["on", "off"], default=None,
+                        help="MVSFormer++ 完整 SVA: DINO SVA -> deconv -> + FPN p8 -> "
+                             "normalized 2D-PE -> self/cross x2 -> top-down。需要 DINO + feed_fpn")
     parser.add_argument("--vis-mode", choices=["softmax", "sigmoid"], default=None,
                         help="softmax=旧的 source 维竞争; sigmoid=多标签独立可见性")
     parser.add_argument("--w-range", type=float, default=None)

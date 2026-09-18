@@ -112,11 +112,12 @@ class FPNFeatureExtractor(nn.Module):
         (他们也是加在 encoder 的 1/8 输出上, 再进 decoder)。
 
         ``mid_hook``: 可选的 ``p8 -> p8'`` 回调, 挂在**同一个注入点**上 (DINO 之后、
-        top-down 之前)。CVPE 用它做跨视图交互 —— 因为跨视图需要 [B, V, ...] 而这里
-        是 [B*V, ...], 所以必须由调用方 (MultiViewFPN) 负责 reshape。放在这个点上,
-        CVPE 的修改就和 DINO 一样沿 top-down 传遍四级, **不需要另建一条平行的
-        降维/上采样链** (MonoMVSNet 的 FMT_with_pathway 只是因为它的 FPN4 是外部
-        模块拿不到中间态)。``mid_hook=None`` 时前向逐位不变。
+        top-down 之前)。完整 SVA 的第二段 (1/8 上的 2D-PE + self/cross 注意力,
+        models/sva.py) 用它做跨视图交互 —— 跨视图需要 [B, V, ...] 而这里是
+        [B*V, ...], 所以由调用方 (MultiViewFPN) 负责 reshape。放在这个点上, 它的
+        修改就和 DINO 一样沿 top-down 传遍四级, 等价于 MVSFormer++ 的
+        FMT_with_pathway (upsample-add-smooth), 不需要另建一条平行链。
+        ``mid_hook=None`` 时前向逐位不变。
         """
         # 自底向上
         f_half = self.tower_half(x)          # [B, c_half, H/2, W/2]
@@ -163,20 +164,20 @@ class MultiViewFPN(nn.Module):
         self.out_channels = out_channels
 
     def forward(self, imgs: torch.Tensor, dino: torch.Tensor | None = None,
-                cvpe_fn=None) -> dict[int, torch.Tensor]:
+                p8_fn=None) -> dict[int, torch.Tensor]:
         """``dino``: 可选 [B, V, out_channels, h8, w8], 每个视角一份。
 
-        ``cvpe_fn``: 可选的 ``[B, V, C, h, w] -> [B, V, C, h, w]`` 回调, 在 1/8 注入点
+        ``p8_fn``: 可选的 ``[B, V, C, h, w] -> [B, V, C, h, w]`` 回调, 在 1/8 注入点
         上做跨视图交互 (见 ``FPNFeatureExtractor.forward`` 的 ``mid_hook``)。这里只
-        负责 [B*V, ...] <-> [B, V, ...] 的形状转换, 几何与模型都在调用方。
-        ``cvpe_fn=None`` 时前向逐位不变。
+        负责 [B*V, ...] <-> [B, V, ...] 的形状转换, 模型在调用方。
+        ``p8_fn=None`` 时前向逐位不变。
         """
         B, V, C, H, W = imgs.shape
         d = dino.reshape(B * V, *dino.shape[2:]) if dino is not None else None
         hook = None
-        if cvpe_fn is not None:
+        if p8_fn is not None:
             def hook(p8: torch.Tensor) -> torch.Tensor:
                 c8, h8, w8 = p8.shape[-3:]
-                return cvpe_fn(p8.view(B, V, c8, h8, w8)).reshape(B * V, c8, h8, w8)
+                return p8_fn(p8.view(B, V, c8, h8, w8)).reshape(B * V, c8, h8, w8)
         feats = self.fpn(imgs.view(B * V, C, H, W), dino=d, mid_hook=hook)
         return {s: f.view(B, V, f.shape[1], f.shape[2], f.shape[3]) for s, f in feats.items()}

@@ -140,8 +140,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--fuse-only", action="store_true",
                    help="跳过推理, 直接拿 --out 下已缓存的逐视角深度重新融合。换融合方法或"
                         "调阈值时用它 —— 重跑推理是 3 个 arm x 1078 样本的浪费。")
-    p.add_argument("--fusion", choices=["geo", "dedup", "gipuma"], default="dedup",
-                   help="默认 dedup。geo = 几何+光度一致性, 每个 ref 视角各输出一遍存活像素, "
+    p.add_argument("--fusion", choices=["geo", "dedup", "gipuma", "none"], default="dedup",
+                   help="默认 dedup。none = 只写逐视角深度缓存 (depth/conf/K/E/image 的 npz), "
+                        "不在本进程里融合 —— 交给 points_fusibile.py (fusibile 融合) 做; "
+                        "geo = 几何+光度一致性, 每个 ref 视角各输出一遍存活像素, "
                         "**跨视角不去重** —— 49 视角下一个 scan 出 2500-4500 万点; "
                         "dedup = geo 再加 fusibile 式的跨视角消费标记, 同一个表面点只由"
                         "最先认领它的 ref 视角输出一次 (纯 torch, 无外部依赖); "
@@ -356,23 +358,53 @@ def _align_cfg_to_ckpt(cfg, state: dict, override: str = "auto", fingerprint=Non
         if fingerprint.get("tau_stages"):
             cfg = replace(cfg, depth_range=replace(
                 cfg.depth_range, tau_stages=tuple(fingerprint["tau_stages"])))
-        # CVPE。全部字段都从 fingerprint 恢复, 不用当前默认值 —— 默认值一旦有人
-        # 改动, 旧 checkpoint 就会静默地跑在另一套几何上。缺字段 = 2026-08-25
-        # 之前的 checkpoint, 那时还没有 CVPE, 所以 enabled=False 是对的默认。
-        cfg = replace(cfg, cvpe=replace(
-            cfg.cvpe,
-            enabled=bool(fingerprint.get("cvpe_enabled", False)),
-            d_model=int(fingerprint.get("cvpe_d_model", cfg.cvpe.d_model)),
-            num_planes=int(fingerprint.get("cvpe_num_planes", cfg.cvpe.num_planes)),
-            n_heads=int(fingerprint.get("cvpe_n_heads", cfg.cvpe.n_heads)),
-            cam_mid_channels=int(fingerprint.get("cvpe_cam_mid_channels",
-                                                 cfg.cvpe.cam_mid_channels)),
-            layer_pattern=str(fingerprint.get("cvpe_layer_pattern", cfg.cvpe.layer_pattern))))
-        _fs = int(fingerprint.get("cvpe_feature_stride", 8))
-        if cfg.cvpe.enabled and _fs != 8:
+        # CVPE 已从网络卸载 (2026-09-18)。带 CVPE 的旧 vNext checkpoint 在当前代码
+        # 上跑不出它自己的结果, 直接停, 而不是把它当成"没有 CVPE 的模型"加载。
+        if bool(fingerprint.get("cvpe_enabled", False)):
             raise SystemExit(
-                f"checkpoint 的 cvpe_feature_stride={_fs}, 但当前实现把 CVPE 写死在 "
-                f"FPN 的 1/8 注入点上。这个 checkpoint 与当前代码不是同一个模型。")
+                "这个 checkpoint 训练时开着 CVPE, 而 CVPE 已从网络卸载 (2026-09-18)。"
+                "要推理旧 vNext 请切回 f6de5b4。")
+        # 完整 SVA。缺字段 = 2026-09-18 之前的 checkpoint, 那时是旧的 1x1 投影。
+        cfg = replace(cfg, sva=replace(
+            cfg.sva,
+            full=bool(fingerprint.get("sva_full", False)),
+            hr_layers=str(fingerprint.get("sva_hr_layers", cfg.sva.hr_layers)),
+            hr_heads=int(fingerprint.get("sva_hr_heads", cfg.sva.hr_heads)),
+            hr_mlp_ratio=float(fingerprint.get("sva_hr_mlp_ratio", cfg.sva.hr_mlp_ratio)),
+            pe_max_shape=tuple(fingerprint.get("sva_pe_max_shape", cfg.sva.pe_max_shape))))
+        if cfg.sva.full and fingerprint.get("sva_hr_attention", "linear_elu") != "linear_elu":
+            raise SystemExit(f"checkpoint 的 sva_hr_attention={fingerprint.get('sva_hr_attention')}, "
+                             "当前实现只有 linear_elu。")
+        # 级联窗口几何。这些不改 state_dict 的形状, 所以对不上时 load 不会报错 ——
+        # 推理会**静默地**跑在另一套窗口上。2026-09-18 之前这里一个都没恢复:
+        # 训练 RANGE_MIN_GI=0.66,0.20,0.10 的 checkpoint 推理时用的是 config 默认的
+        # (0.66, 0.20, 0.05), stage4 的窗口下限只有训练时的一半。
+        _dr = cfg.depth_range
+        _da = fingerprint.get("depth_adaptive")
+        _lh = fingerprint.get("local_half_gi")
+        cfg = replace(cfg, depth_range=replace(
+            _dr,
+            range_k=tuple(fingerprint.get("range_k", _dr.range_k)),
+            range_min_gi=tuple(fingerprint.get("range_min_gi", _dr.range_min_gi)),
+            range_max_gi=float(fingerprint.get("range_max_gi", _dr.range_max_gi)),
+            local_half_min_gi=float(_lh[0]) if _lh else _dr.local_half_min_gi,
+            local_half_max_gi=float(_lh[1]) if _lh else _dr.local_half_max_gi,
+            gate_hard_conf=float(fingerprint.get("gate_hard_conf", _dr.gate_hard_conf)),
+            mode_window=int(fingerprint.get("mode_window", _dr.mode_window)),
+            branch_prior_mode=str(fingerprint.get("branch_prior_mode", _dr.branch_prior_mode)),
+            branch_prior_anneal_steps=int(fingerprint.get(
+                "branch_prior_anneal_steps", _dr.branch_prior_anneal_steps)),
+            depth_adaptive_range=bool(_da[0]) if _da else _dr.depth_adaptive_range,
+            depth_adaptive_max=float(_da[1]) if _da else _dr.depth_adaptive_max,
+            depth_adaptive_apply=str(_da[2]) if _da else _dr.depth_adaptive_apply,
+            depth_adaptive_stages=tuple(bool(x) for x in _da[3]) if _da else _dr.depth_adaptive_stages))
+        # num_depths_stage1 恒等于 num_global + num_local (network 会断言)
+        _nd1 = cfg.depth_range.num_global + cfg.depth_range.num_local
+        if cfg.cost_volume.num_depths_stage1 != _nd1:
+            cfg = replace(cfg, cost_volume=replace(cfg.cost_volume, num_depths_stage1=_nd1))
+        print(f"[test] 窗口几何 (来自 fingerprint): num_global/local="
+              f"{cfg.depth_range.num_global}/{cfg.depth_range.num_local} "
+              f"range_min_gi={cfg.depth_range.range_min_gi} sva_full={cfg.sva.full}")
         if override == "auto":
             cfg = replace(cfg, spre=replace(
                 cfg.spre, enabled=fingerprint["spre_enabled"],
@@ -1017,10 +1049,15 @@ def main() -> None:
     print(f"[test] split={args.split} scans={len(scans)} samples={len(ds)} out={out_root} "
           f"resize={args.resize_scale} full_image={args.full_image} prior_target_wh={prior_wh} "
           f"prior_resize={args.prior_resize_scale}")
+    cache_only = args.fuse and args.fusion == "none"
     if args.fuse and not args.priors_only:
-        print(f"[test] fused point clouds -> {ply_dir}")
+        print(f"[test] per-view depth cache -> {out_root / 'depth'}" if cache_only
+              else f"[test] fused point clouds -> {ply_dir}")
 
     if args.fuse_only:
+        if cache_only:
+            raise SystemExit("--fuse-only 与 --fusion none 矛盾: 缓存已在, 直接跑 "
+                             "points_fusibile.py --out <缓存目录> 即可。")
         # 深度缓存已经在 out_root/depth 下, 不需要先验、不需要模型、不需要 GPU 推理
         dcache = out_root / "depth"
         if not dcache.is_dir() or not any(dcache.iterdir()):
@@ -1043,7 +1080,7 @@ def main() -> None:
     cfg = getattr(load_model, "last_cfg", cfg)
     # 在推理**之前**写: 跑到一半崩掉时, 目录里也留着谱系, 而不是留下一堆
     # 无法归属的 npz。
-    write_run_manifest([out_root] + ([ply_dir] if args.fuse else []),
+    write_run_manifest([out_root] + ([ply_dir] if args.fuse and not cache_only else []),
                        cfg, args, ckpt_path, getattr(load_model, "last_meta", None))
 
     result = run_inference(model, ds, cfg, args, device, out_root)
@@ -1063,6 +1100,11 @@ def main() -> None:
     print(f"[test] wrote {out_root / 'metrics.json'}")
 
     if not args.fuse:
+        return
+    if cache_only:
+        n_npz = sum(1 for _ in (out_root / "depth").rglob("*.npz"))
+        print(f"\n[test] --fusion none: {n_npz} 个逐视角 npz 在 {out_root / 'depth'}\n"
+              f"[test] 融合: python points_fusibile.py --out {out_root} --ply-dir <PLY_DIR>")
         return
 
     del model

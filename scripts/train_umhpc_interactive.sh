@@ -5,7 +5,7 @@
 #
 #   salloc --partition=gpu-a100 --gres=gpu:1 --cpus-per-task=16 --mem=96G --time=1-00:00:00
 #   cd /scr/user/qinglong/projects/upr-mvs01
-#   ARM=w1 bash scripts/train_umhpc_interactive.sh
+#   ARM=sva bash scripts/train_umhpc_interactive.sh   (默认就是 sva)
 #
 # arm 与训练参数全部来自 scripts/_arm_common.sh —— 与 scripts/sbatch_1gpu.sh
 # 是同一份。两个脚本各抄一份 arg 列表迟早会漂, 那时候两条曲线还长得很像,
@@ -18,7 +18,7 @@
 # 跑丢 30 小时很亏; 本脚本适合短跑和调试。
 #
 # 显存: 提交长跑之前先量, 不要信默认的 PER_GPU_BATCH:
-#     ARM=w1 bash scripts/fit_batch.sh
+#     ARM=sva bash scripts/fit_batch.sh
 # =============================================================================
 
 set -euo pipefail
@@ -41,7 +41,7 @@ fi
 cd "$PROJECT_DIR"
 
 # --- arm 与公共参数: 与双卡脚本同源 ---
-ARM=${ARM:-w1}
+ARM=${ARM:-sva}
 NPROC=1                       # 必须在 source 之前: 用来算 GLOBAL_BATCH 和 lr
 # shellcheck source=scripts/_arm_common.sh
 source "$PROJECT_DIR/scripts/_arm_common.sh"

@@ -3,7 +3,7 @@
 # 在**目标卡**上量 per-GPU batch 的显存占用, 然后再决定 PER_GPU_BATCH。
 # 不训练, 扫完就退出。在已经拿到 GPU 的 interactive shell 里跑。
 #
-#   ARM=w1 bash scripts/fit_batch.sh
+#   ARM=sva bash scripts/fit_batch.sh   (默认就是 sva)
 #   ARM=w3b BATCHES=1,2,4,6,8,10 TARGET=0.95 bash scripts/fit_batch.sh
 #
 # 为什么不能靠算: 显存对 batch 近似线性, 但对**像素数不是**干净的线性 ——
@@ -29,7 +29,7 @@ FIT_HW=${FIT_HW:-}                  # 空 = 用多尺度里最大的
 [[ -x "$PYTHON_BIN"  ]] || { echo "找不到解释器: $PYTHON_BIN" >&2; exit 1; }
 cd "$PROJECT_DIR"
 
-ARM=${ARM:-w1}
+ARM=${ARM:-sva}
 NPROC=${NPROC:-1}
 # shellcheck source=scripts/_arm_common.sh
 source "$PROJECT_DIR/scripts/_arm_common.sh"

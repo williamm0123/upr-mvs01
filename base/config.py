@@ -156,8 +156,13 @@ class DepthRangeConfig:
     # 32/16 -> 40/8: 共位测试 (experiments/out/coloc_val_*.log) 显示 stage1 尾巴上
     # global 分支 100% 含 <20mm 候选、81% 含 <8mm, 而 local 分支只有 47.8%/37.9%。
     # 把预算从命中率低的分支挪走。总数仍须 == num_depths_stage1。
-    num_global: int = 40
-    num_local: int = 8
+    # 2026-09-18 -> 44/4: local 候选过多时会严重干扰 stage1 的深度假设 (先验错
+    # 的区域里一整簇 local bin 与 global 网格竞争), 只留 4 个贴着先验的候选。
+    # ⚠ 所有 *_gi 常数以 global_interval = span/(num_global-1) 为单位, 改
+    # num_global 会连带缩放 stage2-4 的窗口下限 —— 训练脚本里 RANGE_MIN_GI 已按
+    # (44-1)/(32-1) 换算, 保持 stage2-4 的绝对窗口与 32/16 基线一致。
+    num_global: int = 44
+    num_local: int = 4
     global_quantile_lo: float = 0.002
     global_quantile_hi: float = 0.998
     global_margin_ratio: float = 0.12
@@ -376,6 +381,10 @@ class CVPEConfig:
     p8->p4->p2->p1 传遍四级。``enabled=False`` 时模块**不构造**, 且构造顺序排在
     所有既有模块之后 —— 于是既不占参数, 也不改变前面任何模块从全局 RNG 取到的
     随机数。开启时 out_proj 零初始化, step 0 的输出与关闭逐位一致。
+
+    **2026-09-18 已从网络卸载**: ``models/cvpe.py`` 保留, 但 ``UprMVSNet`` 不再
+    构造或调用它, ``enabled=True`` 会直接报错。字段留着只为读旧 checkpoint 的
+    fingerprint 时能给出明确的错误而不是静默跑成另一个模型。
     """
 
     enabled: bool = False
@@ -386,6 +395,28 @@ class CVPEConfig:
     # 固定 ('self','cross') x 4, 与 MonoMVSNet 的 layer_names 一致。写成字符串
     # 是为了进 fingerprint 时可读; 解析在 models/cvpe.py。
     layer_pattern: str = "self,cross,self,cross,self,cross,self,cross"
+
+
+@dataclass(frozen=True)
+class SVAConfig:
+    """MVSFormer++ 的完整 SVA (models/sva.py + models/spre.py 的 SVAFusion)。
+
+    ``full=False``: 旧行为 —— DINO token 上一段 SVA, 1x1 conv 投到 FPN 宽度,
+    双线性上采样后加到 p8。
+    ``full=True``: 第一段 SVA 之后 proj + 两层 deconv (x4) 上采样, 加到 p8,
+    再在 1/8 上加 normalized 2D-PE、做 (self, cross, self, cross) 四层线性注意力,
+    然后沿 FPN top-down 传到 1/4、1/2、1/1。
+
+    需要 ``dino.mode != off`` 且 ``dino.feed_fpn=True`` (第二段作用在融合了 DINO
+    的 1/8 特征上)。注意力类型固定为线性注意力 (MVSFormer++ 的 FMT_config), 不是
+    配置项: 它对序列长度不敏感, 而推理时 p8 的 token 数是训练的 2-4 倍。
+    """
+
+    full: bool = False
+    hr_layers: str = "self,cross,self,cross"   # FMT_config.layer_names
+    hr_heads: int = 4                            # FMT_config.nhead
+    hr_mlp_ratio: float = 4.0
+    pe_max_shape: tuple[int, int] = (128, 128)   # PositionEncodingSineNorm 的默认值
 
 
 @dataclass(frozen=True)
@@ -622,6 +653,7 @@ class MVSConfig:
     prior: PriorConfig = field(default_factory=PriorConfig)
     fpn: FPNConfig = field(default_factory=FPNConfig)
     cvpe: CVPEConfig = field(default_factory=CVPEConfig)
+    sva: SVAConfig = field(default_factory=SVAConfig)
     depth_range: DepthRangeConfig = field(default_factory=DepthRangeConfig)
     cost_volume: CostVolumeConfig = field(default_factory=CostVolumeConfig)
     points_alignment: PointsAlignmentConfig = field(default_factory=PointsAlignmentConfig)

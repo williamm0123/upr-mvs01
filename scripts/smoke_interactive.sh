@@ -1,186 +1,172 @@
 #!/bin/bash -l
 # =============================================================================
-# UPRMVS 工单 v3 —— interactive 节点上的实现校验 + 显存实测。
-# 本脚本不含 sbatch/salloc/srun, 不申请任何资源, 只在已经拿到 GPU 的 shell 里跑。
+# UPRMVS —— 单卡 A100-80GB 上的**实现校验 + 显存实测** (默认 ARM=sva)。
+# 在已经拿到 GPU 的 interactive shell 里跑; 本脚本不含 sbatch/salloc/srun,
+# 不申请任何资源。
 #
-#   salloc --partition=gpu-a100 --gres=gpu:1 --cpus-per-task=16 --mem=96G --time=02:00:00
-#   cd /scr/user/qinglong/projects/upr-mvs01
+#   salloc --partition=gpu-a100 --gres=gpu:1 --cpus-per-task=16 --mem=96G --time=03:00:00
+#   cd /scr/user/qinglong/projects/upr-mvs01 && git pull
 #   bash scripts/smoke_interactive.sh
 #
-# 五步, 全部是**实现校验**而不是性能实验:
-#   [1] 单元检查            不碰数据集, 秒级
-#   [2] legacy 等价性       axis_space=inverse 在 step 0 必须与 legacy 逐元素一致
-#   [3] 死参数检查          每个可训练参数都要收到梯度 (白占优化器状态 / DDP 会炸)
-#   [4] 显存峰值            合成全分辨率前反向的确切峰值 + batch 扫描
-#   [5] 真实数据短跑        四个 arm + 一次长跑 (2026-08-23 起只用单卡)
+# 四步, 回答的都是 "跑不跑得通 / 占多少显存", **不是**性能实验:
+#   [1] env    GPU / torch / git / 数据集与先验缓存路径
+#   [2] synth  scripts/verify_sva.py (8 条实现校验: PE / 线性注意力与 MVSFormer++
+#              逐元素一致、44+4 候选、梯度覆盖、fingerprint 往返、CVPE 已卸载),
+#              然后合成数据 train.py --smoke: 构造 + 前向 + 反向 + 存 checkpoint。
+#              不碰数据集, 几分钟内出结果。这一步挂了后面不用看。
+#   [3] mem    train.py --fit-batch: 在多尺度里**最大**的训练尺度 (640x896) 上
+#              逐个 batch 量峰值显存 (合成数据, 前反向两步, 含 AdamW 状态)。
+#   [4] real   真实数据 LONG_STEPS 步训练 + 结尾一次完整 val, 后台 nvidia-smi
+#              每秒采样。报: 峰值显存 / 占用率 / GPU 利用率 / s/step -> 30k ETA /
+#              有无 nan。
 #
-# **[2] 不过就不要往下走。** W1 同时动了轴的空间、interval 的算法、回归方式和
-# 损失, 任何一处写错都会以"效果不好"而不是报错的形式出现。
+# 训练参数与 scripts/sbatch_1gpu.sh **同源** (scripts/_arm_common.sh), 所以这里
+# 量到的就是正式训练的那一份, 不是另一个配置。
 #
 # 只跑某一步:  STAGE=mem bash scripts/smoke_interactive.sh
+# 调整:        LONG_STEPS=500 FIT_BATCHES=2,4,6 PER_GPU_BATCH=4 bash ...
 # =============================================================================
 set -euo pipefail
 
 PROJECT_DIR=${PROJECT_DIR:-/scr/user/qinglong/projects/upr-mvs01}
 PYTHON_BIN=${PYTHON_BIN:-/home/user/qinglong/.conda/envs/uprmvs/bin/python}
-SMOKE_STEPS=${SMOKE_STEPS:-1000}        # arm 扫描: 只问"跑不跑得起来"
-LONG_STEPS=${LONG_STEPS:-2000}        # 长跑: 工单验收 (4) 要 200-500 步
-LONG_ARM=${LONG_ARM:-w1}             # 长跑用哪个 arm (就是你要提交的那个)
-BATCH_SIZE=${BATCH_SIZE:-4}          # per-GPU
-NUM_WORKERS=${NUM_WORKERS:-4}
-NUM_VIEWS=${NUM_VIEWS:-5}
-MEM_BATCHES=${MEM_BATCHES:-"1 2 4"}  # 显存扫描的 per-GPU batch
-STAGE=${STAGE:-all}                  # all / units / equiv / ddpcheck / mem / run / long
+TRAIN_PROFILE=${TRAIN_PROFILE:-umhpc}
+STAGE=${STAGE:-all}                 # all / env / synth / mem / real
+SMOKE_STEPS=${SMOKE_STEPS:-3}
+FIT_BATCHES=${FIT_BATCHES:-1,2,4,5,6}
+FIT_TARGET=${FIT_TARGET:-0.90}
+LONG_STEPS=${LONG_STEPS:-300}
 
 [[ -d "$PROJECT_DIR" ]] || { echo "找不到项目目录: $PROJECT_DIR" >&2; exit 1; }
-[[ -x "$PYTHON_BIN"  ]] || { echo "找不到解释器: $PYTHON_BIN" >&2; exit 1; }
+[[ -x "$PYTHON_BIN"  ]] || { echo "找不到解释器: $PYTHON_BIN (用 PYTHON_BIN=... 覆盖)" >&2; exit 1; }
 cd "$PROJECT_DIR"
 
-export UPRMVS_MACHINE=umhpc
-export UPRMVS_PROFILE=umhpc
+ARM=${ARM:-sva}
+NPROC=1                       # 必须在 source 之前: 用来算 GLOBAL_BATCH 和 lr
+# shellcheck source=scripts/_arm_common.sh
+source "$PROJECT_DIR/scripts/_arm_common.sh"
+SMOKE_NAME="smoke_${ARM}"
+
+export UPRMVS_MACHINE=${UPRMVS_MACHINE:-umhpc}
+export UPRMVS_PROFILE="$TRAIN_PROFILE"
 export PYTHONPATH="$PROJECT_DIR:$PROJECT_DIR/models:$PROJECT_DIR/models/Depth-Anything-3/src"
 export PYTHONNOUSERSITE=1
 export PYTHONUNBUFFERED=1
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-8}
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 
-echo "=================================================================="
-echo " UPRMVS 工单 v3 实现校验"
-echo " host=$(hostname)  job=${SLURM_JOB_ID:-none}"
-echo " CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-not-set}"
-echo "=================================================================="
-nvidia-smi --query-gpu=index,name,memory.total,memory.used --format=csv
-"$PYTHON_BIN" -c 'import torch;print("torch",torch.__version__,"cuda",torch.cuda.is_available(),"gpus",torch.cuda.device_count())'
-NGPU=$("$PYTHON_BIN" -c 'import torch;print(torch.cuda.device_count())')
-[[ "$NGPU" -ge 1 ]] || { echo "没有可见 GPU —— 先进 GPU interactive 分配" >&2; exit 1; }
+OUT_DIR="logs/smoke_${ARM}_$(date +%Y%m%d_%H%M%S)"
+mkdir -p "$OUT_DIR"
 
 run_stage () { [[ "$STAGE" == "all" || "$STAGE" == "$1" ]]; }
+train_cmd=("$PYTHON_BIN" train.py --gpus 1 --ddp off "${COMMON_ARGS[@]}" "${ARM_ARGS[@]}")
 
-# ------------------------------------------------------------------ [1] 单元
-if run_stage units; then
-echo; echo "### [1/5] 单元检查 (不碰数据集) ###"
-"$PYTHON_BIN" scripts/verify_w1.py --units
+echo "=================================================================="
+echo " UPRMVS 单卡实现校验 + 显存实测   arm=$ARM"
+echo " host=$(hostname)  job=${SLURM_JOB_ID:-none}  CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-not-set}"
+echo " git=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)$(git diff --quiet 2>/dev/null || echo ' (工作树有改动)')"
+echo " per_gpu_batch=$PER_GPU_BATCH  lr=$LR  views=$NUM_VIEWS  workers=$NUM_WORKERS"
+echo " stage1: global=$NUM_GLOBAL local=$NUM_LOCAL  range_min_gi=$RANGE_MIN_GI"
+echo " arm_args: ${ARM_ARGS[*]}"
+echo " 日志目录: $OUT_DIR"
+echo "=================================================================="
+
+# ------------------------------------------------------------------ [1] env
+# 环境检查每次都跑: 它很便宜, 而且没卡的话后面三步都没有意义。
+echo; echo "### [1/4] 环境 ###"
+nvidia-smi --query-gpu=index,name,memory.total,memory.used --format=csv
+"$PYTHON_BIN" - <<'PY'
+import sys, torch
+print(f"python {sys.executable}\ntorch {torch.__version__}  cuda={torch.cuda.is_available()}  gpus={torch.cuda.device_count()}")
+if not torch.cuda.is_available():
+    sys.exit("没有可见 GPU —— 先进 GPU interactive 分配 (salloc ... --gres=gpu:1)")
+p = torch.cuda.get_device_properties(0)
+print(f"GPU0 {p.name}  {p.total_memory / 2**30:.1f} GiB  sm_{p.major}{p.minor}")
+from base.config import ProjectPaths
+pp = ProjectPaths()
+for k in ("dtu_train_root", "prior_cache_path", "dinov3_weights_file"):
+    v = getattr(pp, k)
+    print(f"  {k:20s} {v}{'' if v.exists() else '   <<< 不存在'}")
+PY
+
+# ------------------------------------------------------------------ [2] synth
+if run_stage synth; then
+echo; echo "### [2/4] 实现校验 (scripts/verify_sva.py) ###"
+set +e
+"$PYTHON_BIN" scripts/verify_sva.py 2>&1 | tee "$OUT_DIR/verify_sva.log" | grep -E "^\[verify_sva\]|\[ok\]|Error|assert"
+rc=${PIPESTATUS[0]}
+set -e
+[[ $rc -eq 0 ]] || { echo "verify_sva 失败 (退出码 $rc), 完整日志 $OUT_DIR/verify_sva.log" >&2; exit "$rc"; }
+echo; echo "### [2/4] 合成数据 smoke (${SMOKE_STEPS} 步, 构造 + 前向 + 反向 + 存 ckpt) ###"
+set +e
+"${train_cmd[@]}" --batch-size "$PER_GPU_BATCH" --name "$SMOKE_NAME" \
+    --smoke --smoke-steps "$SMOKE_STEPS" 2>&1 | tee "$OUT_DIR/synth.log" | grep -E "^\[smoke|params=|Error"
+rc=${PIPESTATUS[0]}
+set -e
+[[ $rc -eq 0 ]] || { echo "合成数据 smoke 失败 (退出码 $rc), 完整日志 $OUT_DIR/synth.log" >&2; exit "$rc"; }
 fi
 
-# ------------------------------------------------------- [2] legacy 等价性
-if run_stage equiv; then
-echo; echo "### [2/5] legacy 等价性 (step 0 的候选轴必须逐元素一致) ###"
-"$PYTHON_BIN" scripts/verify_w1.py --equivalence --tol 1e-5
-fi
-
-# ------------------------------------------------------------- [3] DDP 前提
-if run_stage ddpcheck; then
-echo; echo "### [3/5] 死参数检查: 每个可训练参数都要收到梯度 ###"
-echo "    (要梯度却永远收不到 = 白占 AdamW 状态; 而且一旦回到 DDP"
-echo "     find_unused_parameters=False 会在第二个 iteration 直接报错)"
-"$PYTHON_BIN" scripts/verify_w1.py --ddp-check
-fi
-
-# ------------------------------------------------------------- [4] 显存峰值
+# ------------------------------------------------------------------ [3] mem
 if run_stage mem; then
-echo; echo "### [4/5] 合成全分辨率前反向的**确切**显存峰值 ###"
-echo "    torch.cuda.max_memory_allocated —— nvidia-smi 的采样在短跑里经常采不到峰值"
-for b in $MEM_BATCHES; do
-  echo; echo "--- per-GPU batch = $b ---"
-  set +e
-  "$PYTHON_BIN" scripts/verify_w1.py --mem --batch "$b" --views "$NUM_VIEWS"
-  rc=$?
-  set -e
-  if [[ $rc -ne 0 ]]; then
-    echo "    batch=$b 失败 (很可能是 OOM) —— 这就是这张卡的上界"
-    break
-  fi
-done
-echo
-echo "提示: 训练是多尺度的 (最大 640x896, 见 cfg.augment.scales), 上面用的是"
-echo "      target 512x640。按 0.57 + B x (0.18 + 21.9 x Mpx) GiB 外推到 640x896:"
-echo "      B=1 约 13GiB, B=2 约 26GiB, B=4 约 51GiB, W1/W3 再加约 6%。"
+echo; echo "### [3/4] 显存扫描: 最大训练尺度上 batch = ${FIT_BATCHES} ###"
+echo "    (训练是多尺度的, 峰值只出现在最大尺度那几步; 按它定 batch 才不会跑到一半 OOM)"
+set +e
+"${train_cmd[@]}" --batch-size 1 --name "fit_${ARM}" \
+    --fit-batch "$FIT_BATCHES" --fit-target "$FIT_TARGET" \
+    --fit-lr-ref "$LR_REF" --fit-lr-ref-batch "$LR_REF_BATCH" 2>&1 | tee "$OUT_DIR/fit_batch.log" \
+    | grep -E "^\[fit-batch\]|^ +[0-9]+ |batch +allocated|OOM|卡 ->"
+rc=${PIPESTATUS[0]}
+set -e
+[[ $rc -eq 0 ]] || { echo "显存扫描异常退出 (退出码 $rc), 完整日志 $OUT_DIR/fit_batch.log" >&2; exit "$rc"; }
 fi
 
-# ------------------------------------------------------- [5] 真实数据短跑
-if run_stage run; then
-echo; echo "### [5/5] 真实数据短跑 (每个配置 ${SMOKE_STEPS} 步) ###"
-common=(
-  --profile umhpc --gpus 1 --ddp off
-  --batch-size "$BATCH_SIZE" --num-views "$NUM_VIEWS" --num-workers "$NUM_WORKERS"
-  --amp on --amp-dtype bf16
-  --num-global 32 --num-local 16 --range-min-gi 0.66,0.20,0.10
-  --gate-local off --branch-prior off
-  --stage1-weight 0.5 --w-branch 0 --prior on --spre on
-  --no-clean-lists --smoke --smoke-steps "$SMOKE_STEPS" --build-priors skip
-)
-W1_ARGS=(--axis-space inverse --stage4-head map --mode-window-stages 2,2,1,2
-         --spre-cascade on --tau-stages 0.98,0.95,0.92)
-for cfgname in w0 w1 w3 w3b; do
-  case "$cfgname" in
-    w0)  extra=(--axis-space legacy_depth --stage4-head expect --visibility off) ;;
-    w1)  extra=("${W1_ARGS[@]}" --visibility off) ;;
-    w3)  extra=("${W1_ARGS[@]}" --visibility off --geo-valid on
-                --conf-head on --w-conf 1.0) ;;
-    w3b) extra=("${W1_ARGS[@]}" --geo-valid on --conf-head on --w-conf 1.0
-                --visibility on --vis-mode sigmoid --vis-supervise on --w-vis 0.1) ;;
-  esac
-  echo; echo "--- arm: $cfgname ---"
-  mon="/tmp/gpu_${cfgname}_$$.csv"
-  nvidia-smi --query-gpu=index,memory.used,utilization.gpu \
-      --format=csv,noheader -l 2 > "$mon" 2>/dev/null &
-  monpid=$!
-  set +e
-  "$PYTHON_BIN" train.py "${common[@]}" "${extra[@]}" --name "smoke_$cfgname" 2>&1 | tail -12
-  rc=${PIPESTATUS[0]}
-  set -e
-  kill "$monpid" 2>/dev/null || true
-  wait "$monpid" 2>/dev/null || true
-  if [[ -s "$mon" ]]; then
-    echo "--- $cfgname nvidia-smi 采样峰值 (2s 间隔, 只是参考; 确切值看 [4]) ---"
-    sort -t, -k2 -n -r "$mon" | head -2
-  fi
-  rm -f "$mon"
-  [[ "$rc" -eq 0 ]] || { echo "arm $cfgname 退出码 $rc" >&2; exit "$rc"; }
-done
+# ------------------------------------------------------------------ [4] real
+if run_stage real; then
+echo; echo "### [4/4] 真实数据 ${LONG_STEPS} 步 + 一次完整 val (batch=$PER_GPU_BATCH) ###"
+MON="$OUT_DIR/nvidia_smi.csv"
+nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu \
+    --format=csv,noheader,nounits -l 1 > "$MON" 2>/dev/null &
+monpid=$!
+trap 'kill $monpid 2>/dev/null || true' EXIT
+set +e
+"${train_cmd[@]}" --batch-size "$PER_GPU_BATCH" --name "${SMOKE_NAME}_real" \
+    --steps "$LONG_STEPS" --val-interval 1000000000 --log-interval 10 --resume off \
+    2>&1 | tee "$OUT_DIR/real.log" | grep -E "^\[step|^\[val|NonFinite|Error|OOM|out of memory"
+rc=${PIPESTATUS[0]}
+set -e
+kill "$monpid" 2>/dev/null || true
+wait "$monpid" 2>/dev/null || true
 
-fi
-
-# ------------------------------------------- [5b] 真实数据长跑 (工单验收 (4))
-if run_stage long; then
-echo; echo "### [5b] 真实数据长跑 ${LONG_STEPS} 步 (arm=$LONG_ARM) ###"
-echo "    工单验收 (4): 检查非有限值、梯度范数、张量形状。"
-echo "    **不是**性能实验 —— 200 步区分不了'实现有 bug'和'方案不行', 不要拿它排名。"
-case "$LONG_ARM" in
-  w0)  long_extra=(--axis-space legacy_depth --stage4-head expect --visibility off) ;;
-  w1)  long_extra=(--axis-space inverse --stage4-head map --mode-window-stages 2,2,1,2
-                   --spre-cascade on --tau-stages 0.98,0.95,0.92 --visibility off) ;;
-  w3)  long_extra=(--axis-space inverse --stage4-head map --mode-window-stages 2,2,1,2
-                   --spre-cascade on --tau-stages 0.98,0.95,0.92 --visibility off
-                   --geo-valid on --conf-head on --w-conf 1.0) ;;
-  w3b) long_extra=(--axis-space inverse --stage4-head map --mode-window-stages 2,2,1,2
-                   --spre-cascade on --tau-stages 0.98,0.95,0.92
-                   --geo-valid on --conf-head on --w-conf 1.0
-                   --visibility on --vis-mode sigmoid --vis-supervise on --w-vis 0.1) ;;
-  *)   echo "LONG_ARM 只能是 w0/w1/w3/w3b" >&2; exit 2 ;;
-esac
-LONG_LOG="/tmp/uprmvs_long_${LONG_ARM}_$$.log"
-"$PYTHON_BIN" train.py     --profile umhpc --gpus 1 --ddp off     --batch-size "$BATCH_SIZE" --num-views "$NUM_VIEWS" --num-workers "$NUM_WORKERS"     --amp on --amp-dtype bf16     --num-global 32 --num-local 16 --range-min-gi 0.66,0.20,0.10     --gate-local off --branch-prior off     --stage1-weight 0.5 --w-branch 0 --prior on --spre on     "${long_extra[@]}"     --steps "$LONG_STEPS" --lr-schedule-steps 30000     --val-interval "$LONG_STEPS" --log-interval 10     --no-clean-lists --build-priors skip --resume off     --name "long_$LONG_ARM" 2>&1 | tee "$LONG_LOG" | tail -30
 echo
-echo "--- 非有限值 / 梯度自检 ---"
-if grep -qiE "nan|inf" "$LONG_LOG"; then
-  echo "  日志里出现 nan/inf, 逐行看一下 (rescue_err=nan 在 branch_prior=off 时是正常的):"
-  grep -inE "nan|inf" "$LONG_LOG" | head -10
+echo "--- [4] 汇总 ---"
+if [[ -s "$MON" ]]; then
+    awk -F', *' '{u=$1; t=$2; if (u>m) m=u; s+=$3; n++} END {
+        printf "  nvidia-smi 峰值显存 %.1f / %.1f GiB = %.1f%%   平均 GPU 利用率 %.0f%% (%d 个采样, 含 val 与 dataloader 预热)\n",
+               m/1024, t/1024, 100*m/t, s/n, n }' "$MON"
+fi
+last=$(grep -E "^\[step" "$OUT_DIR/real.log" | tail -1 || true)
+if [[ -n "$last" ]]; then
+    echo "  最后一行: $last"
+    sps=$(sed -n 's/.* \([0-9.]*\)s\/step.*/\1/p' <<<"$last")
+    [[ -n "$sps" ]] && awk -v s="$sps" -v n="$STEPS" \
+        'BEGIN{printf "  %.2f s/step -> %d 步约 %.1f 小时 (不含 val; 每 500 步一次 val)\n", s, n, s*n/3600}'
+fi
+if grep -E "^\[step" "$OUT_DIR/real.log" | grep -qE "loss=(nan|inf)|abs_err=(nan|inf)"; then
+    echo "  !!! loss / abs_err 出现 nan/inf:"
+    grep -E "^\[step" "$OUT_DIR/real.log" | grep -E "loss=(nan|inf)|abs_err=(nan|inf)" | head -5
 else
-  echo "  [ok] 日志里没有 nan/inf"
+    echo "  [ok] 训练行里 loss / abs_err 没有 nan/inf (rescue_err=nan 在窗口里没有被破坏的先验时是正常的)"
 fi
-grep -E "grad/norm|nonfinite" "$LONG_LOG" | tail -3 || true
-echo "  完整日志: $LONG_LOG"
-echo "  梯度范数 / amp_scale / nonfinite_frac 三条曲线在 tensorboard 的"
-echo "  train/diag_grad_* 下, 事故的提前量都在那里。"
+grep -E "^\[val" "$OUT_DIR/real.log" | tail -1 || echo "  !!! 没有 val 输出 —— val 没跑完"
+[[ $rc -eq 0 ]] || { echo "真实数据短跑失败 (退出码 $rc), 完整日志 $OUT_DIR/real.log" >&2; exit "$rc"; }
 fi
 
 echo
 echo "=================================================================="
-echo " 校验结束。提交 30k 之前确认:"
-echo "   * [2] legacy 等价性 PASS —— 不过就不要提交"
-echo "   * [3] 四个配置都没有 '缺梯度' 的参数"
-echo "   * [4] 目标 batch 的峰值显存离 80GiB 有余量 (多尺度会再高约 40%)"
-echo "   * [5] 四个 arm 都没有非有限值"
-echo "   * [5b] ${LONG_STEPS} 步长跑没有 nan/inf, 梯度范数没有发散"
+echo " 校验结束 (完整日志在 $OUT_DIR)。提交 30k 之前确认:"
+echo "   * [2] verify_sva 全部通过, 合成数据 smoke 打印了 '[smoke] OK'"
+echo "   * [3] PER_GPU_BATCH=$PER_GPU_BATCH 那一行的占用率 < 90%"
+echo "         (没有就改小: PER_GPU_BATCH=... sbatch scripts/sbatch_1gpu.sh, lr 会自动按 sqrt 缩放)"
+echo "   * [4] 没有 nan/inf、val 正常结束; 看一眼 s/step 推算的 30k 时长是否在 --time=2 天之内"
+echo " 然后:  sbatch scripts/sbatch_1gpu.sh"
 echo "=================================================================="

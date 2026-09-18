@@ -254,32 +254,35 @@ class UprMVSNet(nn.Module):
                 "dino_mode != 'off' 但 feed_fpn=False 且 reliability_source != 'spre' "
                 "—— DINO 会被加载却无人使用。请设 dino_mode='off'。"
             )
+        # MVSFormer++ 完整 SVA (deconv + 1/8 的 2D-PE + self/cross)。第二段作用在
+        # 融合了 DINO 的 p8 上, 所以必须有 DINO 且喂 FPN; 否则直接报错而不是静默
+        # 退回旧的 1x1 投影。
+        sva_cfg = getattr(self.cfg, "sva", None)
+        self.full_sva = bool(sva_cfg is not None and sva_cfg.full)
+        if self.full_sva and not (self.dino_enabled and self.feed_fpn):
+            raise ValueError(
+                "sva.full=True 需要 dino_mode != 'off' 且 feed_fpn=True "
+                f"(当前 dino_mode={self.dino_mode!r}, feed_fpn={self.feed_fpn})")
         if self.dino_enabled:
             from models.spre import SPRE, DinoSVA
             self.dino_sva = DinoSVA(
                 self.cfg.spre, self.cfg.dino, self.cfg.paths.dinov3_weights_file,
                 fpn_channels=fpn_c if self.feed_fpn else None,
+                sva_cfg=sva_cfg,
             )
             # 只在真的要用时实例化: 多卡 DDP 用 find_unused_parameters=False,
             # 建了却不 forward 的参数会在 reduction 时报错。
             self.spre = SPRE(self.cfg.spre, self.dino_sva.out_dim) if self.spre_enabled else None
 
-        # ---- CVPE (工单 v5.3 的主线模块) --------------------------------------
-        # **必须构造在最后**: 关闭时不构造, 开启时也只在所有既有模块之后从全局
-        # RNG 取数, 于是 cvpe=off 的 checkpoint 与改动前逐位一致, cvpe=on 也不会
-        # 让前面任何模块拿到不同的初始权重。两者是严格配对的实验。
+        # ---- CVPE: 2026-09-18 已卸载 ------------------------------------------
+        # models/cvpe.py 保留, 但网络不再构造也不再调用它; p8 注入点现在给完整
+        # SVA 的第二段用。enabled=True 直接报错 —— 静默忽略的话, 旧 vNext 的
+        # checkpoint 会被当成"没有 CVPE 的模型"加载, 跑出另一个模型的点云。
         cvpe_cfg = getattr(self.cfg, "cvpe", None)
-        self.cvpe = None
         if cvpe_cfg is not None and bool(cvpe_cfg.enabled):
-            from models.cvpe import CrossViewPE
-            self.cvpe = CrossViewPE(
-                in_channels=fpn_c,
-                d_model=int(cvpe_cfg.d_model),
-                num_planes=int(cvpe_cfg.num_planes),
-                n_heads=int(cvpe_cfg.n_heads),
-                layer_pattern=tuple(x.strip() for x in cvpe_cfg.layer_pattern.split(",")),
-                cam_mid_channels=int(cvpe_cfg.cam_mid_channels),
-            )
+            raise ValueError(
+                "CVPE 已从网络卸载 (2026-09-18), cvpe.enabled 必须为 False。"
+                "要复现旧 vNext 的 checkpoint 请切回 f6de5b4。")
 
     def _resolve_depth_bounds(self, batch: dict) -> tuple[torch.Tensor, torch.Tensor]:
         if "depth_min" in batch and "depth_max" in batch:
@@ -482,21 +485,11 @@ class UprMVSNet(nn.Module):
         dino_fpn = (self.dino_sva.fpn_feature(fused, grid, coarse_hw)
                     if self.feed_fpn else None)
 
-        # CVPE 挂在 FPN 的 1/8 注入点上 (DINO 之后、top-down 之前), 所以它的修改
-        # 沿 p8->p4->p2->p1 传遍四级 —— 不需要另建一条平行的降维/上采样链。
-        # 模块只返回 delta, **残差相加只在这里做一次**; 用 cat 重建张量而不是
-        # 对 p8[:, 1:] 原地赋值 (原地写 autograd 叶子会静默地丢梯度)。
-        cvpe_fn = None
-        if self.cvpe is not None:
-            def cvpe_fn(p8: torch.Tensor) -> torch.Tensor:
-                delta = self.cvpe(
-                    p8=p8, K=K, E=E,
-                    depth_min=depth_min.reshape(-1), depth_max=depth_max.reshape(-1),
-                    feature_stride=s1_stride,
-                )
-                return torch.cat([p8[:, :1], p8[:, 1:] + delta], dim=1)
-
-        feats = self.fpn(images, dino=dino_fpn, cvpe_fn=cvpe_fn)  # {8: [B,V,C,h,w], ...}
+        # 完整 SVA 的第二段挂在 FPN 的 1/8 注入点上 (DINO 之后、top-down 之前):
+        # p8 (= FPN 1/8 + deconv 上来的 DINO) -> 2D-PE -> self/cross 注意力, 然后
+        # 沿 p8->p4->p2->p1 传遍四级, 与 MVSFormer++ 的 FMT_with_pathway 同构。
+        p8_fn = self.dino_sva.refine_p8 if self.full_sva else None
+        feats = self.fpn(images, dino=dino_fpn, p8_fn=p8_fn)  # {8: [B,V,C,h,w], ...}
 
         # ---------- Stage 1 (coarsest, 1/8): dual-branch hypotheses ----------
         feat1 = feats[s1_stride]
@@ -865,10 +858,10 @@ class UprMVSNet(nn.Module):
         # sub-dict, 把 refine_range_from_posterior 写进去的 range_stats 全冲掉。
         for _sname, _d in bimodal_diag.items():
             stage_out["range_diag"].setdefault(_sname, {}).update(_d)
-        if self.cvpe is not None and self.cvpe.last_stats is not None:
-            # 纯诊断, 不进损失。delta_rel 恒为 0 = CVPE 什么也没学到;
-            # 远大于 1 = 它在覆盖 p8 而不是修正 p8, 两头都是故障信号。
-            stage_out["range_diag"]["cvpe"] = dict(self.cvpe.last_stats)
+        if self.full_sva and self.dino_sva.hr.last_stats is not None:
+            # 纯诊断, 不进损失。delta_rel 恒为 ~0 = 1/8 的注意力什么也没学到;
+            # 远大于 1 = 它在覆盖 FPN 特征而不是修正, 两头都是故障信号。
+            stage_out["range_diag"]["sva"] = dict(self.dino_sva.hr.last_stats)
         stage_out["range_diag"]["branch"] = {"bp_beta": float(getattr(self, "last_bp_beta", 0.0))}
         stage_out["range_diag"]["cost"] = {
             f"max_s{i + 1}": float(getattr(m, "last_cost_max", 0.0))

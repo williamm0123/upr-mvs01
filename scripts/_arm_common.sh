@@ -23,7 +23,7 @@
 #   NUM_WORKERS NUM_VIEWS STEPS LR SEED ...   给调用方 echo 用
 # =============================================================================
 
-ARM=${ARM:-w1}
+ARM=${ARM:-sva}
 
 # ---------------------------------------------------------------- arm 定义
 case "$ARM" in
@@ -85,23 +85,36 @@ case "$ARM" in
     fi
     ;;
   vnext)
-    # ---- 工单 v5.3 的唯一候选模型 ------------------------------------------
-    # 基座是 W0 (legacy_depth + stage4_head=expect), 因为与 MonoMVSNet 的点云
-    # 差距是 acc 主导 (+0.058 对 comp +0.022), 而 W0 在 capped_2mm / acc_2mm
-    # 上胜过 W1。W1 那一整套 (逆深度轴 / 可学习范围 / MAP 残差头 / SPRE 逐级
-    # 注入) 全部**不启用** —— 它们改的是 w_k 的下游, 而 w_k 在 W0 与 W1 之间
-    # 几乎不变 (stage3 差 0.7%)。
-    #
-    # 三个新模块构成一条完整的因果链, 不是三个可以逐项开关的小改动:
-    #   CVPE (相机感知的 source 特征) -> geo_valid (几何有效的多视聚合)
-    #   -> conf_head (学哪些深度进点云融合)
-    # 所以它们同批进、同批判读; 中途不按某一级的中间指标开新 arm。
-    RUN_NAME=${RUN_NAME:-UPRMVS_vNext}
+    # 工单 v5.3 的 vNext (W0 基座 + CVPE + geo_valid + conf_head)。
+    # **2026-09-18 退役**: CVPE 已从网络卸载, train.py 对 --cvpe on 直接报错。
+    # 它的后继是下面的 ARM=sva。要复现 vNext 请切回 f6de5b4。
+    echo "ARM=vnext 已退役 (CVPE 已卸载), 用 ARM=sva; 复现旧 vNext 请切回 f6de5b4" >&2
+    return 2 2>/dev/null || exit 2
+    ;;
+  sva)
+    # ---- 2026-09-18: vNext 去掉 CVPE + MVSFormer++ 完整 SVA + stage1 44/4 ----
+    # 三处改动 (一次训练, 一次点云终审):
+    #   1. 特征: MVSFormer++ 完整 SVA —— DINO token 上 self/cross (SVAFusion)
+    #      -> proj + 2x deconv 上采样到 1/8 -> 加到 FPN p8 -> normalized 2D-PE
+    #      -> (self, cross, self, cross) 线性注意力 -> 沿 FPN top-down 传到四级
+    #   2. stage1 候选 32 global + 16 local -> 44 global + 4 local
+    #   3. CVPE 卸载 (模块代码保留, 网络不再构造/调用)
+    # 其余沿用 vNext 的基座: legacy_depth + stage4 expect + geo_valid + conf_head。
+    RUN_NAME=${RUN_NAME:-UPRMVS_SVA_G44L4}
+    NUM_GLOBAL=${NUM_GLOBAL:-44}
+    NUM_LOCAL=${NUM_LOCAL:-4}
+    # ⚠ 单位陷阱: range_min_gi 以 global_interval = span/(num_global-1) 为单位。
+    # 32 -> 44 会把 gi 缩到 31/43 = 0.72, stage2-4 的窗口下限整体跟着缩 28%
+    # (上一次 32/16 -> 40/8 就这样把 stage4 in_range 从 0.809 拉到 0.690)。
+    # 这里按 (44-1)/(32-1) 换算, 让 stage2-4 的**绝对**窗口与 32/16 基线
+    # (0.66,0.20,0.10) 一致 —— 这一轮只改 stage1 的候选分配, 不连带改级联窗口。
+    RANGE_MIN_GI=${RANGE_MIN_GI:-0.9155,0.2774,0.1387}
     ARM_ARGS=(
       --axis-space legacy_depth                  # 不启用 W1 的逆深度轴/范围控制器
       --stage4-head expect                       # 不用 MAP + 有界残差
       --spre-cascade off                         # SPRE 只留 stage1 的稳定用法
-      --cvpe on                                  # 主线: 相机感知的跨视位置编码
+      --cvpe off                                 # 已卸载
+      --sva-full on                              # MVSFormer++ 完整 SVA
       --geo-valid on                             # 出画幅的零值不再进多视平均
       --conf-head on --conf-detach on            # 旁路置信度头 (梯度已分组裁剪)
       --w-conf "${W_CONF:-1.0}" --conf-tau-mm "${CONF_TAU_MM:-2.0}"
@@ -109,7 +122,7 @@ case "$ARM" in
     )
     ;;
   *)
-    echo "ARM 只能是 w0 / w1 / w3 / w3b / vnext, 收到 '$ARM'" >&2; return 2 2>/dev/null || exit 2 ;;
+    echo "ARM 只能是 w0 / w1 / w3 / w3b / sva, 收到 '$ARM'" >&2; return 2 2>/dev/null || exit 2 ;;
 esac
 
 # ------------------------------------------- 公共部分 (四个 arm 完全一致)
