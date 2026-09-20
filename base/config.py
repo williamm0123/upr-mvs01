@@ -60,6 +60,10 @@ def _default_paths() -> dict[str, Path]:
             # The filename encodes none of the resolutions it was built at, so a
             # changed --prior-resize-scale / --prior-target-* needs a force rebuild.
             "prior_cache_path": project_path / "log/prior_cache",
+            # 全量 DA3 单目深度缓存 (scripts/build_da3_cache_all.py), 一个 npz 每
+            # (scan, view, light), 与 prior_cache 无关 (不含 VGGT/融合/标尺), 只是原始
+            # DA3 输出, 存在原生 1200x1600 分辨率上, 供以后的实验直接复用。
+            "da3_cache_path": project_path / "log/da3_cache",
             # per-view depth/conf/K/E/image that fusion consumes, plus metrics.json,
             # under a <split>/ subdir. Kept after the run on purpose: re-fusing at
             # different --photo-thresh/--geo-* costs nothing while re-running
@@ -88,6 +92,7 @@ class ProjectPaths:
     dtu_list_path: Path = _DEFAULT_PATHS["dtu_list_path"]
     sfm_cache_path: Path = _DEFAULT_PATHS["sfm_cache_path"]
     prior_cache_path: Path = _DEFAULT_PATHS["prior_cache_path"]
+    da3_cache_path: Path = _DEFAULT_PATHS["da3_cache_path"]
     depth_cache_path: Path = _DEFAULT_PATHS["depth_cache_path"]
     pred_points_path: Path = _DEFAULT_PATHS["pred_points_path"]
     resnet50_weights_file: Path = _DEFAULT_PATHS["resnet50_weights_file"]
