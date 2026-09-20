@@ -51,6 +51,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
+from uuid import uuid4
 
 import cv2
 import numpy as np
@@ -81,6 +82,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dry-run", action="store_true", help="只统计目标组合数, 不装模型不跑")
     p.add_argument("--limit", type=int, default=0, help="调试用: 只处理前 N 个待办组合 (0=不限)")
     p.add_argument("--log-every", type=int, default=50)
+    p.add_argument("--shard", default=None, metavar="i/N",
+                   help="多进程分片: 只做待办列表里第 i 份 (0 起算) / 共 N 份。单卡实测 GPU "
+                        "没吃满 (瓶颈在 PNG 解码和 npz 压缩), 开 2~4 个进程各跑一片接近线性加速, "
+                        "例如 --shard 0/3 / --shard 1/3 / --shard 2/3 三个进程并行")
+    p.add_argument("--verify", action="store_true",
+                   help="不跑推理, 只校验已有缓存能否正常读出且形状/类型正确; 加 --repair 会把坏的删掉")
+    p.add_argument("--repair", action="store_true",
+                   help="配合 --verify: 删除损坏的缓存文件, 之后重跑主命令即可补回")
     p.add_argument("--out", default=None, help="覆盖 cfg.paths.da3_cache_path")
     p.add_argument("--dtu-root", default=None, help="覆盖 cfg.paths.dtu_train_root")
     p.add_argument("--device", default="cuda")
@@ -126,11 +135,51 @@ def build_todo(dtu_root: Path, cache_root: Path, scans: list[str], views: list[i
 
 
 def save_depth(path: Path, depth: np.ndarray, meta: dict) -> None:
+    """原子落盘。**临时名必须带进程号+随机串**: 2026-09-20 实测两个实例并行跑同一批文件时,
+    固定的 `xxx.npz.tmp` 会被两边同时打开 ("wb" 还会互相截断), 一边 os.replace 成功后另一边
+    报 FileNotFoundError, 而且先落地的那个文件还会被另一边残留的 fd 继续写花 —— 报错是小事,
+    静默损坏才是大事。带上 pid 之后每个进程有自己的临时文件, 多进程分片 (--shard) 才安全。"""
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    with tmp.open("wb") as fh:          # savez_compressed 会给不以 .npz 结尾的名字再加 .npz,
-        np.savez_compressed(fh, depth=depth, **meta)   # 必须传文件对象而不是路径字符串
-    os.replace(tmp, path)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid4().hex[:8]}.tmp")
+    try:
+        with tmp.open("wb") as fh:      # savez_compressed 会给不以 .npz 结尾的名字再加 .npz,
+            np.savez_compressed(fh, depth=depth, **meta)   # 必须传文件对象而不是路径字符串
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)     # 写一半失败时不留垃圾 (replace 成功后这里是 no-op)
+
+
+def verify_cache(cache_root: Path, scans: list[str], views: list[int], lights: list[int],
+                 repair: bool) -> int:
+    """逐个打开已有的 npz, 确认能解压、key 齐、形状是 1200x1600。并发写坏的文件 (见 save_depth
+    的注释) 只有真正读一遍才会暴露 —— 断点续跑只看文件在不在, 坏文件会被一直跳过。"""
+    bad: list[Path] = []
+    n_checked = 0
+    for scan in scans:
+        for view in views:
+            for light in lights:
+                f = cache_path(cache_root, scan, view, light)
+                if not f.is_file():
+                    continue
+                n_checked += 1
+                try:
+                    with np.load(f) as z:
+                        d = z["depth"]
+                        if d.shape != (NATIVE_H, NATIVE_W):
+                            raise ValueError(f"形状 {d.shape} != {(NATIVE_H, NATIVE_W)}")
+                        if not np.isfinite(np.asarray(d[::64, ::64], np.float32)).all():
+                            raise ValueError("抽样里有非有限值")
+                except Exception as exc:  # noqa: BLE001
+                    bad.append(f)
+                    print(f"    !! 坏文件 {f}: {type(exc).__name__}: {exc}", flush=True)
+    print(f"[da3-cache] 校验 {n_checked} 个文件, 坏 {len(bad)} 个")
+    if bad and repair:
+        for f in bad:
+            f.unlink(missing_ok=True)
+        print(f"[da3-cache] 已删除 {len(bad)} 个坏文件, 重跑主命令即可补回")
+    elif bad:
+        print("[da3-cache] 加 --repair 可以把它们删掉, 然后重跑主命令补回")
+    return len(bad)
 
 
 def _fmt(sec: float) -> str:
@@ -152,6 +201,10 @@ def main() -> None:
     views = args.views if args.views is not None else list(range(num_views(dtu_root)))
     lights = args.lights
 
+    if args.verify:
+        print(f"[da3-cache] 校验模式: cache_root={cache_root}")
+        raise SystemExit(1 if verify_cache(cache_root, scans, views, lights, args.repair) else 0)
+
     todo, stats = build_todo(dtu_root, cache_root, scans, views, lights, args.force)
     total_slots = len(todo) + stats["n_already_done"]
     print(f"[da3-cache] dtu_root={dtu_root}  cache_root={cache_root}")
@@ -160,6 +213,12 @@ def main() -> None:
     print(f"[da3-cache] 目标组合 {total_slots} (磁盘上有图的)  "
          f"已完成 {stats['n_already_done']}  待建 {len(todo)}  "
          f"(图不存在, 不计入待建/失败: {stats['n_no_image']})")
+    if args.shard:
+        i_s, n_s = (int(x) for x in args.shard.split("/"))
+        if not 0 <= i_s < n_s:
+            raise SystemExit(f"--shard 应该是 i/N 且 0 <= i < N, 收到 {args.shard}")
+        todo = todo[i_s::n_s]
+        print(f"[da3-cache] --shard {args.shard}: 本进程负责 {len(todo)} 个")
     if args.limit:
         todo = todo[: args.limit]
         print(f"[da3-cache] --limit {args.limit}: 只跑前 {len(todo)} 个")
