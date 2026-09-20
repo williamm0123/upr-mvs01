@@ -10,7 +10,7 @@ from base.config import ProjectPaths, build_mvs_config
 from data.dtu import DTUMVSDataset
 import models.norm_fill as norm_fill
 import data.camera_utils as C
-from models.depth_range import initial_range_from_prior
+# from models.depth_range import initial_range_from_prior
 from models.sfm import SfMConfig, generate_sparse_depth_from_sample
 from models.norm_fill import _tensor_to_uint8_hwc
 
@@ -34,7 +34,7 @@ def select_first_ref_per_scan_metas(metas):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--profile", choices=["local", "umhpc"], default=None)
+    parser.add_argument("--profile", choices=["local", "umhpc"], default="local")
     parser.add_argument("--device", default=None)
     parser.add_argument("--num-views", type=int, default=None)
     parser.add_argument("--max-scans", type=int, default=0)
@@ -65,6 +65,13 @@ def main():
         resize_scale=0.5,
     )
     dataset.metas = select_first_ref_per_scan_metas(dataset.metas)
+    path_prior = paths.prior_cache_path
+    prior_name = "prior_0000_3.npz"
+    prior_file_path = path_prior / "scan77"/prior_name
+    with np.load(prior_file_path) as prior_77:
+        print("读取成功，内部包含的键名:", prior_77.files)
+    # print("prior_77 keys:", prior_77.keys())
+        depth_prior = prior_77["depth_prior"]
 
     for i, sample in enumerate(dataset):
         if i>0:
@@ -81,17 +88,20 @@ def main():
             conf_percentile=args.conf_percentile,
             image_target_wh=(args.target_w, args.target_h),
         )
-        depth_filled = out["depth_filled"]
+        
         depth_gt = sample["depth_gt"]
         intrinsics = sample["intrinsics"][0]
         extrinsics = sample["extrinsics"][0]
-        depth_filled = C.backproject_depth_to_world_points(depth_filled, intrinsics, extrinsics)
+        points_prior = C.backproject_depth_to_world_points(depth_prior, intrinsics, extrinsics)
         depth_gt = C.backproject_depth_to_world_points(depth_gt, intrinsics, extrinsics)
 
-        colors_filled = np.tile(np.array([153, 204, 255], dtype=np.uint8), (depth_filled.shape[0], 1))
+        colors_filled = np.tile(np.array([153, 204, 255], dtype=np.uint8), (points_prior.shape[0], 1))
         colors_gt = np.tile(np.array([255, 255, 255], dtype=np.uint8), (depth_gt.shape[0], 1))
-        merged_points = np.concatenate([depth_filled, depth_gt], axis=0)
+        merged_points = np.concatenate([points_prior, depth_gt], axis=0)
         merged_colors = np.concatenate([colors_filled, colors_gt], axis=0)
         C.save_pointcloud_ply(merged_points, f"outputs/depth_hypo/{scan}_merged_pointcloud.ply", colors=merged_colors)
+
+
+
 if __name__ == "__main__":
     main()

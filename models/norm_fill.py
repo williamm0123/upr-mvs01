@@ -680,6 +680,7 @@ def generate_priors_from_sample(
 
     pred = _run_vggt(vggt_model, images_resized.clamp(0,255)/255.0, device)
     pred["images_uint8"] = images_uint8
+    print("vggt pred keys:", pred.keys())
     
     ## conf filtering
     points = np.asarray(pred["world_points"])
