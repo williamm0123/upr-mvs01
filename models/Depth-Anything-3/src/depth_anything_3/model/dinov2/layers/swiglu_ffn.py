@@ -36,7 +36,13 @@ try:
     from xformers.ops import SwiGLU
 
     XFORMERS_AVAILABLE = True
-except ImportError:
+except Exception:
+    # 2026-09-20: umhpc 上 torch 被别的安装悄悄升到了 2.8.0+cu128, 而装的 xformers 还是
+    # 编译给 2.3.1+cu121 的, C++/CUDA 扩展加载不了, 退到它自己的 triton 后端 —— 那条路又和
+    # 装的 triton 版本不兼容, 在 `xformers.ops.fmha.triton_splitk` 模块导入时就直接抛
+    # AttributeError (不是 ImportError), 原来这里只 except ImportError 接不住, 整个脚本
+    # 直接崩掉。SwiGLU 只是个可选的融合算子, 退回下面纯 PyTorch 的 SwiGLUFFN 功能等价、
+    # 只是慢一点, 所以任何导入期异常都应该退化, 不止 ImportError。
     SwiGLU = SwiGLUFFN
     XFORMERS_AVAILABLE = False
 
