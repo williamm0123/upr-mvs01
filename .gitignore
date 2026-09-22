@@ -38,6 +38,7 @@ slurm-*.err
 /outputs/
 /uprmvs_outputs/
 /models/fast_gicp/vcpkg/
+/models/sam3
 /experiments/
 # Model checkpoints and exported weights
 *.pth
