@@ -1,0 +1,196 @@
+"""Configuration for the MoA network (models/network_moa.py, train_moa.py, test_moa.py).
+
+A separate tree from ``base/config.MVSConfig`` on purpose: the new network has no
+prior / SPRE / depth-range sections, so nothing in here can switch them back on.
+Machine-independent building blocks (paths, FPN, SVA, DINO, augmentation) are
+reused from ``base/config`` unchanged.
+"""
+from __future__ import annotations
+
+import dataclasses
+import os
+import typing
+from dataclasses import dataclass, field
+
+from base.config import (
+    AugmentConfig, DINOConfig, FPNConfig, ProjectPaths, SPREConfig, SVAConfig,
+)
+
+
+@dataclass(frozen=True)
+class CascadeConfig:
+    """Four stages at strides 8/4/2/1, all axes uniform in inverse depth."""
+
+    num_depths: tuple[int, int, int, int] = (48, 16, 8, 4)
+    warp_channels: tuple[int, int, int, int] = (128, 64, 32, 16)
+    num_groups: int = 8
+    warp_use_half: bool = True
+    unet_base_channels: int = 16
+    unet_depth: int = 3
+    # DepthDecoder regression window (+-bins around the argmax) per stage.
+    mode_windows: tuple[int, int, int, int] = (2, 2, 1, 1)
+    # Stage 2/3/4 window half-width, in units of the parent stage's spacing.
+    window_halfwidth_bins: tuple[float, float, float] = (3.0, 2.0, 1.0)
+    # MoA.md §9: h' = max(h_base, |c - y| + h_keep) so the window still holds the MVS centre.
+    keep_margin_bins: tuple[float, float, float] = (1.0, 1.0, 0.5)
+
+
+@dataclass(frozen=True)
+class MoAConfig:
+    enabled: bool = True
+    # widths
+    emb_dim: int = 16
+    shape_width: int = 32
+    feat_dim: int = 16
+    evidence_dim: int = 16
+    evidence_hidden: int = 16
+    conf_hidden: int = 32
+    mix_hidden: int = 32
+    # DA3 edge barrier. tau_edge: log-depth jump between adjacent full-res pixels;
+    # tau_jump: endpoint log-depth difference at the working resolution.
+    tau_edge: float = 0.03
+    tau_jump: float = 0.10
+    edge_dilate: bool = False
+    # local WLS (3x3 / 5x5 / 7x7)
+    spatial_sigma: tuple[float, float, float] = (1.0, 2.0, 3.0)
+    tau_shape_init: float = 0.5
+    # Ridge toward the identity. x lives in [0,1], so a 3x3 window on a typical slope
+    # has Sw*Var(x) ~ 1e-4: anything near that would dominate the fit. Flat windows are
+    # handled by the offset-only branch (tau_var), not by the ridge.
+    lambda_a: float = 1e-6
+    lambda_b: float = 1e-6
+    tau_var: float = 1e-6
+    min_neff: tuple[float, float, float] = (2.0, 4.0, 6.0)
+    a_range: tuple[float, float] = (0.2, 5.0)
+    b_max: float = 0.25
+    # global affine (per sample, Huber IRLS)
+    global_iters: int = 3
+    global_huber_k: float = 1.345
+    global_min_eff: float = 64.0
+    # Per transition (->stage 2/3/4): largest centre move, in parent spacings.
+    max_shift_bins: tuple[float, float, float] = (8.0, 4.0, 2.0)
+    # depth conflict c_d = sigmoid((gap/(sigma+du) - t_d)/T_d); tighter at finer stages
+    conflict_t_d: tuple[float, float, float] = (3.0, 2.0, 1.5)
+    conflict_T_d: tuple[float, float, float] = (0.5, 0.5, 0.5)
+    conflict_tau_s: float = 1.0
+    # mixture head starts leaning on MVS (softmax logit bias of expert 0)
+    mvs_bias_init: float = 1.0
+
+
+@dataclass(frozen=True)
+class MoALossConfig:
+    stage_weights: tuple[float, float, float, float] = (1.0, 1.0, 1.5, 2.0)
+    moa_stage_weights: tuple[float, float, float] = (1.0, 1.0, 1.0)
+    w_center: float = 1.0
+    w_shape: float = 0.5
+    w_conf: float = 0.5
+    # GT depth discontinuity (log-depth jump between neighbours) excluded from L_shape
+    gt_edge_tau: float = 0.03
+
+
+@dataclass(frozen=True)
+class MoATrainConfig:
+    profile: str = "umhpc"
+    epochs: int = 15
+    max_steps: int = 0                 # 0 = epochs x steps_per_epoch
+    batch_size: int = 4
+    val_batch_size: int = 4
+    num_views: int = 5
+    num_workers: int = 12
+    lr: float = 4.243e-4
+    weight_decay: float = 1.0e-4
+    warmup_steps: int = 1000
+    grad_clip: float = 1.0
+    amp: bool = True
+    amp_dtype: str = "bf16"
+    seed: int = 20260526
+    log_interval: int = 20
+    val_interval: int = 2000           # 0 = only at epoch ends
+    ckpt_interval: int = 1000
+    multi_scale: bool = True
+    height: int = 512                  # used when multi_scale is off
+    width: int = 640
+    da3_missing: str = "error"         # error / skip
+    nan_grad_patience: int = 10
+
+
+def _train_profile(profile: str) -> MoATrainConfig:
+    if profile == "umhpc":
+        return MoATrainConfig(profile="umhpc")
+    if profile == "local":
+        return MoATrainConfig(profile="local", epochs=2, batch_size=1, val_batch_size=1,
+                              num_views=3, num_workers=4, lr=1e-4, warmup_steps=500,
+                              val_interval=1000, ckpt_interval=500, multi_scale=False,
+                              da3_missing="skip")
+    raise ValueError(f"unknown profile {profile!r}")
+
+
+@dataclass(frozen=True)
+class MoAMVSConfig:
+    paths: ProjectPaths = field(default_factory=ProjectPaths)
+    fpn: FPNConfig = field(default_factory=FPNConfig)
+    sva: SVAConfig = field(default_factory=lambda: SVAConfig(full=True))
+    dino: DINOConfig = field(default_factory=DINOConfig)
+    # DinoSVA's constructor takes a SPREConfig; only its SVAFusion widths are read.
+    dino_fusion: SPREConfig = field(default_factory=SPREConfig)
+    cascade: CascadeConfig = field(default_factory=CascadeConfig)
+    moa: MoAConfig = field(default_factory=MoAConfig)
+    loss: MoALossConfig = field(default_factory=MoALossConfig)
+    augment: AugmentConfig = field(default_factory=AugmentConfig)
+    train: MoATrainConfig = field(default_factory=lambda: _train_profile(
+        os.environ.get("UPRMVS_PROFILE", "umhpc")))
+
+
+def build_moa_config(profile: str | None = None) -> MoAMVSConfig:
+    prof = profile or os.environ.get("UPRMVS_PROFILE", "umhpc")
+    return MoAMVSConfig(train=_train_profile(prof))
+
+
+# Sections that define the network. Saved in every checkpoint and restored by
+# test_moa.py, so inference rebuilds exactly what was trained.
+ARCH_SECTIONS = ("fpn", "sva", "dino", "dino_fusion", "cascade", "moa")
+
+
+def _to_plain(v):
+    if dataclasses.is_dataclass(v):
+        return {f.name: _to_plain(getattr(v, f.name)) for f in dataclasses.fields(v)}
+    if isinstance(v, (tuple, list)):
+        return [_to_plain(x) for x in v]
+    if isinstance(v, os.PathLike):
+        return str(v)
+    return v
+
+
+def arch_snapshot(cfg: MoAMVSConfig) -> dict:
+    return {name: _to_plain(getattr(cfg, name)) for name in ARCH_SECTIONS}
+
+
+def config_snapshot(cfg: MoAMVSConfig) -> dict:
+    return _to_plain(cfg)
+
+
+def _to_tuple(v):
+    return tuple(_to_tuple(x) for x in v) if isinstance(v, list) else v
+
+
+def _from_dict(cls, data: dict):
+    hints = typing.get_type_hints(cls)
+    kw = {}
+    for f in dataclasses.fields(cls):
+        if f.name not in data:
+            continue
+        v = data[f.name]
+        if dataclasses.is_dataclass(hints.get(f.name)) and isinstance(v, dict):
+            v = _from_dict(hints[f.name], v)
+        kw[f.name] = _to_tuple(v)
+    unknown = set(data) - {f.name for f in dataclasses.fields(cls)}
+    if unknown:
+        print(f"[config] {cls.__name__}: ignoring unknown keys {sorted(unknown)}")
+    return cls(**kw)
+
+
+def apply_arch_snapshot(cfg: MoAMVSConfig, snapshot: dict) -> MoAMVSConfig:
+    """Replace the architecture sections of ``cfg`` with a checkpoint's snapshot."""
+    hints = typing.get_type_hints(MoAMVSConfig)
+    upd = {name: _from_dict(hints[name], snapshot[name]) for name in ARCH_SECTIONS if name in snapshot}
+    return dataclasses.replace(cfg, **upd)
