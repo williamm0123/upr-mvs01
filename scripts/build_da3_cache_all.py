@@ -38,16 +38,37 @@ DA3 输出是无量纲的相对深度 (量级 O(1)), float16 的相对精度 (~1
     python scripts/build_da3_cache_all.py --limit 50           # 调试: 只跑前 50 个组合
     python scripts/build_da3_cache_all.py --force               # 忽略已存在的文件, 全部重建
 
-失败 (读图/推理异常) 记到 ``<cache_root>/_failures_<时间戳>.csv``, 不会带崩整轮; 结尾打印
+失败 (读图/推理异常) 记到 ``<cache_root>/_failures_<时间戳>_<pid>.csv``, 不会带崩整轮; 结尾打印
 完成率与失败清单路径。Ctrl-C 或作业超时后重新跑同一条命令会跳过已完成的文件继续。
+
+## 从 umhpc 下载的 zip: 整个 scan 跳过
+
+本地 cache 有一部分是从 umhpc 下载的 ``<cache_root>/scanN.zip`` (内部是平铺的 343 个
+``da3_*.npz``, 还没解压)。有 zip 的 scan 整个跳过, 不在本地重算 (``--include-zipped`` 关掉)。
+下载一般和本地构建同时进行, 所以**每开始一个新 scan 前都重新扫一次 zip**, 中途下载完的
+scan 也不会再被算。``--order lex-desc`` 按字典序倒着建, 和按字典序正着下载的 zip 在中间
+碰头, 两边不会抢同一个 scan (scripts/build_da3_cache_local.sh 默认就用它)。
+
+已有的 scan 目录照常按文件取差集: 建满的 (343 个文件) 一个都不会进待办, 只有中断留下的
+半截目录才会补齐缺的文件。
+
+## process_res 一致性
+
+一个 cache 根目录只能有一种 process_res: 数据集只读一个文件的 ``process_res`` 就当成整个
+cache 的值 (data/dtu_moa.py), 混进另一种分辨率的深度不会报错, 只会悄悄变差 (518 和 1600 的
+形状差别见测试 18)。所以如果已有文件 (目录里的 npz 或 zip 里的 npz) 的 process_res 和
+``--process-res`` 不同, 就直接拒绝运行; 想换分辨率就换一个 ``--out``。
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import io
 import os
+import re
 import sys
+import zipfile
 import time
 from datetime import datetime
 from pathlib import Path
@@ -63,6 +84,8 @@ from base.config import ProjectPaths, build_mvs_config  # noqa: E402
 
 NATIVE_H, NATIVE_W = 1200, 1600
 ALL_LIGHTS = tuple(range(7))
+# scanN.zip, 以及浏览器重复下载时自动改的 "scanN (1).zip"
+ZIP_RE = re.compile(r"^(scan\d+)(?: \(\d+\))?\.zip$")
 
 
 def parse_args() -> argparse.Namespace:
@@ -90,6 +113,11 @@ def parse_args() -> argparse.Namespace:
                    help="不跑推理, 只校验已有缓存能否正常读出且形状/类型正确; 加 --repair 会把坏的删掉")
     p.add_argument("--repair", action="store_true",
                    help="配合 --verify: 删除损坏的缓存文件, 之后重跑主命令即可补回")
+    p.add_argument("--include-zipped", action="store_true",
+                   help="不跳过 <cache_root> 下已有 scanN.zip 的 scan (默认跳过, 见文件头说明)")
+    p.add_argument("--order", choices=["num", "lex", "lex-desc"], default="num",
+                   help="scan 处理顺序: num=数值序 scan1,2,3..; lex=字典序 scan1,10,100..; "
+                        "lex-desc=字典序倒序 (和按字典序下载的 zip 从两头往中间走)")
     p.add_argument("--out", default=None, help="覆盖 cfg.paths.da3_cache_path")
     p.add_argument("--dtu-root", default=None, help="覆盖 cfg.paths.dtu_train_root")
     p.add_argument("--device", default="cuda")
@@ -104,6 +132,37 @@ def scan_list(dtu_root: Path) -> list[str]:
     rect = dtu_root / "Rectified_raw"
     return sorted((d.name for d in rect.iterdir() if d.is_dir()),
                  key=lambda s: (len(s), s))     # scan2 < scan10 (数值序, 不是字典序)
+
+
+def zipped_scans(cache_root: Path) -> set[str]:
+    """<cache_root> 下已下载完的 scanN.zip 对应的 scan 名。Chrome 下载中的文件叫
+    "Unconfirmed NNN.crdownload" 且不在这个目录里, 所以这里能看到的 zip 都是完整的。"""
+    if not cache_root.is_dir():
+        return set()
+    return {m.group(1) for f in cache_root.iterdir() if (m := ZIP_RE.match(f.name))}
+
+
+def existing_process_res(cache_root: Path) -> tuple[int, Path] | None:
+    """已有缓存的 process_res: 先找目录里的 npz, 没有就读一个 zip 里的第一个 npz。"""
+    if not cache_root.is_dir():
+        return None
+    for d in sorted(cache_root.iterdir()):
+        if d.is_dir():
+            for f in d.glob("da3_*.npz"):
+                try:
+                    with np.load(f) as z:
+                        return int(z["process_res"]), f
+                except Exception:  # noqa: BLE001 - 坏文件交给 --verify, 换一个看
+                    continue
+    for zf in sorted(cache_root.glob("scan*.zip")):
+        try:
+            with zipfile.ZipFile(zf) as z:
+                name = next(n for n in z.namelist() if n.endswith(".npz"))
+                with np.load(io.BytesIO(z.read(name))) as npz:
+                    return int(npz["process_res"]), zf
+        except Exception:  # noqa: BLE001
+            continue
+    return None
 
 
 def image_path(dtu_root: Path, scan: str, view: int, light: int) -> Path:
@@ -198,12 +257,27 @@ def main() -> None:
     missing_scans = [s for s in scans if not (dtu_root / "Rectified_raw" / s).is_dir()]
     if missing_scans:
         raise SystemExit(f"--scans 里这些在 Rectified_raw/ 下找不到: {missing_scans}")
+    if args.order == "lex":
+        scans = sorted(scans)
+    elif args.order == "lex-desc":
+        scans = sorted(scans, reverse=True)
     views = args.views if args.views is not None else list(range(num_views(dtu_root)))
     lights = args.lights
 
     if args.verify:
         print(f"[da3-cache] 校验模式: cache_root={cache_root}")
         raise SystemExit(1 if verify_cache(cache_root, scans, views, lights, args.repair) else 0)
+
+    zipped = set() if args.include_zipped else zipped_scans(cache_root)
+    if zipped:
+        print(f"[da3-cache] 跳过 {len(zipped)} 个已有 zip 的 scan: "
+             f"{' '.join(sorted(zipped, key=lambda s: (len(s), s)))}")
+        scans = [s for s in scans if s not in zipped]
+
+    found = existing_process_res(cache_root)
+    if found and found[0] != args.process_res:
+        raise SystemExit(f"{found[1]} 的 process_res={found[0]}, 与 --process-res {args.process_res} "
+                         f"不一致; 同一个 cache 根目录不能混两种分辨率, 请换 --out")
 
     todo, stats = build_todo(dtu_root, cache_root, scans, views, lights, args.force)
     total_slots = len(todo) + stats["n_already_done"]
@@ -236,14 +310,24 @@ def main() -> None:
     da3_model = nf.load_da3_model(ProjectPaths().da3_weights_file, device)
 
     cache_root.mkdir(parents=True, exist_ok=True)
-    fail_csv = cache_root / f"_failures_{datetime.now():%Y%m%d_%H%M%S}.csv"
+    # 带 pid: --shard 的几个进程同一秒启动时会拿到同一个时间戳, 共用一个文件会互相截断,
+    # 全部成功的那个进程结尾 unlink 时还会把别的进程的失败清单一起删掉
+    fail_csv = cache_root / f"_failures_{datetime.now():%Y%m%d_%H%M%S}_{os.getpid()}.csv"
     n_ok = n_fail = 0
+    cur_scan, late_zipped = None, []
     t_start = time.time()
 
     with fail_csv.open("w", newline="") as fh:
         wr = csv.writer(fh)
         wr.writerow(["scan", "view", "light", "error"])
         for i, (scan, view, light) in enumerate(todo, 1):
+            if scan != cur_scan:
+                cur_scan = scan
+                if not args.include_zipped and scan in zipped_scans(cache_root):
+                    late_zipped.append(scan)
+                    print(f"[da3-cache] {scan}.zip 在运行中下载完了, 跳过这个 scan", flush=True)
+            if late_zipped and late_zipped[-1] == scan:
+                continue
             t0 = time.time()
             try:
                 img_path = image_path(dtu_root, scan, view, light)
@@ -265,13 +349,15 @@ def main() -> None:
                 print(f"    !! {scan} v{view} l{light}: {type(exc).__name__}: {exc}", flush=True)
             if i % args.log_every == 0 or i == len(todo):
                 elapsed = time.time() - t_start
-                rate = i / max(elapsed, 1e-6)
+                rate = (n_ok + n_fail) / max(elapsed, 1e-6)
                 eta = (len(todo) - i) / max(rate, 1e-9)
                 print(f"[da3-cache] {i}/{len(todo)}  ok={n_ok} fail={n_fail}  "
                      f"{rate:.2f}/s  用时 {_fmt(elapsed)}  预计剩余 {_fmt(eta)}  "
                      f"最新 {scan} v{view} l{light} {time.time()-t0:.2f}s", flush=True)
 
     print(f"[da3-cache] 完成: ok={n_ok} fail={n_fail} / {len(todo)}  总用时 {_fmt(time.time()-t_start)}")
+    if late_zipped:
+        print(f"[da3-cache] 运行中因 zip 下载完而跳过: {' '.join(late_zipped)}")
     if n_fail:
         print(f"[da3-cache] 失败清单: {fail_csv}")
     else:
