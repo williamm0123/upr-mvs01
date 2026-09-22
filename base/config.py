@@ -64,6 +64,13 @@ def _default_paths() -> dict[str, Path]:
             # (scan, view, light), 与 prior_cache 无关 (不含 VGGT/融合/标尺), 只是原始
             # DA3 输出, 存在原生 1200x1600 分辨率上, 供以后的实验直接复用。
             "da3_cache_path": project_path / "log/da3_cache",
+            # 离线 SfM 稀疏点云 (scripts/build_sfm_cache_all.py): 已知 DTU 相机做极线引导
+            # 匹配+三角化, 一个 npz 每 (scan, view), 只在 light 3 上建 (几何与光照无关)。
+            # 与上面 sfm_cache_path (log/sfm_depth, dataset 里已注释掉的旧路) 不是一回事。
+            "sfm_sparse_cache_path": project_path / "log/sfm_cache",
+            # da3_cache 用 sfm_sparse_cache 的点做深度域 a*d+b 标定后的 metric 深度
+            # (scripts/calibrate_da3_with_sfm.py), 文件名/key 与 da3_cache 完全相同, 换根目录即可替换。
+            "da3_sfm_cache_path": project_path / "log/da3_sfm_cache",
             # per-view depth/conf/K/E/image that fusion consumes, plus metrics.json,
             # under a <split>/ subdir. Kept after the run on purpose: re-fusing at
             # different --photo-thresh/--geo-* costs nothing while re-running
@@ -93,6 +100,8 @@ class ProjectPaths:
     sfm_cache_path: Path = _DEFAULT_PATHS["sfm_cache_path"]
     prior_cache_path: Path = _DEFAULT_PATHS["prior_cache_path"]
     da3_cache_path: Path = _DEFAULT_PATHS["da3_cache_path"]
+    sfm_sparse_cache_path: Path = _DEFAULT_PATHS["sfm_sparse_cache_path"]
+    da3_sfm_cache_path: Path = _DEFAULT_PATHS["da3_sfm_cache_path"]
     depth_cache_path: Path = _DEFAULT_PATHS["depth_cache_path"]
     pred_points_path: Path = _DEFAULT_PATHS["pred_points_path"]
     resnet50_weights_file: Path = _DEFAULT_PATHS["resnet50_weights_file"]
