@@ -181,6 +181,11 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--epochs", type=int, default=None)
     p.add_argument("--max-steps", type=int, default=None, help="hard stop; 0 = epochs x steps_per_epoch")
+    p.add_argument("--lr-schedule-steps", type=int, default=None,
+                   help="cosine horizon; 默认跟随实际停止步数。只有在'用短跑筛选、但要与长跑"
+                        "同轨迹'时才单独指定 —— 那种跑法结束时模型没有退火完")
+    p.add_argument("--warp-channels", default=None, metavar="C1,C2,C3,C4",
+                   help="四级 cost volume 的 warp 通道 (默认 128,128,64,64; 必须能被 num_groups 整除)")
     p.add_argument("--batch-size", type=int, default=None)
     p.add_argument("--val-batch-size", type=int, default=None)
     p.add_argument("--num-views", type=int, default=None)
@@ -230,7 +235,8 @@ def build_config(args) -> MoAMVSConfig:
                        ("weight_decay", "weight_decay"), ("grad_clip", "grad_clip"),
                        ("amp_dtype", "amp_dtype"), ("seed", "seed"), ("log_interval", "log_interval"),
                        ("val_interval", "val_interval"), ("ckpt_interval", "ckpt_interval"),
-                       ("height", "height"), ("width", "width"), ("da3_missing", "da3_missing")]:
+                       ("height", "height"), ("width", "width"), ("da3_missing", "da3_missing"),
+                       ("lr_schedule_steps", "lr_schedule_steps")]:
         v = getattr(args, name)
         if v is not None:
             upd[attr] = v
@@ -239,6 +245,11 @@ def build_config(args) -> MoAMVSConfig:
     if args.multi_scale is not None:
         upd["multi_scale"] = args.multi_scale == "on"
     cfg = dataclasses.replace(cfg, train=dataclasses.replace(t, **upd))
+    if args.warp_channels:
+        wc = tuple(int(x) for x in args.warp_channels.split(","))
+        if len(wc) != 4:
+            raise SystemExit("--warp-channels 需要四个值, 例如 128,128,64,64")
+        cfg = dataclasses.replace(cfg, cascade=dataclasses.replace(cfg.cascade, warp_channels=wc))
     moa = dataclasses.replace(cfg.moa, enabled=args.moa == "on")
     if args.moa_dim:
         d = int(args.moa_dim)
@@ -463,8 +474,10 @@ def main(argv=None) -> None:
     steps_per_epoch = len(loader)
     if steps_per_epoch == 0:
         raise SystemExit(f"train split has {len(train_ds)} samples < batch {t.batch_size}")
-    horizon = t.epochs * steps_per_epoch
-    max_steps = t.max_steps if t.max_steps and t.max_steps > 0 else horizon
+    max_steps = t.max_steps if t.max_steps and t.max_steps > 0 else t.epochs * steps_per_epoch
+    # 退火 horizon 默认 = 实际停止步数, 否则 "--max-steps 30000 + epochs 15" 会跑出一个
+    # 停在 88% 峰值 lr 上的模型 —— 它既不能横比也说明不了收敛到哪。
+    horizon = t.lr_schedule_steps if t.lr_schedule_steps and t.lr_schedule_steps > 0 else max_steps
 
     logger = RunLogger(args.name, project)
     start_step = 0
@@ -506,7 +519,9 @@ def main(argv=None) -> None:
 
     (logger.root / "config.json").write_text(json.dumps(config_snapshot(cfg), indent=2))
     print("=" * 72)
-    print(f" run={args.name}  epochs={t.epochs}  steps/epoch={steps_per_epoch}  max_steps={max_steps}")
+    print(f" run={args.name}  epochs={t.epochs}  steps/epoch={steps_per_epoch}  max_steps={max_steps}"
+          f"  lr_horizon={horizon}" + ("  (!= max_steps: 结束时不会退火到底)" if horizon != max_steps else ""))
+    print(f" warp_channels={cfg.cascade.warp_channels}  num_depths={cfg.cascade.num_depths}")
     print(f" batch={t.batch_size} views={t.num_views} lr={t.lr:g} warmup={t.warmup_steps} "
           f"amp={t.amp}/{t.amp_dtype} multi_scale={t.multi_scale}")
     print(f" train={len(train_ds)} samples  val={len(val_ds)} samples  DA3 process_res={train_ds.da3_process_res}")

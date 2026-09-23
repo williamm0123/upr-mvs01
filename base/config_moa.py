@@ -22,7 +22,11 @@ class CascadeConfig:
     """Four stages at strides 8/4/2/1, all axes uniform in inverse depth."""
 
     num_depths: tuple[int, int, int, int] = (48, 16, 8, 4)
-    warp_channels: tuple[int, int, int, int] = (128, 64, 32, 16)
+    # v2: 四级全 128 (v1 是 128/64/32/16)。加宽的代价几乎全在 warp 张量
+    # [B,C,D,H,W] 上 —— 它每个 source 都要留给反向。本地实测每样本 26.4 ->
+    # 42.2 GiB/Mpx (+60%), 每步 +43%; 按集群 v1 的 98%@batch4 反推, 640x896
+    # 上 batch 2 约 63 GiB (79%), batch 3 放不下。
+    warp_channels: tuple[int, int, int, int] = (128, 128, 128, 128)
     num_groups: int = 8
     warp_use_half: bool = True
     unet_base_channels: int = 16
@@ -104,6 +108,7 @@ class MoATrainConfig:
     profile: str = "umhpc"
     epochs: int = 15
     max_steps: int = 0                 # 0 = epochs x steps_per_epoch
+    lr_schedule_steps: int = 0         # 0 = 跟随实际停止步数
     batch_size: int = 4
     val_batch_size: int = 4
     num_views: int = 5

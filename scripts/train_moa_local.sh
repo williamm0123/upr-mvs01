@@ -12,8 +12,8 @@
 #   batch 1 / 3 视角 / 固定 512x640 (无多尺度) / MoA 宽度 8 (正式 16) / lr 1e-4 /
 #   val 只抽 60 个样本 / DA3 缺失的样本自动跳过 (--da3-missing skip), 所以只下载了
 #   部分 scan 的 DA3 cache 也能跑 —— 启动日志会打印跳过了多少。
-# 实测 (合成数据): batch 1 x 3 视角 x 512x640 峰值 7.5 GiB, ~0.75 s/step;
-#                 5 视角 9.5 GiB, ~1.2 s/step。
+# 实测 (合成数据, v2 的四级全 128): batch 1 x 3 视角 x 512x640 峰值 9.9 GiB, 1.15 s/step;
+#   5 视角 448x576 峰值 11.7 GiB。v1 的窄通道用 WARP_CHANNELS=128,64,32,16 (峰值 7.7)。
 #
 # 本地 uprmvs 环境目前 import torch 失败 (缺 typing_extensions, 2026-09-18 装 pcl
 # 时被删)。修好之前可以用 PYTHON_BIN / EXTRA_PYTHONPATH 指向能用的解释器或依赖目录。
@@ -37,6 +37,7 @@ NUM_VIEWS=${NUM_VIEWS:-3}
 HEIGHT=${HEIGHT:-512}
 WIDTH=${WIDTH:-640}
 MOA_DIM=${MOA_DIM:-8}
+WARP_CHANNELS=${WARP_CHANNELS:-128,128,128,128}
 LR=${LR:-1e-4}
 WARMUP_STEPS=${WARMUP_STEPS:-500}
 NUM_WORKERS=${NUM_WORKERS:-4}
@@ -86,6 +87,7 @@ args=(
     --name "$RUN_NAME"
     --moa "$MOA"
     --moa-dim "$MOA_DIM"
+    --warp-channels "$WARP_CHANNELS"
     --epochs "$EPOCHS"
     --max-steps "$MAX_STEPS"
     --batch-size "$BATCH_SIZE"
