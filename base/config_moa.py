@@ -201,7 +201,21 @@ def _from_dict(cls, data: dict):
 
 
 def apply_arch_snapshot(cfg: MoAMVSConfig, snapshot: dict) -> MoAMVSConfig:
-    """Replace the architecture sections of ``cfg`` with a checkpoint's snapshot."""
+    """Replace the architecture sections of ``cfg`` with a checkpoint's snapshot.
+
+    Fields the snapshot does not carry take today's defaults. That is silent by
+    construction — a config-only field (no weights attached) changes behaviour
+    without changing the state dict — so they are reported: a checkpoint from
+    before such a field existed would otherwise be evaluated under semantics it
+    was never trained with.
+    """
     hints = typing.get_type_hints(MoAMVSConfig)
     upd = {name: _from_dict(hints[name], snapshot[name]) for name in ARCH_SECTIONS if name in snapshot}
-    return dataclasses.replace(cfg, **upd)
+    out = dataclasses.replace(cfg, **upd)
+    missing = [f"{sec}.{f.name}={getattr(getattr(out, sec), f.name)!r}"
+               for sec in ARCH_SECTIONS if sec in snapshot
+               for f in dataclasses.fields(getattr(out, sec)) if f.name not in snapshot[sec]]
+    if missing:
+        print("[config] WARNING 这份 checkpoint 的快照里没有以下字段, 将使用当前代码的默认值 "
+              "(训练时的行为可能与此不同):\n  " + "\n  ".join(missing))
+    return out

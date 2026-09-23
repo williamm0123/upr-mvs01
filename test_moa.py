@@ -48,6 +48,10 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="write the per-view npz cache (--no-fuse = metrics only)")
     p.add_argument("--conf-window", type=int, default=1,
                    help="+-bins around each stage's argmax for the fusion confidence")
+    p.add_argument("--moa-gain", default=None, metavar="G2,G3,G4",
+                   help="覆盖 checkpoint 的 moa_gain, 例如 1,1,1 (在该字段存在之前训练的权重)")
+    p.add_argument("--edge-snap", choices=["on", "off"], default=None,
+                   help="覆盖 checkpoint 的 edge_snap (在该字段存在之前训练的权重用 off)")
     return p.parse_args(argv)
 
 
@@ -144,6 +148,18 @@ def main(argv=None) -> None:
     if ck.get("kind") != "moa_mvsnet":
         raise SystemExit(f"{args.ckpt} is not a MoAMVSNet checkpoint (use test.py for UprMVSNet)")
     cfg = apply_arch_snapshot(build_moa_config(args.profile), ck["arch"])
+    moa_over = {}
+    if args.moa_gain:
+        g = tuple(float(x) for x in args.moa_gain.split(","))
+        if len(g) != 3:
+            raise SystemExit("--moa-gain 需要三个值, 例如 1,1,1")
+        moa_over["moa_gain"] = g
+    if args.edge_snap:
+        moa_over["edge_snap"] = (args.edge_snap == "on",) * 3
+    if moa_over:
+        import dataclasses as _dc
+        cfg = _dc.replace(cfg, moa=_dc.replace(cfg.moa, **moa_over))
+        print(f"[test] 覆盖 MoA 推理行为: {moa_over}")
     model = MoAMVSNet(cfg).to(device)
     load_model_state(model, ck["model"])
     model.eval()
