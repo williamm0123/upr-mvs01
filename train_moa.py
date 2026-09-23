@@ -307,7 +307,11 @@ class RunLogger:
         self.root = project / "log" / "experiments" / name
         self.model_dir = self.root / "model"
         self.model_dir.mkdir(parents=True, exist_ok=True)
-        self.tb = SummaryWriter(str(self.root / "tensorboard")) if SummaryWriter else None
+        self.tb_dir = self.root / "tensorboard"
+        self.tb = SummaryWriter(str(self.tb_dir)) if SummaryWriter else None
+        if self.tb is None:
+            print("[log] WARNING tensorboard 不可用 (torch.utils.tensorboard 导入失败), "
+                  "本次训练只有 stdout, 不会写 tfevents")
         self.best = float("inf")
 
     def scalars(self, prefix: str, values: dict, step: int) -> None:
@@ -497,6 +501,7 @@ def main(argv=None) -> None:
     print(f" batch={t.batch_size} views={t.num_views} lr={t.lr:g} warmup={t.warmup_steps} "
           f"amp={t.amp}/{t.amp_dtype} multi_scale={t.multi_scale}")
     print(f" train={len(train_ds)} samples  val={len(val_ds)} samples  DA3 process_res={train_ds.da3_process_res}")
+    print(f" ckpt -> {logger.model_dir}/{{latest,best}}.pth   tensorboard -> {logger.tb_dir}")
     print("=" * 72)
 
     stop = {"sig": None}
