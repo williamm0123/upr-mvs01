@@ -115,6 +115,8 @@ def moa_diagnostics(mo, g: torch.Tensor, m: torch.Tensor, vmin, vmax, s: int) ->
         p + "mono_valid": mo.mono_valid.mean(),
         p + "global_ok": mo.global_ok.float().mean(),
         p + "edge_frac": mo.edge.mean(),
+        # share of edge pixels the snap sent to the monocular surface (rest -> MVS)
+        p + "snap_mono_frac": mo.edge_snap_mono.sum() / mo.edge.sum().clamp_min(1.0),
     }
     for j, name in enumerate(("mvs", "glob", "l3", "l5", "l7")):
         out[p + f"pi_{name}"] = mo.mixture_weights[:, j].mean()

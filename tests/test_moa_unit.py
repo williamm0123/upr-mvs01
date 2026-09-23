@@ -19,7 +19,7 @@ from models.moa.geometry import (
 )
 from models.moa.global_affine import robust_global_affine
 from models.moa.local_affine import MultiScaleLocalAffine, spec_closed_form
-from models.moa.mixture import apply_mvs_override
+from models.moa.mixture import apply_mvs_override, mono_proposal, scale_mono_weights
 from models.moa.moa import MoACascade
 
 VMIN = torch.tensor(1.0 / 935.0).view(1, 1, 1, 1)
@@ -225,6 +225,8 @@ def _moa_inputs(B=1, H=16, W=20, D=8, du=0.004, seed=0, mono_shape="plane"):
     prob = torch.softmax(-dist, dim=1)
     if mono_shape == "plane":
         mono = 0.002 * z_prev + 0.3
+    elif mono_shape == "step":                                     # a depth discontinuity
+        mono = 0.002 * z_prev + 0.3 + 0.5 * (xx >= 0.5).float().expand(B, 1, H, W)
     else:                                                          # disagrees with MVS
         mono = 0.002 * z_prev + 0.3 + 0.2 * torch.sin(8 * xx).expand(B, 1, H, W)
     return dict(
@@ -288,6 +290,59 @@ def test_low_confidence_conflict_allows_affine():
     assert out.mixture_weights[:, 2:3][right].mean() > 0.5
     moved = (out.center_u - out.mvs_u).abs()[right & (out.conflict > 0.5)]
     assert moved.numel() > 0 and moved.mean() > 1e-3
+
+
+def test_stage4_gain_pulls_centre_back_to_mvs():
+    pi = torch.softmax(torch.randn(2, 5, 3, 3), dim=1)
+    assert torch.equal(scale_mono_weights(pi, 1.0), pi)
+    g = scale_mono_weights(pi, 0.3)
+    assert torch.allclose(g.sum(1), torch.ones_like(g[:, 0]), atol=1e-6)
+    assert torch.allclose(g[:, 1:], pi[:, 1:] * 0.3)
+    assert (g[:, 0] >= pi[:, 0]).all()
+
+    # identical weights and fixture, only the gain differs: the stage-4 centre
+    # must move less, and the conflict it detected must be unchanged
+    inp = _moa_inputs(mono_shape="wavy")
+    outs = {}
+    for gain in (1.0, 0.3):
+        # edge snap off: it is a hard selection, which would break the exact
+        # proportionality the gain is being checked for
+        m = _moa(moa_gain=(1.0, 1.0, gain), edge_snap=(False, False, False))
+        _force_conf(m, 0.0)          # r = 0.5: anchors exist, override only partial
+        with torch.no_grad():
+            outs[gain] = m(2, **inp)
+    move = {g: (o.center_u - o.mvs_u).abs().mean() for g, o in outs.items()}
+    assert float(move[1.0]) > 1e-4, "fixture should move the centre at gain 1"
+    assert torch.allclose(move[0.3], 0.3 * move[1.0], rtol=1e-3), move
+    assert torch.allclose(outs[1.0].conflict, outs[0.3].conflict, atol=1e-6)
+    assert torch.allclose(outs[1.0].mixture_weights[:, 1:] * 0.3, outs[0.3].mixture_weights[:, 1:], atol=1e-6)
+
+
+def test_edge_snap_picks_a_surface():
+    """At a DA3 depth edge the centre must be exactly the MVS centre or exactly the
+    monocular surface — never a blend of the two (MonoMVSNet-style hard choice)."""
+    inp = _moa_inputs(mono_shape="step")
+    out = {}
+    for on in (True, False):
+        m = _moa(edge_snap=(on, on, on))
+        _force_conf(m, 0.0)
+        with torch.no_grad():
+            out[on] = m(0, **inp)
+    o = out[True]
+    assert o.edge.sum() > 0, "fixture should produce depth edges"
+    u_mix = (o.mixture_weights * o.experts_u).sum(dim=1, keepdim=True)
+    x_prop = mono_proposal(o.mixture_weights_raw, o.experts_u, o.mvs_u)
+    at_edge = o.edge > 0.5
+    picked_y = o.center_u[at_edge] == o.mvs_u[at_edge]
+    picked_x = o.center_u[at_edge] == x_prop[at_edge]
+    assert bool((picked_y | picked_x).all()), "edge centre is neither surface"
+    assert torch.equal(o.center_u[~at_edge], u_mix[~at_edge])
+    snapped_mono = o.edge_snap_mono[at_edge] > 0.5
+    assert bool((picked_x | ~snapped_mono).all()) and bool((picked_y | snapped_mono).all())
+    # switch off -> plain mixture everywhere
+    off = out[False]
+    assert torch.equal(off.center_u, (off.mixture_weights * off.experts_u).sum(dim=1, keepdim=True))
+    assert float(off.edge_snap_mono.sum()) == 0.0
 
 
 def test_batch_independence():

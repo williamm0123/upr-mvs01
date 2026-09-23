@@ -33,7 +33,7 @@ from models.moa.global_affine import robust_global_affine
 from models.moa.local_affine import MultiScaleLocalAffine, ShapeEncoder
 from models.moa.mixture import (
     NUM_EXPERTS, MixtureHead, apply_mvs_override, depth_conflict, mono_proposal,
-    prob_conflict, shape_conflict, soft_or,
+    prob_conflict, scale_mono_weights, shape_conflict, soft_or,
 )
 
 NUM_TRANSITIONS = 3
@@ -61,6 +61,7 @@ class MoAOutput:
     affine_support: torch.Tensor
     affine_offset_only: torch.Tensor
     edge: torch.Tensor                # [B,1,H,W] binary DA3 edge at this resolution
+    edge_snap_mono: torch.Tensor      # [B,1,H,W] 1 = edge pixel snapped to the monocular surface
     edge_barrier_rate: torch.Tensor   # [B,3]
     global_a: torch.Tensor            # [B]
     global_b: torch.Tensor            # [B]
@@ -213,8 +214,17 @@ class MoACascade(nn.Module):
             shape_conflict(x_prop, y, edge_dil, du, cfg.conflict_tau_s),
         )
         alpha = (r_anchor * conflict).detach()
-        pi_t = apply_mvs_override(pi, alpha)
-        u_c = (pi_t * experts).sum(dim=1, keepdim=True)
+        pi_t = scale_mono_weights(apply_mvs_override(pi, alpha), float(cfg.moa_gain[level]))
+        u_mix = (pi_t * experts).sum(dim=1, keepdim=True)
+
+        # ---- depth-edge snap: pick a surface, never the average of two -------
+        snap_mono = torch.zeros_like(u_mix)
+        u_c = u_mix
+        if bool(cfg.edge_snap[level]):
+            to_mono = (u_mix - x_prop).abs() < (u_mix - y).abs()
+            at_edge = edge_bin > 0.5
+            u_c = torch.where(at_edge, torch.where(to_mono, x_prop, y), u_mix)
+            snap_mono = (at_edge & to_mono).float()
 
         return MoAOutput(
             center_depth=u_to_depth(u_c, vmin, vmax), center_u=u_c, mvs_u=y, du=du,
@@ -222,6 +232,6 @@ class MoACascade(nn.Module):
             mvs_confidence=r, mvs_conf_logit=r_logit, conflict=conflict.detach(), alpha=alpha,
             mixture_weights=pi_t, mixture_weights_raw=pi, experts_u=experts,
             affine_a=la.a, affine_b=la.b, affine_valid=la.valid, affine_support=la.support,
-            affine_offset_only=la.offset_only, edge=edge_bin,
+            affine_offset_only=la.offset_only, edge=edge_bin, edge_snap_mono=snap_mono,
             edge_barrier_rate=bar["blocked_rate"], global_a=a_g, global_b=b_g, global_ok=ok_g,
         )

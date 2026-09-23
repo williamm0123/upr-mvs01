@@ -69,6 +69,17 @@ class MoAConfig:
     global_min_eff: float = 64.0
     # Per transition (->stage 2/3/4): largest centre move, in parent spacings.
     max_shift_bins: tuple[float, float, float] = (8.0, 4.0, 2.0)
+    # Per transition: ceiling on the mixture mass the monocular experts may hold.
+    # Stage 4 searches an already narrow window, where a local affine cannot be
+    # exact on the true surface, so its residual shape error is noise rather
+    # than a correction — MoA keeps the coarse stages and steps back at the end.
+    moa_gain: tuple[float, float, float] = (1.0, 0.7, 0.3)
+    # Per transition: at a DA3 depth edge, snap the centre to whichever of
+    # {MVS centre, monocular surface} the mixture already leans to, instead of
+    # blending them. A blend of a foreground and a background estimate lands on
+    # neither surface, which is exactly the failure the barrier cannot prevent
+    # (the two experts disagree *at* the same pixel, not across a neighbourhood).
+    edge_snap: tuple[bool, bool, bool] = (True, True, True)
     # depth conflict c_d = sigmoid((gap/(sigma+du) - t_d)/T_d); tighter at finer stages
     conflict_t_d: tuple[float, float, float] = (3.0, 2.0, 1.5)
     conflict_T_d: tuple[float, float, float] = (0.5, 0.5, 0.5)

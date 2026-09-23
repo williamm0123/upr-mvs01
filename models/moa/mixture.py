@@ -78,6 +78,22 @@ def soft_or(*terms: torch.Tensor) -> torch.Tensor:
     return 1.0 - keep
 
 
+def scale_mono_weights(pi: torch.Tensor, gain: float) -> torch.Tensor:
+    """Cap the mass the monocular experts may hold: pi_j *= gain (j != mvs), rest to MVS.
+
+    A per-transition authority knob. At stage 4 the search window is already
+    narrow, so a local affine's residual shape error is no longer a useful
+    correction but noise around a nearly-correct MVS centre — hence a small
+    gain there. It does NOT change the mono proposal used for conflict
+    detection (all monocular experts are scaled by the same factor, so their
+    renormalized mixture is unchanged), only how far the centre may move.
+    """
+    if gain >= 1.0:
+        return pi
+    mono = pi[:, 1:] * gain
+    return torch.cat([1.0 - mono.sum(dim=1, keepdim=True), mono], dim=1)
+
+
 def apply_mvs_override(pi: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
     """Redistribute mixture mass toward expert 0 by ``alpha`` [B,1,H,W]; sums stay 1."""
     alpha = alpha.detach()
