@@ -7,7 +7,6 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=96G
 #SBATCH --time=12:00:00
-#SBATCH --chdir=/scr/user/qinglong/projects/upr-mvs01
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err
 
@@ -25,7 +24,15 @@
 
 set -euo pipefail
 
-PROJECT_DIR=${PROJECT_DIR:-/scr/user/qinglong/projects/upr-mvs01}
+# 目录自适应: sbatch 用提交目录 (SLURM_SUBMIT_DIR), 直接 bash 用脚本自身位置。
+# **不要**写死 --chdir —— SBATCH 指令在提交时解析, 从 uprmvs02 提交却被 chdir 到
+# upr-mvs01, 跑的就是另一个 checkout 的代码、写的是另一个 checkout 的 log。
+PROJECT_DIR=${PROJECT_DIR:-${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}}
+if [[ ! -f "$PROJECT_DIR/train_moa.py" ]]; then
+    echo "PROJECT_DIR=$PROJECT_DIR 不像是本仓库的根目录 (没有 train_moa.py)。" >&2
+    echo "  sbatch 请在仓库根目录下提交, 或显式 PROJECT_DIR=... sbatch ..." >&2
+    exit 2
+fi
 PYTHON_BIN=${PYTHON_BIN:-/home/user/qinglong/.conda/envs/uprmvs/bin/python}
 PROFILE=${PROFILE:-umhpc}
 RUN_NAME=${RUN_NAME:-MOA_E15}

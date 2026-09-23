@@ -9,14 +9,14 @@
 #SBATCH --qos=long
 #SBATCH --time=3-00:00:00
 #SBATCH --signal=B:USR1@900
-#SBATCH --chdir=/scr/user/qinglong/projects/upr-mvs01
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err
 
 # =============================================================================
 # MoAMVSNet v2 —— 单卡 A100-80GB, 30k 步 (sbatch 排队, 不是 bash)。
 #
-#   cd /scr/user/qinglong/projects/upr-mvs01 && git pull
+#   cd <本 checkout 的根目录> && git pull      # 从哪个 checkout 提交就跑哪份代码
+#   mkdir -p logs                              # 首次: slurm 在脚本启动前就要写 logs/
 #   sbatch scripts/train_moa_umhpc.sh                    # v2: 30k 步, warp 128/128/64/64
 #   MOA=off sbatch scripts/train_moa_umhpc.sh            # 同口径的纯 MVS 基线 (归因必需)
 #   STEPS=0 EPOCHS=15 sbatch scripts/train_moa_umhpc.sh  # 回到按 epoch 跑
@@ -53,7 +53,15 @@
 
 set -euo pipefail
 
-PROJECT_DIR=${PROJECT_DIR:-/scr/user/qinglong/projects/upr-mvs01}
+# 目录自适应: sbatch 用提交目录 (SLURM_SUBMIT_DIR), 直接 bash 用脚本自身位置。
+# **不要**写死 --chdir —— SBATCH 指令在提交时解析, 从 uprmvs02 提交却被 chdir 到
+# upr-mvs01, 跑的就是另一个 checkout 的代码、写的是另一个 checkout 的 log。
+PROJECT_DIR=${PROJECT_DIR:-${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}}
+if [[ ! -f "$PROJECT_DIR/train_moa.py" ]]; then
+    echo "PROJECT_DIR=$PROJECT_DIR 不像是本仓库的根目录 (没有 train_moa.py)。" >&2
+    echo "  sbatch 请在仓库根目录下提交, 或显式 PROJECT_DIR=... sbatch ..." >&2
+    exit 2
+fi
 cd "$PROJECT_DIR"
 
 MOA=${MOA:-on}
