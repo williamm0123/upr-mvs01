@@ -91,6 +91,17 @@ mkdir -p logs
 RUN_DIR="log/experiments/$RUN_NAME"
 if [[ "$FRESH" == "1" ]]; then
     if [[ -e "$RUN_DIR" ]]; then
+        # 同名目录还在被写 = 多半有另一个作业正在跑它。直接 mv 会把它的
+        # model/ 从脚下挪走, 那个作业下一次存档就 FileNotFoundError 死掉,
+        # 而它的 tfevents 会继续写进 _archive —— 两个 run 的日志就此对半劈开。
+        RECENT=$(find "$RUN_DIR" -type f -mmin -60 -print -quit 2>/dev/null || true)
+        if [[ -n "$RECENT" && "${FORCE_ARCHIVE:-0}" != "1" ]]; then
+            echo "拒绝归档: $RUN_DIR 最近 60 分钟内仍有写入 ($RECENT)。" >&2
+            echo "  另一个作业很可能正在用这个名字。并行跑新版本请换名字:" >&2
+            echo "     RUN_NAME=${RUN_NAME}_v2 sbatch $0" >&2
+            echo "  确认那个作业已经结束再归档: FORCE_ARCHIVE=1 sbatch $0" >&2
+            exit 2
+        fi
         ARCHIVE="log/experiments/_archive/${RUN_NAME}_$(date -u +%Y%m%d_%H%M%S)"
         mkdir -p "$(dirname "$ARCHIVE")"
         mv "$RUN_DIR" "$ARCHIVE"

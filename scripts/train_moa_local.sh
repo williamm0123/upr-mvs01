@@ -73,6 +73,13 @@ fi
     exit 1
 }
 
+# 同名的本地训练已经在跑 = 两个进程会轮流覆盖同一份 latest.pth
+if pgrep -f "train_moa.py.*--name $RUN_NAME( |$)" >/dev/null 2>&1; then
+    echo "已经有一个 --name $RUN_NAME 的 train_moa.py 在跑 (pid: $(pgrep -f "train_moa.py.*--name $RUN_NAME" | tr '\n' ' '))。" >&2
+    echo "  并行跑就换个名字: RUN_NAME=${RUN_NAME}_v2 bash $0" >&2
+    exit 2
+fi
+
 args=(
     --profile local
     --device cuda:0

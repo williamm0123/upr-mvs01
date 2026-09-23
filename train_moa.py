@@ -476,9 +476,18 @@ def main(argv=None) -> None:
         ckpt_path = Path(args.resume)
     if ckpt_path is not None:
         ck = load_checkpoint(ckpt_path, map_location="cpu")
-        if ck.get("arch") != arch_snapshot(cfg):
-            raise SystemExit(f"[resume] {ckpt_path} was trained with a different architecture; "
-                             f"use a new --name or --resume off")
+        saved_arch = ck.get("arch") or {}
+        cur_arch = arch_snapshot(cfg)
+        if saved_arch != cur_arch:
+            diff = [f"  {sec}.{k}: {saved_arch.get(sec, {}).get(k)!r} -> {v!r}"
+                    for sec in cur_arch for k, v in cur_arch[sec].items()
+                    if saved_arch.get(sec, {}).get(k) != v]
+            raise SystemExit(
+                f"[resume] {ckpt_path} was trained with a different architecture:\n"
+                + "\n".join(diff[:20])
+                + f"\n如果这份 checkpoint 是旧代码跑出来的, 继续训练会让同一条曲线前后半段"
+                  f"不是同一个模型。要么用新 --name 重跑, 要么把代码切回 checkpoint 对应"
+                  f"的 commit ({(ck.get('git') or {}).get('commit', '?')[:12]})。")
         load_model_state(model, ck["model"])
         if ck.get("optimizer") is None:
             raise SystemExit(f"[resume] {ckpt_path} has no optimizer state (weights-only); "
