@@ -77,15 +77,18 @@ export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:Tr
 # --- fusibile arch 自检: 不匹配就是 0 顶点 ply + 退出码 0, 必须提前拦下 ---
 check_fusibile () {
     [[ -x "$FUSIBILE_EXE" ]] || { echo "找不到 fusibile: $FUSIBILE_EXE (用 FUSIBILE_EXE=... 指定)" >&2; exit 1; }
-    local cc cuobj
+    local cc cuobj elf
     cc=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '. ')
     cuobj=$(command -v cuobjdump || echo "/home/william/miniconda3/envs/fusibile_build/bin/cuobjdump")
     [[ -n "$cc" && -x "$cuobj" ]] || { echo "[warn] 无法自检 fusibile 的 CUDA arch (缺 nvidia-smi 或 cuobjdump)"; return 0; }
-    if "$cuobj" --list-elf "$FUSIBILE_EXE" 2>/dev/null | grep -q "sm_${cc}\."; then
+    # 先取完整输出再匹配: `cuobjdump | grep -q` 在 pipefail 下会因为 grep 提前退出
+    # 让 cuobjdump 吃到 SIGPIPE(141), 管道状态非零, 于是明明匹配上了也判成失败。
+    elf=$("$cuobj" --list-elf "$FUSIBILE_EXE" 2>/dev/null || true)
+    if grep -q "sm_${cc}\." <<<"$elf"; then
         echo "[check] fusibile 覆盖 sm_${cc} ✓"
     else
         echo "fusibile ($FUSIBILE_EXE) 没有编进本机 GPU 的 sm_${cc}:" >&2
-        "$cuobj" --list-elf "$FUSIBILE_EXE" 2>/dev/null | sed 's/^/    /' >&2
+        sed 's/^/    /' <<<"$elf" >&2
         echo "  不重编的话它会报 PTX 错误、写出 0 顶点的 ply 并**退出码 0**。重编方法见本脚本顶部注释。" >&2
         exit 1
     fi
