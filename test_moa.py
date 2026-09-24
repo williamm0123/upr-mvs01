@@ -5,7 +5,7 @@
     python points_fusibile.py --out log/depth_cache/MOA_v1_test --ply-dir log/pred_points_MOA_v1 ...
 
 Writes ``<out>/metrics.json``, ``<out>/run_manifest.json`` and
-``<out>/depth/<scan>/<ref:08d>.npz`` (depth, conf float32, K, E, image, src_views) —
+``<out>/depth/<scan>/<ref:08d>.npz`` (depth, conf, conf_last float32, K, E, image, src_views) —
 the layout test.py produces and points_fusibile.py consumes. The network is
 rebuilt from the architecture snapshot stored in the checkpoint.
 """
@@ -69,6 +69,15 @@ def mode_mass(prob: torch.Tensor, window: int, hw) -> torch.Tensor:
     if tuple(mass.shape[-2:]) != tuple(hw):
         mass = torch.nn.functional.interpolate(mass, size=tuple(hw), mode="bilinear", align_corners=False)
     return mass[:, 0]
+
+
+def last_stage_confidence(outputs: dict) -> torch.Tensor:
+    """Stage-4 max posterior, the photometric confidence MonoMVSNet fuses with (test_dtu.py)."""
+    hw = outputs["depth_full"].shape[-2:]
+    pmax = outputs["stage4"]["prob"].float().amax(dim=1, keepdim=True)
+    if tuple(pmax.shape[-2:]) != tuple(hw):
+        pmax = torch.nn.functional.interpolate(pmax, size=tuple(hw), mode="bilinear", align_corners=False)
+    return pmax[:, 0]
 
 
 def cascade_confidence(outputs: dict, window: int) -> torch.Tensor:
@@ -211,6 +220,7 @@ def main(argv=None) -> None:
                 d / f"{ref_view:08d}.npz",
                 depth=pred[0].cpu().numpy().astype(np.float32),
                 conf=conf[0].cpu().numpy().astype(np.float32),
+                conf_last=last_stage_confidence(out)[0].cpu().numpy().astype(np.float32),
                 K=batch["intrinsics"][0, 0].float().cpu().numpy(),
                 E=batch["extrinsics"][0, 0].float().cpu().numpy(),
                 image=batch["images"][0, 0].permute(1, 2, 0).clamp(0, 255).to(torch.uint8).cpu().numpy(),
