@@ -46,6 +46,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--out", default=None, help="default log/depth_cache/<ckpt run>_<split>")
     p.add_argument("--fuse", action=argparse.BooleanOptionalAction, default=True,
                    help="write the per-view npz cache (--no-fuse = metrics only)")
+    p.add_argument("--da3-missing", choices=["error", "skip"], default="error",
+                   help="DA3 缓存缺样本时: error (默认, 启动即报错) / skip (丢掉那些视角 —— "
+                        "注意融合出来的点云会因此缺一块, 但照样会被打分)")
     p.add_argument("--conf-window", type=int, default=1,
                    help="+-bins around each stage's argmax for the fusion confidence")
     p.add_argument("--moa-gain", default=None, metavar="G2,G3,G4",
@@ -111,7 +114,7 @@ class ScanMeter:
 def build_dataset(cfg, args, load_mono: bool, da3_root: Path) -> MoADTUDataset:
     base = cfg.paths.val_list_file if args.split == "val" else cfg.paths.test_list_file
     ds = MoADTUDataset(cfg.paths.dtu_train_root, args.list or str(base), nviews=args.num_views,
-                       mode=args.split, da3_root=da3_root, load_mono=False, da3_missing="error")
+                       mode=args.split, da3_root=da3_root, load_mono=False, da3_missing=args.da3_missing)
     # the parent __init__ swallows a resize_scale keyword; set the attribute
     ds.resize_scale = args.resize_scale
     if args.full_image:
@@ -133,7 +136,7 @@ def build_dataset(cfg, args, load_mono: bool, da3_root: Path) -> MoADTUDataset:
     if load_mono:
         ds.load_mono = True
         ds.da3_root = Path(da3_root)
-        ds._check_da3("error")
+        ds._check_da3(args.da3_missing)
     for side in (ds.height, ds.width):
         if side % 8:
             raise SystemExit(f"crop {ds.height}x{ds.width} is not a multiple of 8 (resize {args.resize_scale})")
@@ -176,7 +179,7 @@ def main(argv=None) -> None:
     out_root = Path(args.out) if args.out else Path(cfg.paths.depth_cache_path) / f"{run}_{args.split}"
     out_root.mkdir(parents=True, exist_ok=True)
     print(f"[test] {args.ckpt} step {ck.get('step')}  moa={'on' if model.uses_mono else 'off'}  "
-          f"{len(ds)} views  {ds.height}x{ds.width}  amp={amp_dtype if use_amp else 'off'}  -> {out_root}")
+          f"{len(ds)} samples  {ds.height}x{ds.width}  amp={amp_dtype if use_amp else 'off'}  -> {out_root}")
 
     loader = DataLoader(ds, batch_size=1, shuffle=False, num_workers=args.num_workers,
                         collate_fn=collate, pin_memory=True)
