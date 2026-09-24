@@ -222,7 +222,28 @@ def main(argv=None) -> None:
     n = max(len(ds), 1)
     summary = {"overall": meter.overall(), "per_scan": meter.per_scan(),
                "moa": {k: v / n for k, v in moa_stats.items()}}
-    (out_root / "metrics.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    # 只跑了一部分 scan 时不要抹掉已有的: 合并逐 scan 结果, 并按像素数重新加权出
+    # 总体的 abs_err / acc (这两个可以精确合并)。median / p90 需要误差池, 跨 run
+    # 无法重建, 所以只报本次这批 scan 的。
+    path = out_root / "metrics.json"
+    if path.is_file():
+        try:
+            old = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            old = {}
+        merged = {**old.get("per_scan", {}), **summary["per_scan"]}
+        if len(merged) > len(summary["per_scan"]):
+            kept = sorted(set(merged) - set(summary["per_scan"]))
+            print(f"[test] 合并已有的 {len(kept)} 个 scan 的结果: {', '.join(kept)}")
+            tot = sum(v["pixels"] for v in merged.values()) or 1
+            summary["overall_this_run"] = summary.pop("overall")
+            summary["overall"] = {
+                k: sum(v[k] * v["pixels"] for v in merged.values()) / tot
+                for k in ("abs_err", "acc_1mm", "acc_2mm", "acc_4mm", "acc_8mm")}
+            summary["overall"].update(pixels=tot, scans=len(merged),
+                                      note="median/p90 仅在 overall_this_run 里, 跨 run 无法合并")
+            summary["per_scan"] = merged
+    path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
     manifest = {
         "timestamp": datetime.datetime.now().astimezone().isoformat(),
         "checkpoint": {"path": str(Path(args.ckpt).resolve()), "step": ck.get("step"),
@@ -234,9 +255,15 @@ def main(argv=None) -> None:
                       "max_refs": args.max_refs, "conf_window": args.conf_window},
     }
     (out_root / "run_manifest.json").write_text(json.dumps(manifest, indent=2, default=str), encoding="utf-8")
-    o = summary["overall"]
-    print(f"[test] overall abs_err={o['abs_err']:.4f} median={o['median']:.4f} "
-          f"acc_2mm={o['acc_2mm']:.4f} acc_4mm={o['acc_4mm']:.4f}  -> {out_root / 'metrics.json'}")
+    o = summary.get("overall_this_run", summary["overall"])
+    print(f"[test] 本次 {len(summary.get('per_scan', {})) if 'overall_this_run' not in summary else len(ds.metas)} "
+          f"视角: abs_err={o['abs_err']:.4f} median={o['median']:.4f} "
+          f"acc_2mm={o['acc_2mm']:.4f} acc_4mm={o['acc_4mm']:.4f}")
+    if "overall_this_run" in summary:
+        m = summary["overall"]
+        print(f"[test] 合并 {m['scans']} 个 scan: abs_err={m['abs_err']:.4f} acc_2mm={m['acc_2mm']:.4f} "
+              f"acc_4mm={m['acc_4mm']:.4f}")
+    print(f"[test] -> {out_root / 'metrics.json'}")
 
 
 if __name__ == "__main__":
