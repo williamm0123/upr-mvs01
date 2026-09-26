@@ -32,6 +32,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import torch
 from PIL import Image
 
 from data.augment import PhotometricAug, resize_scale_for_crop
@@ -183,3 +184,78 @@ class MoABlendedDataset(MoADTUDataset):
         dv = sample["depth_values"]
         sample["metric_scale"] = np.asarray(DTU_RANGE / float(dv[-1] - dv[0]), dtype=np.float32)
         return sample
+
+
+class BalancedMixDataset(torch.utils.data.Dataset):
+    """DTU + BlendedMVS for balanced fine-tuning (MVSFormer++ ``--balanced_training``).
+
+    Each epoch draws ``min(len)`` samples from every child (a fresh random subset
+    of the larger ones) and shuffles them together, so the two datasets contribute
+    equally no matter how large each is. Batches are mixed; that works because
+    both children use the same multi-scale list (BLENDED_SCALES — DTU can supply
+    any crop up to its frame, Blended cannot exceed 576x768) and the scale plan
+    assigns one crop size per batch across children.
+
+    DTU samples get ``metric_scale = 1`` (already mm); Blended ones carry their own.
+    """
+
+    def __init__(self, children: dict, seed: int) -> None:
+        self.names = list(children)
+        self.children = [children[n] for n in self.names]
+        scales = {tuple(c.scales) for c in self.children}
+        if len(scales) != 1:
+            raise ValueError(f"children need one shared scale list for mixed batches, got {scales}")
+        self.offsets = np.cumsum([0] + [len(c) for c in self.children]).tolist()
+        self.seed = int(seed)
+        self.per_child = min(len(c) for c in self.children)
+        res = {n: c.da3_process_res for n, c in children.items()}
+        self.da3_process_res = res
+        print(f"[mix] {', '.join(f'{n}={len(c)}' for n, c in children.items())} -> "
+              f"{self.per_child} per dataset per epoch (DA3 process_res {res})")
+
+    def __len__(self) -> int:
+        return self.offsets[-1]
+
+    def _locate(self, idx: int) -> tuple[int, int]:
+        k = int(np.searchsorted(self.offsets, idx, side="right")) - 1
+        return k, idx - self.offsets[k]
+
+    def __getitem__(self, idx):
+        k, j = self._locate(int(idx))
+        s = self.children[k][j]
+        s.setdefault("metric_scale", np.asarray(1.0, dtype=np.float32))
+        s["dataset"] = self.names[k]
+        return s
+
+    def set_epoch(self, epoch: int) -> None:
+        for c in self.children:
+            c.set_epoch(epoch)
+
+    def reset_scale_plan(self, order, batch_size: int) -> None:
+        plans = [dict() for _ in self.children]
+        for i, g in enumerate(order):
+            k, j = self._locate(int(g))
+            plans[k][j] = i // max(batch_size, 1)
+        for c, p in zip(self.children, plans):
+            c._barrel = p
+
+    def make_sampler(self, seed: int) -> "BalancedEpochSampler":
+        return BalancedEpochSampler(self, seed)
+
+
+class BalancedEpochSampler(torch.utils.data.Sampler):
+    def __init__(self, ds: BalancedMixDataset, seed: int) -> None:
+        self.ds, self.seed = ds, int(seed)
+        self.set_epoch(0)
+
+    def set_epoch(self, epoch: int) -> None:
+        rng = np.random.default_rng(self.seed + int(epoch))
+        parts = [o + rng.permutation(n)[: self.ds.per_child]
+                 for o, n in zip(self.ds.offsets[:-1], np.diff(self.ds.offsets))]
+        self.order = rng.permutation(np.concatenate(parts)).tolist()
+
+    def __iter__(self):
+        return iter(self.order)
+
+    def __len__(self) -> int:
+        return len(self.order)

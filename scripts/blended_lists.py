@@ -19,6 +19,10 @@ lists/blended_plus/):
 
 An existing val.txt is kept (so the split cannot drift between runs) unless
 --force is given.
+
+``--check-lists A B ...`` instead only checks the scenes named in existing list
+files (e.g. the official lists/blended/{training,validation}_list.txt) and exits
+non-zero if any is missing or incomplete; nothing is written.
 """
 from __future__ import annotations
 
@@ -71,9 +75,26 @@ def main() -> None:
     p.add_argument("--out", default=str(REPO / "lists/blended_plus"))
     p.add_argument("--num-val", type=int, default=7)
     p.add_argument("--force", action="store_true", help="re-draw val.txt even if it exists")
+    p.add_argument("--check-lists", nargs="+", default=None, metavar="LIST",
+                   help="only check the scenes in these list files; write nothing")
     args = p.parse_args()
 
     root, out = Path(args.root), Path(args.out)
+    if args.check_lists:
+        names = list(dict.fromkeys(s.strip() for f in args.check_lists
+                                   for s in Path(f).read_text().splitlines() if s.strip()))
+        bad, n_refs, hws = [], 0, Counter()
+        for name in names:
+            d = root / name
+            info, probs = check_scene(d) if d.is_dir() else ({"refs": 0, "hw": None}, ["folder missing"])
+            n_refs += info["refs"]
+            hws[info["hw"]] += 1
+            if probs:
+                bad.append(name)
+                print(f"  !! {name}: {'; '.join(probs)}")
+        print(f"[blended] {len(names)} listed scenes under {root}: {len(names) - len(bad)} ok, "
+              f"{len(bad)} bad, {n_refs} reference views; image sizes {dict(hws)}")
+        raise SystemExit(1 if bad else 0)
     scenes = sorted(d for d in root.iterdir() if d.is_dir())
     good, rows = [], []
     for d in scenes:

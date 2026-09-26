@@ -483,7 +483,9 @@ def run(args, config_fn=build_config, datasets_fn=build_datasets) -> None:
         return
 
     train_ds, val_ds = datasets_fn(cfg, args)
-    sampler = EpochShuffleSampler(len(train_ds), t.seed)
+    # a dataset may bring its own epoch sampler (train_blended.py's balanced DTU+Blended mix)
+    sampler = (train_ds.make_sampler(t.seed) if hasattr(train_ds, "make_sampler")
+               else EpochShuffleSampler(len(train_ds), t.seed))
     gen = torch.Generator()
     gen.manual_seed(t.seed)
     loader = DataLoader(train_ds, batch_size=t.batch_size, sampler=sampler, num_workers=t.num_workers,

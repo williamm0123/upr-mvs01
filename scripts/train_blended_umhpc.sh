@@ -16,11 +16,22 @@
 # moa1 (DTU, MOA_E15/model/latest.pth) 在 BlendedMVS 上微调 30k 步 —— 单卡 A100, sbatch 提交。
 #
 #   cd /scr/user/qinglong/projects/upr-mvs01 && git pull && mkdir -p logs
-#   sbatch scripts/train_blended_umhpc.sh
+#   sbatch scripts/train_blended_umhpc.sh                 # 默认: DTU + BlendedMVS 均衡混合
+#   MIX_DTU=off sbatch scripts/train_blended_umhpc.sh     # 只用 BlendedMVS
+#
+# 数据: 默认是原版 BlendedMVS 低分辨率 (v1.0.0 BlendedMVS.zip, 113 场景) + 官方
+# 106/7 划分 lists/blended/{training,validation}_list.txt —— 与 MVSFormer++ 相同。
+# 用 BlendedMVS+ (BlendedMVS1.*, 另一批场景) 时:
+#   BLENDED_ROOT=/scr/user/qinglong/dataset/BlendedMVS_plus LIST_MODE=auto sbatch ...
+#   (auto = scripts/blended_lists.py 自己检查并抽 7 个场景做 val, 写 lists/blended_plus/)
+#
+# MIX_DTU=on (默认) 对应 MVSFormer++ 的 --balanced_training: 每个 epoch 从 DTU-train 和
+# Blended-train 各取 min(两者长度) 个样本混洗, 两边贡献相等。DTU 用已有的
+# log/da3_cache (1600); 两边共用 Blended 的多尺度列表 (最大 576x768), 所以一个 batch 可以混。
+# 验证只在 Blended-val 上。
 #
 # 作业里依次做三件事 (前两步都可断点续跑, 已完成时几秒钟就过去):
-#   1. scripts/blended_lists.py —— 检查 BLENDED_ROOT 每个场景的文件, 写
-#      lists/blended_plus/{train,val,all}.txt (val = 7 个场景, 排序后等距抽取, 已有就沿用)
+#   1. 场景检查: official = 核对官方列表里的场景都在且完整; auto = 生成列表
 #   2. DA3 缓存 log/da3_cache_blended (原生 768, DA3_SHARDS 个进程并行; 有失败就停)
 #   3. train_blended.py —— 架构取自 INIT_CKPT 的快照, 并固定成 moa1 的行为:
 #      warp 128/64/32/16, global_solver=huber, moa_gain=1,1,1, edge_snap=off
@@ -47,8 +58,9 @@ cd "$PROJECT_DIR"
 
 RUN_NAME=${RUN_NAME:-MOA1_BLD_30K}
 INIT_CKPT=${INIT_CKPT:-$PROJECT_DIR/log/experiments/MOA_E15/model/latest.pth}
-BLENDED_ROOT=${BLENDED_ROOT:-/scr/user/qinglong/dataset/BlendedMVS_plus}
-LIST_DIR=${LIST_DIR:-$PROJECT_DIR/lists/blended_plus}
+BLENDED_ROOT=${BLENDED_ROOT:-/scr/user/qinglong/dataset/BlendedMVS_low}
+LIST_MODE=${LIST_MODE:-official}        # official = lists/blended 官方划分; auto = blended_lists.py 生成
+MIX_DTU=${MIX_DTU:-on}                  # on = DTU + Blended 均衡混合 (MVSFormer++ --balanced_training)
 DA3_ROOT=${DA3_ROOT:-$PROJECT_DIR/log/da3_cache_blended}
 DA3_SHARDS=${DA3_SHARDS:-3}
 STEPS=${STEPS:-30000}
@@ -107,17 +119,31 @@ echo "=================================================================="
 echo " BlendedMVS fine-tune  run=$RUN_NAME  job=${SLURM_JOB_ID:-manual}  host=$(hostname)"
 echo " git=$(git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)  chain=$CHAIN/$MAX_CHAIN  resume=$RESUME"
 echo " init=$INIT_CKPT"
-echo " data=$BLENDED_ROOT  lists=$LIST_DIR  da3=$DA3_ROOT"
+echo " data=$BLENDED_ROOT  lists=$LIST_MODE  da3=$DA3_ROOT  mix_dtu=$MIX_DTU"
 echo " steps=$STEPS batch=$PER_GPU_BATCH views=$NUM_VIEWS lr=$LR warmup=$WARMUP_STEPS"
 echo "=================================================================="
 nvidia-smi -L || true
 python -c 'import sys, torch; sys.exit(0 if torch.cuda.is_available() else "CUDA 不可用 —— 需要 --gres=gpu:1")'
 
 # ---- 1. scene lists ---------------------------------------------------------
-python scripts/blended_lists.py --root "$BLENDED_ROOT" --out "$LIST_DIR"
+case "$LIST_MODE" in
+    official)
+        TRAIN_LIST=$PROJECT_DIR/lists/blended/training_list.txt
+        VAL_LIST=$PROJECT_DIR/lists/blended/validation_list.txt
+        python scripts/blended_lists.py --root "$BLENDED_ROOT" --check-lists "$TRAIN_LIST" "$VAL_LIST" \
+            || { echo "官方列表里的场景在 $BLENDED_ROOT 下不全 (见上面 !! 行)。BlendedMVS+ 请用 LIST_MODE=auto" >&2; exit 2; }
+        ;;
+    auto)
+        LIST_DIR=${LIST_DIR:-$PROJECT_DIR/lists/blended_plus}
+        python scripts/blended_lists.py --root "$BLENDED_ROOT" --out "$LIST_DIR"
+        TRAIN_LIST=$LIST_DIR/train.txt
+        VAL_LIST=$LIST_DIR/val.txt
+        ;;
+    *) echo "LIST_MODE 只能是 official / auto, 收到 '$LIST_MODE'" >&2; exit 2 ;;
+esac
 
 # ---- 2. DA3 cache (native 768; resumable) -----------------------------------
-DA3_ARGS=(--dataset blended --root "$BLENDED_ROOT" --scenes-file "$LIST_DIR/all.txt" --out "$DA3_ROOT")
+DA3_ARGS=(--dataset blended --root "$BLENDED_ROOT" --scenes-file "$TRAIN_LIST" "$VAL_LIST" --out "$DA3_ROOT")
 python scripts/build_da3_cache_mvs.py "${DA3_ARGS[@]}" --dry-run
 pids=()
 for ((i = 0; i < DA3_SHARDS; i++)); do
@@ -136,9 +162,10 @@ args=(
     --name "$RUN_NAME"
     --init-from "$INIT_CKPT"
     --blended-root "$BLENDED_ROOT"
-    --train-list "$LIST_DIR/train.txt"
-    --val-list "$LIST_DIR/val.txt"
+    --train-list "$TRAIN_LIST"
+    --val-list "$VAL_LIST"
     --da3-root "$DA3_ROOT"
+    --mix-dtu "$MIX_DTU"
     --da3-missing error
     --moa on --moa1-semantics on
     --max-steps "$STEPS"
@@ -178,7 +205,7 @@ if [[ $RC -eq 124 ]]; then
     fi
     NEXT=$((CHAIN + 1))
     echo "=== 超时存档完成, 续投第 $NEXT 次 ==="
-    sbatch --export=ALL,FRESH=0,CHAIN=$NEXT,RUN_NAME=$RUN_NAME,INIT_CKPT=$INIT_CKPT,BLENDED_ROOT=$BLENDED_ROOT,LIST_DIR=$LIST_DIR,DA3_ROOT=$DA3_ROOT,STEPS=$STEPS,PER_GPU_BATCH=$PER_GPU_BATCH,LR=$LR,WARMUP_STEPS=$WARMUP_STEPS \
+    sbatch --export=ALL,FRESH=0,CHAIN=$NEXT,RUN_NAME=$RUN_NAME,INIT_CKPT=$INIT_CKPT,BLENDED_ROOT=$BLENDED_ROOT,LIST_MODE=$LIST_MODE,MIX_DTU=$MIX_DTU,DA3_ROOT=$DA3_ROOT,STEPS=$STEPS,PER_GPU_BATCH=$PER_GPU_BATCH,LR=$LR,WARMUP_STEPS=$WARMUP_STEPS \
         "$PROJECT_DIR/scripts/train_blended_umhpc.sh"
     exit 0
 fi

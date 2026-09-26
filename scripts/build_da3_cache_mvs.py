@@ -19,7 +19,8 @@ Resumable (existing files are skipped), ``--shard i/N`` splits the to-do list
 across processes (the GPU is not the bottleneck: JPEG decode + npz compression).
 
     python scripts/build_da3_cache_mvs.py --dataset blended --root .../BlendedMVS_plus \
-        --scenes-file lists/blended_plus/all.txt --out log/da3_cache_blended
+        --scenes-file lists/blended/training_list.txt lists/blended/validation_list.txt \
+        --out log/da3_cache_blended
     python scripts/build_da3_cache_mvs.py --dataset tnt --root .../TankandTemples \
         --scenes intermediate/Family advanced/Temple --out log/da3_cache_tnt
 """
@@ -51,7 +52,8 @@ def parse_args():
     p.add_argument("--out", required=True)
     p.add_argument("--scenes", nargs="*", default=None,
                    help="blended: scene ids; tnt: split/Scene (default: every scene)")
-    p.add_argument("--scenes-file", default=None, help="one scene per line (blended lists/, tnt split/Scene)")
+    p.add_argument("--scenes-file", nargs="+", default=None,
+                   help="files with one scene per line (blended lists/, tnt split/Scene); merged")
     p.add_argument("--process-res", default="native", help="'native' (image long side) or an int")
     p.add_argument("--shard", default=None, metavar="i/N")
     p.add_argument("--dry-run", action="store_true")
@@ -102,7 +104,8 @@ def main() -> None:
     if args.scenes:
         scenes = args.scenes
     elif args.scenes_file:
-        scenes = [s.strip() for s in Path(args.scenes_file).read_text().splitlines() if s.strip()]
+        scenes = list(dict.fromkeys(s.strip() for f in args.scenes_file
+                                    for s in Path(f).read_text().splitlines() if s.strip()))
     elif args.dataset == "blended":
         scenes = sorted(d.name for d in root.iterdir() if d.is_dir())
     else:
