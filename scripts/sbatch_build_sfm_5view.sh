@@ -4,10 +4,10 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=16
-#SBATCH --mem=64G
-#SBATCH --qos=normal
-#SBATCH --time=04:00:00
+#SBATCH --cpus-per-task=24
+#SBATCH --mem=96G
+#SBATCH --qos=short
+#SBATCH --time=02:00:00
 #SBATCH --chdir=/scr/user/qinglong/projects/upr-mvs01
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err
@@ -31,11 +31,11 @@
 # 下游 log/da3_sfm_cache (calibrate_da3_with_sfm.py) 是用旧点云标定的, 换了点云要重新标定。
 #
 # 本地 5060 Ti (scan1/13, 2 进程): 每 scan 28~47s, 每视角点数中位 ~5K, 点深度对 GT 偏差中位
-# 0.5~0.6mm。124 个 scan 在 A100 上预计 < 1 小时; 按文件断点续跑, 中断后原样重新 sbatch 即可。
+# 0.5~0.6mm。124 个 scan 在 A100 上预计 < 1 小时 (qos=short, 时限给 2h); 按文件断点续跑, 中断后原样重新 sbatch 即可。
 #
 # 可调 (sbatch --export=ALL,变量=值 ... 或提交前 export):
 #   NVIEWS=5          参考视角 + NVIEWS-1 个 src
-#   SFM_WORKERS=4     并行 scan 数 (每个一份 CUDA context, 显存峰值约 2GiB; SIFT 在 CPU)
+#   SFM_WORKERS=12    并行 scan 数, 每个 2 核 (24/12) + 一份 CUDA context (显存峰值约 2GiB, 80GB 卡远够)
 #   SFM_ARGS=""       透传, 例如 "--scans 1 4 9" / "--force" / "--save-ply" / "--dry-run"
 # =============================================================================
 
@@ -45,7 +45,7 @@ PROJECT_DIR=${PROJECT_DIR:-/scr/user/qinglong/projects/upr-mvs01}
 cd "$PROJECT_DIR"
 
 NVIEWS=${NVIEWS:-5}
-SFM_WORKERS=${SFM_WORKERS:-4}
+SFM_WORKERS=${SFM_WORKERS:-12}
 SFM_ARGS=${SFM_ARGS:-}
 OUT_DIR="$PROJECT_DIR/log/sfm_cache"
 
