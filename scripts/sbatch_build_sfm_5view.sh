@@ -7,7 +7,6 @@
 #SBATCH --cpus-per-task=24
 #SBATCH --mem=96G
 #SBATCH --qos=short
-#SBATCH --time=02:00:00
 #SBATCH --chdir=/scr/user/qinglong/projects/upr-mvs01
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err

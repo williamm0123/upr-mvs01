@@ -7,7 +7,10 @@
         --full-image --resize-scale 0.8 --num-views 5
 
     # 只融合已有的深度缓存 (换阈值重融不必重跑推理)
-    python test_dtu.py --phase fuse --out log/moa2/depth_cache_test --ply-dir log/moa2/ply_dypcd
+    python test_dtu.py --phase fuse --no-skip-existing --out log/moa2/depth_cache_test --ply-dir log/moa2/ply_dypcd
+
+    # 中断后原命令重跑: 默认跳过已有的逐视角 NPZ 和逐 scan PLY。
+    # 需要全部重算时加 --no-skip-existing。
 
     # MonoMVSNet 的固定门槛消融版 (test_dtu_pcd.sh)
     python test_dtu.py --phase fuse --filter fixed --out ... --ply-dir ...
@@ -74,7 +77,8 @@ def parse_args(argv=None) -> tuple[argparse.Namespace, list[str]]:
                    help="auto: 有 conf_last 用它, 否则退回四级连乘 conf")
     p.add_argument("--workers", type=int, default=4, help="并行融合的 scan 数")
     p.add_argument("--save-masks", action="store_true", help="写 <out>/mask/<scan>/<ref>_{photo,geo,final}.png")
-    p.add_argument("--skip-existing", action="store_true")
+    p.add_argument("--skip-existing", action=argparse.BooleanOptionalAction, default=True,
+                   help="跳过已有的有效逐视角 NPZ 和逐 scan PLY (默认开启; --no-skip-existing 重算)")
     args, rest = p.parse_known_args(argv)
     if args.phase == "fuse" and rest:
         p.error(f"--phase fuse 不认识这些参数: {' '.join(rest)}")
@@ -233,15 +237,22 @@ def fuse(args) -> None:
         if missing := want - {d.name for d in scans}:
             raise SystemExit(f"缓存里没有: {sorted(missing)}")
     jobs = []
+    skipped = []
     for d in scans:
         ply = ply_dir / f"mvsnet{int(d.name[4:]):03d}_l3.ply"
         if args.skip_existing and ply.is_file():
             print(f"[fuse] skip {d.name} (已有 {ply.name})")
+            skipped.append(d.name)
             continue
         mask_dir = Path(args.out) / "mask" / d.name if args.save_masks else None
         jobs.append((d, ply, mask_dir, args.filter, args.conf, args.conf_key))
     print(f"[fuse] {len(jobs)} 个 scan, filter={args.filter} conf>{args.conf} conf_key={args.conf_key} "
           f"-> {ply_dir}", flush=True)
+
+    manifest_path = ply_dir / "fusion_manifest.json"
+    if not jobs and manifest_path.is_file():
+        print(f"[fuse] 全部已有 PLY，保留现有 {manifest_path}")
+        return
 
     results = []
     with ProcessPoolExecutor(max_workers=max(args.workers, 1)) as ex:
@@ -261,10 +272,11 @@ def fuse(args) -> None:
         "fusion": {"method": "monomvsnet_" + args.filter, "conf": args.conf, "conf_key": sorted(keys),
                    "params": DYNAMIC if args.filter == "dynamic" else FIXED},
         "scans": results,
+        "skipped_existing_scans": skipped,
     }
     ply_dir.mkdir(parents=True, exist_ok=True)
-    (ply_dir / "fusion_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-    print(f"[fuse] 完成 {len(results)} 个 scan -> {ply_dir}")
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    print(f"[fuse] 新融合 {len(results)} 个 scan，跳过已有 {len(skipped)} 个 -> {ply_dir}")
 
 
 def main(argv=None) -> None:
@@ -274,6 +286,8 @@ def main(argv=None) -> None:
         targv = rest + ["--out", args.out]
         if args.scans:
             targv += ["--scans", *map(str, args.scans)]
+        if args.skip_existing:
+            targv.append("--skip-existing")
         test_moa.main(targv)
     if args.phase in ("all", "fuse"):
         fuse(args)

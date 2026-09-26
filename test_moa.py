@@ -8,18 +8,22 @@ Writes ``<out>/metrics.json``, ``<out>/run_manifest.json`` and
 ``<out>/depth/<scan>/<ref:08d>.npz`` (depth, conf, conf_last float32, K, E, image, src_views) —
 the layout test.py produces and points_fusibile.py consumes. The network is
 rebuilt from the architecture snapshot stored in the checkpoint.
+With --skip-existing, structurally complete per-view caches are skipped before
+dataset loading and model inference. Metrics then cover newly inferred views only.
 """
 from __future__ import annotations
 
 import argparse
 import datetime
 import json
+import tempfile
+import zipfile
 from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
 from base.config_moa import apply_arch_snapshot, build_moa_config
 from data.dtu_moa import MoADTUDataset
@@ -44,6 +48,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--da3-root", default=None)
     p.add_argument("--out", default=None, help="default log/depth_cache/<ckpt run>_<split>")
+    p.add_argument("--skip-existing", action="store_true",
+                   help="跳过已有的有效逐视角 NPZ，适合中断后续跑")
     p.add_argument("--fuse", action=argparse.BooleanOptionalAction, default=True,
                    help="write the per-view npz cache (--no-fuse = metrics only)")
     p.add_argument("--da3-missing", choices=["error", "skip"], default="error",
@@ -56,6 +62,22 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--edge-snap", choices=["on", "off"], default=None,
                    help="覆盖 checkpoint 的 edge_snap (在该字段存在之前训练的权重用 off)")
     return p.parse_args(argv)
+
+
+_CACHE_MEMBERS = {f"{key}.npy" for key in ("depth", "conf", "K", "E", "image", "src_views")}
+
+
+def valid_depth_cache(path: Path) -> bool:
+    """Check the ZIP directory without decompressing each cached image."""
+    if not path.is_file():
+        return False
+    try:
+        with zipfile.ZipFile(path) as z:
+            names = set(z.namelist())
+            return _CACHE_MEMBERS <= names and all(
+                z.getinfo(name).file_size > 0 for name in _CACHE_MEMBERS)
+    except (OSError, zipfile.BadZipFile):
+        return False
 
 
 def mode_mass(prob: torch.Tensor, window: int, hw) -> torch.Tensor:
@@ -187,15 +209,37 @@ def main(argv=None) -> None:
     run = Path(args.ckpt).resolve().parent.parent.name
     out_root = Path(args.out) if args.out else Path(cfg.paths.depth_cache_path) / f"{run}_{args.split}"
     out_root.mkdir(parents=True, exist_ok=True)
+    selected_views = len(ds)
+    todo_indices = list(range(selected_views))
+    cached_views = invalid_cache = 0
+    if args.fuse and args.skip_existing:
+        todo_indices = []
+        for idx, (scan, _light, ref_view, _src_views) in enumerate(ds.metas):
+            cache_path = out_root / "depth" / scan / f"{ref_view:08d}.npz"
+            if valid_depth_cache(cache_path):
+                cached_views += 1
+            else:
+                todo_indices.append(idx)
+                invalid_cache += cache_path.is_file()
     print(f"[test] {args.ckpt} step {ck.get('step')}  moa={'on' if model.uses_mono else 'off'}  "
-          f"{len(ds)} samples  {ds.height}x{ds.width}  amp={amp_dtype if use_amp else 'off'}  -> {out_root}")
+          f"{selected_views} samples  {ds.height}x{ds.width}  amp={amp_dtype if use_amp else 'off'}  -> {out_root}")
+    if args.fuse and args.skip_existing:
+        print(f"[test] 续跑检查: 跳过已有 NPZ {cached_views}/{selected_views}，"
+              f"待推理 {len(todo_indices)}，无效缓存重算 {invalid_cache}", flush=True)
+        if todo_indices:
+            scan, _light, ref_view, _src_views = ds.metas[todo_indices[0]]
+            print(f"[test] 从 {todo_indices[0] + 1}/{selected_views} ({scan} ref {ref_view}) 继续", flush=True)
+    if not todo_indices:
+        print("[test] 所选视角均已有缓存，无需推理；已有 metrics.json 保持不变", flush=True)
+        return
 
-    loader = DataLoader(ds, batch_size=1, shuffle=False, num_workers=args.num_workers,
+    loader = DataLoader(Subset(ds, todo_indices), batch_size=1, shuffle=False, num_workers=args.num_workers,
                         collate_fn=collate, pin_memory=True)
     meter = ScanMeter()
     moa_stats: dict[str, float] = defaultdict(float)
     for i, batch in enumerate(loader):
-        scan, _light, ref_view, src_views = ds.metas[i]
+        selected_idx = todo_indices[i]
+        scan, _light, ref_view, src_views = ds.metas[selected_idx]
         batch = {k: (v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v)
                  for k, v in batch.items()}
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
@@ -216,27 +260,46 @@ def main(argv=None) -> None:
         if args.fuse:
             d = out_root / "depth" / scan
             d.mkdir(parents=True, exist_ok=True)
-            np.savez_compressed(
-                d / f"{ref_view:08d}.npz",
-                depth=pred[0].cpu().numpy().astype(np.float32),
-                conf=conf[0].cpu().numpy().astype(np.float32),
-                conf_last=last_stage_confidence(out)[0].cpu().numpy().astype(np.float32),
-                K=batch["intrinsics"][0, 0].float().cpu().numpy(),
-                E=batch["extrinsics"][0, 0].float().cpu().numpy(),
-                image=batch["images"][0, 0].permute(1, 2, 0).clamp(0, 255).to(torch.uint8).cpu().numpy(),
-                src_views=np.asarray(src_views, dtype=np.int64),
-            )
-        if (i + 1) % 20 == 0 or i + 1 == len(ds):
-            print(f"[test] {i + 1}/{len(ds)} ({scan} ref {ref_view})", flush=True)
+            cache_path = d / f"{ref_view:08d}.npz"
+            tmp_path = None
+            try:
+                with tempfile.NamedTemporaryFile(mode="wb", dir=d, prefix=f".{ref_view:08d}.",
+                                                 suffix=".npz.part", delete=False) as tmp:
+                    tmp_path = Path(tmp.name)
+                    np.savez_compressed(
+                        tmp,
+                        depth=pred[0].cpu().numpy().astype(np.float32),
+                        conf=conf[0].cpu().numpy().astype(np.float32),
+                        conf_last=last_stage_confidence(out)[0].cpu().numpy().astype(np.float32),
+                        K=batch["intrinsics"][0, 0].float().cpu().numpy(),
+                        E=batch["extrinsics"][0, 0].float().cpu().numpy(),
+                        image=batch["images"][0, 0].permute(1, 2, 0).clamp(0, 255).to(torch.uint8).cpu().numpy(),
+                        src_views=np.asarray(src_views, dtype=np.int64),
+                    )
+                tmp_path.replace(cache_path)
+            finally:
+                if tmp_path is not None:
+                    tmp_path.unlink(missing_ok=True)
+        if (i + 1) % 20 == 0 or i + 1 == len(todo_indices):
+            print(f"[test] 新推理 {i + 1}/{len(todo_indices)}，"
+                  f"总进度 {selected_idx + 1}/{selected_views} ({scan} ref {ref_view})", flush=True)
 
-    n = max(len(ds), 1)
+    n = max(len(todo_indices), 1)
     summary = {"overall": meter.overall(), "per_scan": meter.per_scan(),
                "moa": {k: v / n for k, v in moa_stats.items()}}
+    if cached_views:
+        summary["coverage"] = {"selected_views": selected_views,
+                               "newly_inferred_views": len(todo_indices),
+                               "cached_views_skipped": cached_views,
+                               "invalid_cache_recomputed": invalid_cache,
+                               "metric_scope": "newly_inferred_views_only"}
     # 只跑了一部分 scan 时不要抹掉已有的: 合并逐 scan 结果, 并按像素数重新加权出
     # 总体的 abs_err / acc (这两个可以精确合并)。median / p90 需要误差池, 跨 run
     # 无法重建, 所以只报本次这批 scan 的。
     path = out_root / "metrics.json"
-    if path.is_file():
+    if cached_views and path.is_file():
+        path = out_root / "metrics_resume.json"
+    if not cached_views and path.is_file():
         try:
             old = json.loads(path.read_text(encoding="utf-8"))
         except Exception:
@@ -262,18 +325,25 @@ def main(argv=None) -> None:
         "da3": {"root": str(da3_root) if model.uses_mono else None, "process_res": ds.da3_process_res},
         "inference": {"split": args.split, "num_views": args.num_views, "resize_scale": args.resize_scale,
                       "full_image": bool(args.full_image), "max_scans": args.max_scans,
-                      "max_refs": args.max_refs, "conf_window": args.conf_window},
+                      "max_refs": args.max_refs, "conf_window": args.conf_window,
+                      "skip_existing": args.skip_existing,
+                      "selected_views": selected_views, "newly_inferred_views": len(todo_indices),
+                      "cached_views_skipped": cached_views,
+                      "invalid_cache_recomputed": invalid_cache},
     }
     (out_root / "run_manifest.json").write_text(json.dumps(manifest, indent=2, default=str), encoding="utf-8")
     o = summary.get("overall_this_run", summary["overall"])
-    print(f"[test] 本次 {len(summary.get('per_scan', {})) if 'overall_this_run' not in summary else len(ds.metas)} "
-          f"视角: abs_err={o['abs_err']:.4f} median={o['median']:.4f} "
+    print(f"[test] 本次新推理 {len(todo_indices)} 视角: "
+          f"abs_err={o['abs_err']:.4f} median={o['median']:.4f} "
           f"acc_2mm={o['acc_2mm']:.4f} acc_4mm={o['acc_4mm']:.4f}")
     if "overall_this_run" in summary:
         m = summary["overall"]
         print(f"[test] 合并 {m['scans']} 个 scan: abs_err={m['abs_err']:.4f} acc_2mm={m['acc_2mm']:.4f} "
               f"acc_4mm={m['acc_4mm']:.4f}")
-    print(f"[test] -> {out_root / 'metrics.json'}")
+    if cached_views:
+        print(f"[test] 指标仅覆盖本次新推理的 {len(todo_indices)} 个视角；"
+              f"跳过的 {cached_views} 个缓存视角未重新计算指标")
+    print(f"[test] -> {path}")
 
 
 if __name__ == "__main__":

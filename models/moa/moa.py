@@ -29,7 +29,7 @@ from models.moa.geometry import (
     axis_spacing, depth_to_u, interp_along_axis, laplacian, sample_at_feature_pixels,
     spatial_grad, u_to_depth,
 )
-from models.moa.global_affine import robust_global_affine
+from models.moa.global_affine import ransac_tukey_global_affine, robust_global_affine
 from models.moa.local_affine import MultiScaleLocalAffine, ShapeEncoder
 from models.moa.mixture import (
     NUM_EXPERTS, MixtureHead, apply_mvs_override, depth_conflict, mono_proposal,
@@ -157,8 +157,17 @@ class MoACascade(nn.Module):
         # ---- global affine (per sample, reliable non-edge anchors) -------------
         edge_dil = F.max_pool2d(edge_bin, 3, stride=1, padding=1)
         q = r_anchor * mv.float() * (1.0 - edge_dil)
-        a_g, b_g, ok_g = robust_global_affine(zm, z_prev, q, n_iter=cfg.global_iters,
-                                              huber_k=cfg.global_huber_k, min_eff=cfg.global_min_eff)
+        solver = cfg.global_solver[level]
+        if solver == "ransac":
+            # stage-1 bins at every level: DA3's shape error does not shrink with the window
+            inv_bin = 1.0 / ((vmax - vmin).reshape(B).float() * self.du_global)
+            a_g, b_g, ok_g = ransac_tukey_global_affine(zm, z_prev, q, inv_bin, tau=cfg.global_ransac_tau,
+                                                        min_eff=cfg.global_min_eff)
+        elif solver == "huber":
+            a_g, b_g, ok_g = robust_global_affine(zm, z_prev, q, n_iter=cfg.global_iters,
+                                                  huber_k=cfg.global_huber_k, min_eff=cfg.global_min_eff)
+        else:
+            raise ValueError(f"unknown global_solver {solver!r}")
         zg = a_g.view(B, 1, 1, 1) * zm + b_g.view(B, 1, 1, 1)
         xv = mv & ok_g.view(B, 1, 1, 1) & torch.isfinite(zg) & (zg > 0)
         x = depth_to_u(torch.where(xv, zg, torch.ones_like(zg)), vmin, vmax)

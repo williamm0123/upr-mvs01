@@ -17,7 +17,7 @@ from models.moa.edge import NeighborhoodBarrier, log_depth_edge, shifted_views, 
 from models.moa.geometry import (
     depth_to_u, interp_along_axis, u_to_depth, window_u_hypotheses,
 )
-from models.moa.global_affine import robust_global_affine
+from models.moa.global_affine import ransac_tukey_global_affine, robust_global_affine
 from models.moa.local_affine import MultiScaleLocalAffine, spec_closed_form
 from models.moa.mixture import apply_mvs_override, mono_proposal, scale_mono_weights
 from models.moa.moa import MoACascade
@@ -213,6 +213,43 @@ def test_global_affine_recovers_per_sample():
     assert math.isclose(float(a[1]), 150.0, rel_tol=1e-3) and math.isclose(float(b[1]), 450.0, rel_tol=1e-3)
 
 
+def _leverage_scene(seed=0):
+    """Object anchors on z = 300 zm + 200, plus 1/3 background anchors in DA3's far
+    tail (large zm) whose MVS depth is unrelated to the object's affine."""
+    g = torch.Generator().manual_seed(seed)
+    zm = torch.rand(1, 1, 48, 48, generator=g) + 0.5
+    zt = 300.0 * zm + 200.0
+    bg = torch.zeros_like(zm, dtype=torch.bool)
+    bg[..., :16, :] = True
+    zm[bg] = 2.5 + torch.rand(int(bg.sum()), generator=g)
+    zt[bg] = 450.0 + 60.0 * torch.rand(int(bg.sum()), generator=g)
+    inv_bin = torch.tensor([1.0 / ((1.0 / 300.0 - 1.0 / 900.0) / 47.0)])
+    return zm, zt, inv_bin
+
+
+def test_ransac_global_affine_resists_leverage_outliers():
+    zm, zt, inv_bin = _leverage_scene()
+    a_h, _, _ = robust_global_affine(zm, zt, torch.ones_like(zm))
+    a, b, ok = ransac_tukey_global_affine(zm, zt, torch.ones_like(zm), inv_bin)
+    assert bool(ok[0])
+    assert math.isclose(float(a[0]), 300.0, rel_tol=1e-3) and math.isclose(float(b[0]), 200.0, rel_tol=1e-3)
+    assert abs(float(a_h[0]) - 300.0) > 30.0          # the Huber fit this replaces is dragged off
+    *_, wmap = ransac_tukey_global_affine(zm, zt, torch.ones_like(zm), inv_bin, return_weights=True)
+    assert wmap.shape == zm.shape
+    assert float(wmap[..., :16, :].max()) == 0.0 and float(wmap[..., 16:, :].min()) > 0.9
+
+
+def test_ransac_global_affine_deterministic_and_fails_cleanly():
+    zm, zt, inv_bin = _leverage_scene()
+    r1 = ransac_tukey_global_affine(zm, zt, torch.ones_like(zm), inv_bin)
+    r2 = ransac_tukey_global_affine(zm, zt, torch.ones_like(zm), inv_bin)
+    assert all(torch.equal(x, y) for x, y in zip(r1, r2))
+    a, b, ok = ransac_tukey_global_affine(zm, zt, torch.zeros_like(zm), inv_bin)
+    assert not bool(ok[0]) and float(a[0]) == 1.0 and float(b[0]) == 0.0
+    _, _, ok = ransac_tukey_global_affine(zm, 900.0 - 100.0 * zm, torch.ones_like(zm), inv_bin)
+    assert not bool(ok[0])
+
+
 # ---------------------------------------------------------------- module level
 def _moa_inputs(B=1, H=16, W=20, D=8, du=0.004, seed=0, mono_shape="plane"):
     g = torch.Generator().manual_seed(seed)
@@ -307,7 +344,9 @@ def test_stage4_gain_pulls_centre_back_to_mvs():
     for gain in (1.0, 0.3):
         # edge snap off: it is a hard selection, which would break the exact
         # proportionality the gain is being checked for
-        m = _moa(moa_gain=(1.0, 1.0, gain), edge_snap=(False, False, False))
+        # Huber: the wavy mono has no consistent affine, so RANSAC (correctly) fails the
+        # global fit and disables the mono experts; this test needs them active
+        m = _moa(moa_gain=(1.0, 1.0, gain), edge_snap=(False, False, False), global_solver=("huber",) * 3)
         _force_conf(m, 0.0)          # r = 0.5: anchors exist, override only partial
         with torch.no_grad():
             outs[gain] = m(2, **inp)
@@ -360,7 +399,7 @@ def test_batch_independence():
 
 
 def test_gradients_only_reach_moa():
-    m = _moa().train()
+    m = _moa(global_solver=("huber",) * 3).train()   # needs active mono experts on the wavy fixture
     inp = _moa_inputs(mono_shape="wavy")
     for k in ("z_prev", "prob", "cv", "ref_feat", "mono_depth"):
         inp[k] = inp[k].clone().requires_grad_(True)

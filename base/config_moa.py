@@ -67,7 +67,12 @@ class MoAConfig:
     min_neff: tuple[float, float, float] = (2.0, 4.0, 6.0)
     a_range: tuple[float, float] = (0.2, 5.0)
     b_max: float = 0.25
-    # global affine (per sample, Huber IRLS)
+    # global affine (per sample). Per transition (->stage 2/3/4): "ransac" = weighted
+    # RANSAC + Tukey IRLS with residuals in stage-1 bins (tau = inlier threshold);
+    # "huber" = Huber/MAD IRLS (global_iters / global_huber_k), which DA3's far-tail
+    # leverage anchors drag off the object (test19: stage1 mono error 14.7 -> 5.7 mm).
+    global_solver: tuple[str, str, str] = ("ransac", "ransac", "ransac")
+    global_ransac_tau: float = 0.5
     global_iters: int = 3
     global_huber_k: float = 1.345
     global_min_eff: float = 64.0
