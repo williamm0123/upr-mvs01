@@ -71,6 +71,11 @@ GT (``Depths_raw``) **只用于写到汇总表里的质量统计** (点深度与
     python scripts/build_sfm_cache_all.py --dry-run                # 只统计待办
     python scripts/build_sfm_cache_all.py --scans 1 13 --workers 1  # 调试
     python scripts/build_sfm_cache_all.py --force                  # 全部重建
+    python scripts/build_sfm_cache_all.py --nviews 5               # 只用 ref + pair.txt 前 4 个 src
+                                                                   # (测试时的 5 视角输入, 不对称化)
+
+断点续跑只跳过 params 与本轮完全一致的文件; 目录里混有别的配置 (如 10 邻居对称版) 时默认报错
+退出, ``--overwrite-mismatched`` 才覆盖。
 
 按 scan 并行 (``--workers`` 个进程, 每个进程自己占一份 CUDA context 做匹配, SIFT 在 CPU
 上)。已存在的 (scan, view) 跳过; 一个 scan 只缺几个视角时只补缺的那几个 (以及它们需要的边)。
@@ -114,6 +119,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--light", type=int, default=3, help="用哪个光照的图建点云 (默认 3)")
     p.add_argument("--neighbors", type=int, default=10,
                    help="每个视角取 pair.txt 前几个邻居 (对称化后作为伙伴); pair.txt 每行 10 个")
+    p.add_argument("--nviews", type=int, default=0,
+                   help=">0 时改用 MVS 输入同款的 N 视角: 伙伴 = pair.txt 前 N-1 个 src, 不对称化, "
+                        "--neighbors 失效 (测试时网络只看得到这 N 张图); 0=旧的对称邻居图")
     # 特征
     p.add_argument("--max-features", type=int, default=40000,
                    help="SIFT 每张图最多保留的关键点 (按响应排序; 0=不限)")
@@ -148,6 +156,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--save-ply", action="store_true", help="每个视角另存一个 .ply 方便看")
     p.add_argument("--no-gt-eval", action="store_true", help="汇总表里不算与 GT 的偏差")
     p.add_argument("--force", action="store_true", help="已存在的文件也重建")
+    p.add_argument("--overwrite-mismatched", action="store_true",
+                   help="已存在但 params 与本轮不同的文件 (如旧的 10 邻居缓存) 直接覆盖; 默认遇到就报错退出")
     p.add_argument("--dry-run", action="store_true", help="只统计待办, 不跑")
     p.add_argument("--out", default=None, help="覆盖 cfg.paths.sfm_sparse_cache_path")
     p.add_argument("--dtu-root", default=None, help="覆盖 cfg.paths.dtu_train_root")
@@ -177,6 +187,18 @@ def image_path(dtu_root: Path, scan: str, view: int, light: int) -> Path:
 
 def sfm_path(root: Path, scan: str, view: int, light: int) -> Path:
     return root / scan / f"sfm_{view:04d}_{light}.npz"
+
+
+def saved_params(path: Path) -> dict:
+    """已有文件写入时的 params; 读不了 (截断/损坏) 返回 {} 以便被当成不一致重建。
+    nviews 字段是后加的, 旧文件缺它即旧的对称邻居图 (nviews=0)。"""
+    try:
+        with np.load(path) as z:
+            p = json.loads(str(z["params"]))
+    except Exception:  # noqa: BLE001
+        return {}
+    p.setdefault("nviews", 0)
+    return p
 
 
 def read_cam(dtu_root: Path, view: int) -> dict:
@@ -446,9 +468,13 @@ def process_scan(job: tuple[str, list[int], dict]) -> list[dict]:
     t_scan = time.time()
 
     has_img = {v for v in pairs if image_path(dtu_root, scan, v, light).is_file()}
-    nb = {v: pairs[v][:K] for v in pairs}
-    partners = {r: sorted((set(nb[r]) | {s for s in pairs if r in nb[s]}) & has_img)
-                for r in views_todo}
+    if opts["nviews"] > 0:
+        # 只用 ref 自己的前 N-1 个 src: 测试时 N 视角输入里就这几张图, 不能借别人的邻居关系
+        partners = {r: sorted(set(pairs[r][:opts["nviews"] - 1]) & has_img) for r in views_todo}
+    else:
+        nb = {v: pairs[v][:K] for v in pairs}
+        partners = {r: sorted((set(nb[r]) | {s for s in pairs if r in nb[s]}) & has_img)
+                    for r in views_todo}
     edges = sorted({(min(r, s), max(r, s)) for r in views_todo for s in partners[r]})
     needed = sorted(set(views_todo) | {v for e in edges for v in e})
 
@@ -571,23 +597,47 @@ def main() -> None:
         raise SystemExit(f"--scans 里这些在 Rectified_raw/ 下找不到: {missing}")
     pairs = read_pairs(dtu_root)
     views = args.views if args.views is not None else sorted(pairs)
+    if args.nviews == 1 or args.nviews > 11:
+        raise SystemExit("--nviews 取 0 (对称邻居图) 或 2..11 (pair.txt 每行 10 个 src)")
+    params = {k: getattr(args, k) for k in ("light", "neighbors", "nviews", "max_features",
+                                            "contrast_threshold", "clahe", "ratio", "max_desc_dist",
+                                            "epi_thresh", "reproj_thresh", "min_tri_angle",
+                                            "depth_margin", "merge_tol", "global_ratio", "min_obs")}
+    params["mutual"] = not args.no_mutual
+    if args.nviews > 0:
+        params["neighbors"] = 0                         # N 视角模式下不起作用, 免得它进 params 比较
 
-    jobs, n_done, n_noimg = [], 0, 0
+    # 断点续跑只跳过 params 完全一致的文件; 同一目录里混进别的配置 (旧的 10 邻居缓存) 会被
+    # 静默当成"已完成", 下游根本分不出来, 所以默认直接拒绝。
+    jobs, n_done, n_noimg, mismatched = [], 0, 0, []
     for scan in scans:
         todo = []
         for v in views:
+            f = sfm_path(out_root, scan, v, args.light)
             if not image_path(dtu_root, scan, v, args.light).is_file():
                 n_noimg += 1
-            elif sfm_path(out_root, scan, v, args.light).is_file() and not args.force:
-                n_done += 1
+            elif f.is_file() and not args.force:
+                if saved_params(f) == params:
+                    n_done += 1
+                else:
+                    mismatched.append(f)
+                    todo.append(v)
             else:
                 todo.append(v)
         if todo:
             jobs.append((scan, todo))
     n_todo = sum(len(v) for _, v in jobs)
+    if mismatched:
+        old = saved_params(mismatched[0])
+        diff = {k: (old.get(k), params[k]) for k in params if old.get(k) != params[k]}
+        print(f"[sfm-cache] {len(mismatched)} 个已有文件的 params 与本轮不同, 例 {mismatched[0]}\n"
+              f"            差异 (旧, 新): {diff}")
+        if not args.overwrite_mismatched:
+            raise SystemExit("[sfm-cache] 拒绝混写。先把旧目录挪走 (mv log/sfm_cache log/sfm_cache_old), "
+                             "或加 --overwrite-mismatched 覆盖, 或 --out 换目录。")
     print(f"[sfm-cache] dtu_root={dtu_root}  out={out_root}")
     print(f"[sfm-cache] scans={len(scans)}  views/scan={len(views)}  light={args.light}  "
-          f"neighbors={args.neighbors}  已完成 {n_done}  待建 {n_todo} (涉及 {len(jobs)} 个 scan)  "
+          f"{f'nviews={args.nviews}' if args.nviews else f'neighbors={args.neighbors}'}  已完成 {n_done}  待建 {n_todo} (涉及 {len(jobs)} 个 scan)  "
           f"缺图跳过 {n_noimg}")
     if args.dry_run or not jobs:
         print("[sfm-cache] dry-run 或无待办, 退出。")
@@ -598,11 +648,6 @@ def main() -> None:
     except AttributeError:
         n_cpu = os.cpu_count() or 1
     workers = max(1, min(args.workers, len(jobs)))
-    params = {k: getattr(args, k) for k in ("light", "neighbors", "max_features", "contrast_threshold",
-                                            "clahe", "ratio", "max_desc_dist", "epi_thresh",
-                                            "reproj_thresh", "min_tri_angle", "depth_margin",
-                                            "merge_tol", "global_ratio", "min_obs")}
-    params["mutual"] = not args.no_mutual
     opts = {**params, "dtu_root": str(dtu_root), "out": str(out_root), "device": args.device,
             "cv_threads": args.cv_threads or max(1, n_cpu // workers),
             "pairs": {str(k): v for k, v in pairs.items()}, "save_ply": args.save_ply,
