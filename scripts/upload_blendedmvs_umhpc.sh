@@ -30,7 +30,8 @@ DRY_RUN=${DRY_RUN:-0}
 VERIFY_ONLY=${VERIFY_ONLY:-0}
 
 # 所有 ssh / rsync 复用同一个连接: 密码登录时只需输一次密码
-SSH_CTL=$(mktemp -u "${TMPDIR:-/tmp}/blended_ssh.XXXXXX")
+# SSH_CTL 可由外部传入 (prepare_blendedmvs_lowres.sh 在开头就建好连接, 输完密码人可以走开)
+SSH_CTL=${SSH_CTL:-$(mktemp -u "${TMPDIR:-/tmp}/blended_ssh.XXXXXX")}
 SSH_OPTS=(-o ControlMaster=auto -o ControlPath="$SSH_CTL" -o ControlPersist=600)
 cleanup() {
     [[ -n "$REMOTE_HOST" ]] && ssh "${SSH_OPTS[@]}" -O exit "$REMOTE_HOST" 2>/dev/null || true

@@ -1,7 +1,7 @@
 """Fine-tune a DTU-trained MoAMVSNet (moa1) on BlendedMVS (balanced with DTU by default).
 
     python train_blended.py --name MOA1_BLD_30K --init-from log/experiments/MOA_E15/model/latest.pth \
-        --blended-root /scr/user/qinglong/dataset/BlendedMVS_low --max-steps 30000 --lr 1e-4
+        --blended-root /scr/user/qinglong/dataset/BlendedMVS_lowres --max-steps 30000 --lr 1e-4
 
 Same training loop as train_moa.py (train_moa.run); only the config source and
 the dataset change:
@@ -56,7 +56,7 @@ MOA1_SEMANTICS = {"global_solver": ("huber",) * 3, "moa_gain": (1.0,) * 3, "edge
 def parse_args(argv=None):
     p = train_moa.build_parser()
     p.description = __doc__
-    p.add_argument("--blended-root", default="/scr/user/qinglong/dataset/BlendedMVS_low")
+    p.add_argument("--blended-root", default="/scr/user/qinglong/dataset/BlendedMVS_lowres")
     p.add_argument("--mix-dtu", choices=["on", "off"], default="on",
                    help="on: balanced DTU + Blended training (MVSFormer++ --balanced_training)")
     p.add_argument("--dtu-da3-root", default=None, help="DTU DA3 cache (default cfg.paths.da3_cache_path)")

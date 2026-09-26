@@ -60,7 +60,7 @@ cd "$PROJECT_DIR"
 
 RUN_NAME=${RUN_NAME:-MOA1_BLD_30K}
 INIT_CKPT=${INIT_CKPT:-$PROJECT_DIR/log/experiments/MOA_E15/model/latest.pth}
-BLENDED_ROOT=${BLENDED_ROOT:-/scr/user/qinglong/dataset/BlendedMVS_low}
+BLENDED_ROOT=${BLENDED_ROOT:-/scr/user/qinglong/dataset/BlendedMVS_lowres}
 LIST_MODE=${LIST_MODE:-official}        # official = lists/blended 官方划分; auto = blended_lists.py 生成
 MIX_DTU=${MIX_DTU:-on}                  # on = DTU + Blended 均衡混合 (MVSFormer++ --balanced_training)
 DA3_ROOT=${DA3_ROOT:-$PROJECT_DIR/log/da3_cache_blended}
