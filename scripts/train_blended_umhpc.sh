@@ -38,8 +38,10 @@
 #      (即不带 moa2 的逐级降权 / 边缘硬选面)。只加载权重 (严格: 缺一个就报错),
 #      新优化器 + 新 warmup/cosine, horizon = STEPS。
 #
-# 验证指标: abs_err / acc_2mm 按 "DTU 深度范围下的 mm" 归一化 (见 data/blended_moa.py),
-# 与 DTU 的数量级可比; best.pth 按它选。
+# 验证指标 (Blended-val): 误差按深度假设间隔计 (metric_scale = 1/interval), acc_2mm = 误差 < 2 个
+# 间隔, 与 MVSFormer++ 的 Blended 验证口径相同 (它的 thres2mm = 2*interval); best.pth 按 abs_err 选。
+# 训练采样也照它的 *_dataset_ms.py: 源视角从 pair 前 7 (Blended) / 全部 (DTU) 里随机取,
+# 随机裁剪落到全空 GT 时重抽 (MVSFORMER_SAMPLING=off 关掉); DTU 用 lists/dtu/trainval.txt。
 #
 # 常用覆盖:  LR=2e-4 sbatch ...   PER_GPU_BATCH=2 sbatch ...   RUN_NAME=xxx sbatch ...
 # 超时: 提前 15 分钟 USR1 -> 写 latest.pth -> 以 FRESH=0 自动续投 (最多 MAX_CHAIN 次)。
@@ -166,6 +168,7 @@ args=(
     --val-list "$VAL_LIST"
     --da3-root "$DA3_ROOT"
     --mix-dtu "$MIX_DTU"
+    --mvsformer-sampling "${MVSFORMER_SAMPLING:-on}"
     --da3-missing error
     --moa on --moa1-semantics on
     --max-steps "$STEPS"

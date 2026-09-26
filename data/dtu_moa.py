@@ -64,6 +64,21 @@ class MoADTUDataset(DTUMVSDataset):
 
     # Frame size the DA3 cache is stored at and the images are resized from.
     native_hw: tuple[int, int] = NATIVE_HW
+    # Training-time source selection (MVSFormer++ datasets/*_ms.py): 0 = first nviews-1
+    # of pair.txt (moa1's DTU training); k > 0 = random nviews-1 out of the top k;
+    # -1 = random out of all. Drawn from the per-sample rng, so still reproducible.
+    src_shuffle_top: int = 0
+    # Re-draw a random crop up to this many times while its 1/8-resolution GT mask is
+    # empty (MVSFormer++ loops until non-empty; BlendedMVS has sky-only crops).
+    crop_retry: int = 0
+
+    def _pick_sources(self, srcs: list, rng) -> list:
+        k = self.src_shuffle_top
+        if self.mode != "train" or k == 0:
+            return srcs
+        pool = list(srcs if k < 0 else srcs[:k])
+        rng.shuffle(pool)
+        return pool + [v for v in srcs if v not in pool]
 
     def da3_file(self, scan: str, view: int, light: int) -> Path:
         return da3_cache_file(self.da3_root, scan, view, light)
@@ -87,11 +102,23 @@ class MoADTUDataset(DTUMVSDataset):
         rng = self._rng(idx)
         crop_h, crop_w, resize_scale = self.sample_geometry(idx, rng)
         aug_params = self.aug.draw(rng) if self.aug is not None else None
-        pc = self.precrop_inputs(idx, resize_scale=resize_scale, aug_params=aug_params,
-                                 load_src_depth=False)
+        meta = self.metas[idx]
+        picked = self._pick_sources(meta[3], rng)
+        # precrop_inputs reads the sources from self.metas; swap in the draw for this call only
+        self.metas[idx] = (*meta[:3], picked)
+        try:
+            pc = self.precrop_inputs(idx, resize_scale=resize_scale, aug_params=aug_params,
+                                     load_src_depth=False)
+        finally:
+            self.metas[idx] = meta
         imgs_np, Ks, Es = pc["views_np"], pc["intrinsics"], pc["extrinsics"]
         h0, w0 = imgs_np[0].shape[:2]
         crop_x, crop_y = self.pick_crop_origin(h0, w0, crop_h, crop_w, rng=rng)
+        if self.random_crop and pc["mask_hr"] is not None:
+            for _ in range(self.crop_retry):
+                if (pc["mask_hr"][crop_y:crop_y + crop_h:8, crop_x:crop_x + crop_w:8] > 0).any():
+                    break
+                crop_x, crop_y = self.pick_crop_origin(h0, w0, crop_h, crop_w, rng=rng)
 
         images, intrinsics = [], []
         depth_gt = mask_gt = None
@@ -105,7 +132,8 @@ class MoADTUDataset(DTUMVSDataset):
             images.append(img)
             intrinsics.append(K)
 
-        scan, light, ref, src_views = self.metas[idx]
+        scan, light, ref, _ = meta
+        src_views = picked[: self.nviews - 1]
         sample = {
             "sample_index": int(idx),
             "scan": str(scan),

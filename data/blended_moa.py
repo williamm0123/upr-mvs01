@@ -17,11 +17,14 @@ Differences from DTU:
 * no mask file — valid GT is ``depth > 0``;
 * line 12 of ``_cam.txt`` is ``depth_min interval num depth_max``; parsed by
   field count (see :func:`read_cam`);
-* depth units are per-scene arbitrary. Every sample therefore carries
-  ``metric_scale = DTU_RANGE / (depth_max - depth_min)``, and the training
-  metrics multiply errors by it: "mm" in the Blended logs means *mm at DTU's
-  depth range*, the same fraction of the search range as on DTU. The network and
-  the loss are unaffected — both work in the normalised inverse-depth axis;
+* hypotheses follow MVSFormer++'s blended_dataset_ms.py: interval =
+  num * interval_cam / 192 * 1.06, values = arange(min, min + interval * 191.5)
+  — the camera's range stretched by the same 1.06 as DTU;
+* depth units are per-scene arbitrary. Every sample carries ``metric_scale =
+  1 / interval`` and the training metrics multiply errors by it, i.e. Blended
+  errors are counted in hypothesis intervals — MVSFormer++'s Blended validation
+  convention (its "thres2mm" = 2 intervals). DTU samples keep 1 (mm; MVSFormer++
+  divides DTU's 2.65mm interval by 2.65). Network and loss are unaffected;
 * pair.txt may list fewer than ``nviews-1`` sources; the best one is repeated
   (MVSFormer++ does the same). A reference without any source is dropped.
 """
@@ -40,8 +43,6 @@ from data.dtu_moa import MoADTUDataset
 from data.io import read_pfm
 
 BLENDED_HW = (576, 768)
-# DTU's hypothesis range: 192 bins x 2.5mm x 1.06 (data/dtu.py read_camera_file)
-DTU_RANGE = 192 * 2.5 * 1.06
 # Multi-scale crops for 576x768 frames: DTU's list tops out at 640x896, which a
 # 576x768 source cannot provide without upsampling.
 BLENDED_SCALES = ((384, 512), (448, 576), (448, 640), (512, 640), (512, 704), (576, 768))
@@ -91,6 +92,16 @@ def read_pair(filename) -> list[tuple[int, list[int]]]:
 def read_scene_list(path) -> list[str]:
     with open(path) as f:
         return [s.strip() for s in f if s.strip() and not s.lstrip().startswith("#")]
+
+
+def blended_interval(cam_file, ndepths: int = 192, interval_scale: float = 1.06) -> float:
+    """MVSFormer++ blended_dataset_ms.read_cam_file: (num * interval) / ndepths * 1.06."""
+    with open(cam_file) as f:
+        f12 = f.read().splitlines()[11].split()
+    interval = float(f12[1])
+    if len(f12) >= 3:
+        interval = int(float(f12[2])) * interval / ndepths
+    return interval * interval_scale
 
 
 def blended_da3_file(root: Path, scene: str, view: int) -> Path:
@@ -152,6 +163,7 @@ class MoABlendedDataset(MoADTUDataset):
             depth = None
             if i == 0:
                 dmin, dmax = d0, d1
+                interval = blended_interval(root / "cams" / f"{v:08d}_cam.txt", self.ndepths)
                 depth = np.asarray(read_pfm(str(root / "rendered_depth_maps" / f"{v:08d}.pfm")),
                                    dtype=np.float32)
                 depth = np.where(np.isfinite(depth) & (depth > 0), depth, 0.0).astype(np.float32)
@@ -174,7 +186,7 @@ class MoABlendedDataset(MoADTUDataset):
             imgs.append(img)
             Ks.append(np.asarray(K, np.float32))
             Es.append(np.asarray(E, np.float32))
-        depth_values = np.linspace(dmin, dmax, self.ndepths, dtype=np.float32)
+        depth_values = np.arange(dmin, dmin + interval * (self.ndepths - 0.5), interval, dtype=np.float32)
         return {"views_np": imgs, "intrinsics": np.stack(Ks), "extrinsics": np.stack(Es),
                 "depth_hr": depth_hr, "mask_hr": mask_hr, "depth_values": depth_values,
                 "scan": scene, "ref_view": ref_view, "light_idx": 0}
@@ -182,7 +194,7 @@ class MoABlendedDataset(MoADTUDataset):
     def __getitem__(self, idx):
         sample = super().__getitem__(idx)
         dv = sample["depth_values"]
-        sample["metric_scale"] = np.asarray(DTU_RANGE / float(dv[-1] - dv[0]), dtype=np.float32)
+        sample["metric_scale"] = np.asarray(1.0 / float(dv[1] - dv[0]), dtype=np.float32)
         return sample
 
 
@@ -223,7 +235,7 @@ class BalancedMixDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         k, j = self._locate(int(idx))
         s = self.children[k][j]
-        s.setdefault("metric_scale", np.asarray(1.0, dtype=np.float32))
+        s.setdefault("metric_scale", np.asarray(1.0, dtype=np.float32))    # DTU: already mm
         s["dataset"] = self.names[k]
         return s
 
