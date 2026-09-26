@@ -150,10 +150,18 @@ def load_model_state(model: torch.nn.Module, state: dict) -> None:
         raise RuntimeError(f"checkpoint mismatch: missing={missing[:8]} unexpected={unexpected[:8]}")
 
 
-def depth_errors(pred: torch.Tensor, gt: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    """Per-batch sums [n, sum|e|, <1, <2, <4, <8] (float64 on device)."""
+def depth_errors(pred: torch.Tensor, gt: torch.Tensor, mask: torch.Tensor,
+                 scale: torch.Tensor | None = None) -> torch.Tensor:
+    """Per-batch sums [n, sum|e|, <1, <2, <4, <8] (float64 on device).
+
+    ``scale`` [B] multiplies each sample's errors before thresholding — the
+    batch's ``metric_scale`` on datasets without a common metric unit (BlendedMVS).
+    """
     m = mask.bool() & (gt > 0)
-    e = (pred.float() - gt.float()).abs()[m]
+    e = (pred.float() - gt.float()).abs()
+    if scale is not None:
+        e = e * scale.float().view(-1, *([1] * (e.dim() - 1)))
+    e = e[m]
     return torch.stack([m.sum().double(), e.double().sum()] +
                        [(e < t).sum().double() for t in (1.0, 2.0, 4.0, 8.0)])
 
@@ -174,7 +182,7 @@ def metric_mask(batch: dict) -> torch.Tensor:
 # --------------------------------------------------------------------------- #
 # config / data / model
 # --------------------------------------------------------------------------- #
-def parse_args(argv=None) -> argparse.Namespace:
+def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser("MoAMVSNet training")
     p.add_argument("--profile", choices=["local", "umhpc"], default=os.environ.get("UPRMVS_PROFILE", "umhpc"))
     p.add_argument("--name", default="MOA")
@@ -216,13 +224,19 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--resume", default="auto", help="auto / off / path to a .pth")
     p.add_argument("--init-from", default=None,
                    help="load weights only (e.g. a --moa off baseline); modules absent there keep their init")
+    p.add_argument("--init-strict", action="store_true",
+                   help="with --init-from: fail unless every trainable weight is found in the checkpoint")
     p.add_argument("--freeze-backbone", action="store_true",
                    help="MoA.md stage B: train only MoA (DINO/FPN/SVA/cost volume/decoders frozen)")
     p.add_argument("--keep-epoch-ckpts", action="store_true")
     p.add_argument("--smoke", action="store_true", help="synthetic batches, no dataset")
     p.add_argument("--smoke-steps", type=int, default=20)
     p.add_argument("--smoke-hw", type=int, nargs=2, default=(256, 320))
-    return p.parse_args(argv)
+    return p
+
+
+def parse_args(argv=None) -> argparse.Namespace:
+    return build_parser().parse_args(argv)
 
 
 def build_config(args) -> MoAMVSConfig:
@@ -405,7 +419,7 @@ def validate(model, loader, loss_fn, cfg, device, freeze_backbone: bool) -> dict
                  for k, v in batch.items()}
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
             out = model(batch)
-        sums += depth_errors(out["depth_full"], batch["depth_gt"], metric_mask(batch))
+        sums += depth_errors(out["depth_full"], batch["depth_gt"], metric_mask(batch), batch.get("metric_scale"))
         _, logs = loss_fn(out, batch, diagnostics=True)
         for k, v in logs.items():
             agg[k] = agg.get(k, 0.0) + float(v)
@@ -421,8 +435,13 @@ def fmt(m: dict, keys=("abs_err", "acc_2mm", "acc_4mm")) -> str:
 
 
 def main(argv=None) -> None:
-    args = parse_args(argv)
-    cfg = build_config(args)
+    run(parse_args(argv))
+
+
+def run(args, config_fn=build_config, datasets_fn=build_datasets) -> None:
+    """Training loop. ``config_fn(args)`` / ``datasets_fn(cfg, args)`` let another
+    entry point (train_blended.py) swap the dataset and the config source."""
+    cfg = config_fn(args)
     t = cfg.train
     project = Path(cfg.paths.project_path)
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
@@ -435,8 +454,10 @@ def main(argv=None) -> None:
         ck = load_checkpoint(args.init_from, map_location="cpu")
         missing, unexpected = model.load_state_dict(ck["model"], strict=False)
         missing = [k for k in missing if not k.startswith(FROZEN_PREFIX)]
-        print(f"[init] {args.init_from}: {len(missing)} params kept at init "
+        print(f"[init] {args.init_from} (step {ck.get('step')}): {len(missing)} params kept at init "
               f"(e.g. {missing[:3]}), {len(unexpected)} unexpected")
+        if getattr(args, "init_strict", False) and (missing or unexpected):
+            raise SystemExit(f"[init] --init-strict: missing={missing[:8]} unexpected={list(unexpected)[:8]}")
     if args.freeze_backbone:
         if model.moa is None:
             raise SystemExit("--freeze-backbone with --moa off leaves nothing to train")
@@ -461,7 +482,7 @@ def main(argv=None) -> None:
         run_smoke(model, loss_fn, optimizer, scaler, params, cfg, device, args)
         return
 
-    train_ds, val_ds = build_datasets(cfg, args)
+    train_ds, val_ds = datasets_fn(cfg, args)
     sampler = EpochShuffleSampler(len(train_ds), t.seed)
     gen = torch.Generator()
     gen.manual_seed(t.seed)
@@ -588,7 +609,8 @@ def main(argv=None) -> None:
             if diag:
                 with torch.no_grad():
                     logs.update({f"train_{k}": v for k, v in metrics_from_sums(
-                        depth_errors(out["depth_full"], batch["depth_gt"], metric_mask(batch))).items()})
+                        depth_errors(out["depth_full"], batch["depth_gt"], metric_mask(batch),
+                                     batch.get("metric_scale"))).items()})
                 vals = {k: float(v) for k, v in logs.items()}
                 logger.scalars("train", vals, step)
                 logger.scalars("train", {"lr": lr, "epoch": epoch + i / steps_per_epoch}, step)

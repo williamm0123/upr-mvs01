@@ -44,7 +44,7 @@ class MoADTUDataset(DTUMVSDataset):
         keep, missing = [], []
         for m in self.metas:
             scan, light, ref, _ = m
-            (keep if da3_cache_file(self.da3_root, scan, ref, light).is_file() else missing).append(m)
+            (keep if self.da3_file(scan, ref, light).is_file() else missing).append(m)
         if missing:
             ex = ", ".join(f"{s} v{r} l{l}" for s, l, r, _ in missing[:5])
             msg = (f"dataset {self.mode}: {len(missing)}/{len(self.metas)} samples have no DA3 cache "
@@ -56,17 +56,24 @@ class MoADTUDataset(DTUMVSDataset):
         if not self.metas:
             raise RuntimeError(f"dataset {self.mode}: no samples left with a DA3 cache in {self.da3_root}")
         scan, light, ref, _ = self.metas[0]
-        with np.load(da3_cache_file(self.da3_root, scan, ref, light)) as z:
+        with np.load(self.da3_file(scan, ref, light)) as z:
             if "process_res" in z.files:
                 self.da3_process_res = int(np.asarray(z["process_res"]).reshape(-1)[0])
         print(f"[data] {self.mode}: {len(self.metas)} samples, DA3 cache {self.da3_root} "
               f"(process_res={self.da3_process_res})")
 
+    # Frame size the DA3 cache is stored at and the images are resized from.
+    native_hw: tuple[int, int] = NATIVE_HW
+
+    def da3_file(self, scan: str, view: int, light: int) -> Path:
+        return da3_cache_file(self.da3_root, scan, view, light)
+
     def _load_mono(self, scan: str, view: int, light: int, resize_scale: float) -> np.ndarray:
-        with np.load(da3_cache_file(self.da3_root, scan, view, light)) as z:
+        with np.load(self.da3_file(scan, view, light)) as z:
             d = np.asarray(z["depth"], dtype=np.float32)
-        if d.shape != NATIVE_HW:
-            d = cv2.resize(d, (NATIVE_HW[1], NATIVE_HW[0]), interpolation=cv2.INTER_NEAREST)
+        nh, nw = self.native_hw
+        if d.shape != (nh, nw):
+            d = cv2.resize(d, (nw, nh), interpolation=cv2.INTER_NEAREST)
         # invalid -> 0 *before* any resampling, so a negative or NaN never gets
         # blended into a plausible-looking near depth
         d[~np.isfinite(d) | (d <= 0)] = 0.0
