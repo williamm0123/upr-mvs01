@@ -4,15 +4,13 @@
 # 不申请资源, 不自动提交或续投作业。训练参数以 train_lape_umhpc.sh 为基准。
 #
 #   cd <本 checkout 的根目录>
-#   bash scripts/train_lape_umhpc_interactive.sh          # 默认测试 100 步, batch 2
-#   STEPS=100 WARMUP_STEPS=10 bash scripts/train_lape_umhpc_interactive.sh
+#   bash scripts/train_lape_umhpc_interactive.sh          # 默认 10 epoch, batch 2
 #   PER_GPU_BATCH=1 VAL_BATCH_SIZE=1 bash scripts/train_lape_umhpc_interactive.sh
 #   LAPE=off bash scripts/train_lape_umhpc_interactive.sh  # DA3 + MoA 对照
-#   STEPS=0 EPOCHS=1 bash scripts/train_lape_umhpc_interactive.sh  # 跑 1 个 epoch
 #   FRESH=0 RUN_NAME=<原实验名> bash scripts/train_lape_umhpc_interactive.sh
 #
-# 默认使用带时间戳的独立实验名; 输出位于 log/experiments/$RUN_NAME/。
-# 默认 warmup 仍为正式训练的 1000 步; 100 步测试可覆盖 WARMUP_STEPS=10。
+# 默认实验名与原脚本一致; 输出位于 log/experiments/$RUN_NAME/。
+# 训练参数默认值与 train_lape_umhpc.sh 一致, 包括 STEPS=0 和 WARMUP_STEPS=1000。
 # FRESH=1 会归档同名旧 run (保留原脚本的最近写入保护), FRESH=0 自动续训。
 # 可设置 PYTHON_BIN=/path/to/uprmvs/bin/python 跳过 conda 激活。
 # interactive 分配到期后不会自动续投, 后续续训需指定原 RUN_NAME 和 FRESH=0。
@@ -29,12 +27,12 @@ cd "$PROJECT_DIR"
 
 LAPE=${LAPE:-on}
 case "$LAPE" in
-    on)  RUN_NAME=${RUN_NAME:-LAPE_DTU_INTERACTIVE_$(date -u +%Y%m%d_%H%M%S)} ;;
-    off) RUN_NAME=${RUN_NAME:-DA3MOA_DTU_INTERACTIVE_$(date -u +%Y%m%d_%H%M%S)} ;;
+    on)  RUN_NAME=${RUN_NAME:-LAPE_DTU_E10} ;;
+    off) RUN_NAME=${RUN_NAME:-DA3MOA_DTU_E10} ;;
     *) echo "LAPE 只能是 on / off, 收到 '$LAPE'" >&2; exit 2 ;;
 esac
 EPOCHS=${EPOCHS:-10}
-STEPS=${STEPS:-100}                        # >0 则按步数跑 (覆盖 EPOCHS); 0 = 按 EPOCHS
+STEPS=${STEPS:-0}                        # >0 则按步数跑 (覆盖 EPOCHS); 0 = 按 EPOCHS
 WARP_CHANNELS=${WARP_CHANNELS:-128,128,128,128}
 PER_GPU_BATCH=${PER_GPU_BATCH:-2}
 VAL_BATCH_SIZE=${VAL_BATCH_SIZE:-4}
