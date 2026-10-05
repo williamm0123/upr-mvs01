@@ -46,7 +46,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--max-scans", type=int, default=0)
     p.add_argument("--max-refs", type=int, default=0)
     p.add_argument("--num-workers", type=int, default=4)
-    p.add_argument("--da3-root", default=None)
+    p.add_argument("--da3-root", default=None, help="DA3 cache, only for legacy (DINOv3) checkpoints")
     p.add_argument("--out", default=None, help="default log/depth_cache/<ckpt run>_<split>")
     p.add_argument("--skip-existing", action="store_true",
                    help="跳过已有的有效逐视角 NPZ，适合中断后续跑")
@@ -202,10 +202,13 @@ def main(argv=None) -> None:
     use_amp = bool(tcfg.get("amp", True)) and device.type == "cuda"
 
     da3_root = Path(args.da3_root) if args.da3_root else Path(cfg.paths.da3_cache_path)
-    ds = build_dataset(cfg, args, model.uses_mono, da3_root)
-    if model.uses_mono and ck.get("da3_process_res") not in (None, ds.da3_process_res):
+    ds = build_dataset(cfg, args, model.needs_mono_cache, da3_root)
+    if model.needs_mono_cache and ck.get("da3_process_res") not in (None, ds.da3_process_res):
         print(f"[test] WARNING DA3 cache process_res {ds.da3_process_res} != training "
               f"{ck.get('da3_process_res')}")
+    da3_info = ({"source": "online", "process_res": model.da3_process_res} if model.da3_sva is not None
+                else {"source": "cache", "root": str(da3_root) if model.uses_mono else None,
+                      "process_res": ds.da3_process_res})
     run = Path(args.ckpt).resolve().parent.parent.name
     out_root = Path(args.out) if args.out else Path(cfg.paths.depth_cache_path) / f"{run}_{args.split}"
     out_root.mkdir(parents=True, exist_ok=True)
@@ -222,6 +225,7 @@ def main(argv=None) -> None:
                 todo_indices.append(idx)
                 invalid_cache += cache_path.is_file()
     print(f"[test] {args.ckpt} step {ck.get('step')}  moa={'on' if model.uses_mono else 'off'}  "
+          f"lape={'on' if model.lape_on else 'off'}  da3={da3_info['source']}  "
           f"{selected_views} samples  {ds.height}x{ds.width}  amp={amp_dtype if use_amp else 'off'}  -> {out_root}")
     if args.fuse and args.skip_existing:
         print(f"[test] 续跑检查: 跳过已有 NPZ {cached_views}/{selected_views}，"
@@ -322,7 +326,7 @@ def main(argv=None) -> None:
         "checkpoint": {"path": str(Path(args.ckpt).resolve()), "step": ck.get("step"),
                        "best_metric": ck.get("best_metric"), "arch": ck.get("arch"), "git": ck.get("git")},
         "code_git": git_state(),
-        "da3": {"root": str(da3_root) if model.uses_mono else None, "process_res": ds.da3_process_res},
+        "da3": da3_info,
         "inference": {"split": args.split, "num_views": args.num_views, "resize_scale": args.resize_scale,
                       "full_image": bool(args.full_image), "max_scans": args.max_scans,
                       "max_refs": args.max_refs, "conf_window": args.conf_window,

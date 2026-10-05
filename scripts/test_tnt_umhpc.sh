@@ -15,13 +15,15 @@
 # Tanks-and-Temples 推理 + 融合 (MoAMVSNet) —— 单卡 A100, sbatch 提交。
 #
 #   cd /scr/user/qinglong/projects/upr-mvs01 && git pull && mkdir -p logs
-#   sbatch scripts/test_tnt_umhpc.sh                                    # BlendedMVS 微调后的 latest.pth
-#   CKPT=log/experiments/MOA_E15/model/latest.pth TAG=MOA_E15 sbatch scripts/test_tnt_umhpc.sh   # 对照: 纯 DTU 权重
+#   sbatch scripts/test_tnt_umhpc.sh                                    # LAPE BlendedMVS 微调后的 latest.pth
+#   CKPT=log/experiments/LAPE_DTU_E10/model/latest.pth TAG=LAPE_DTU_E10 sbatch scripts/test_tnt_umhpc.sh   # 对照: 纯 DTU 权重
+#   CKPT=log/experiments/MOA1_BLD_30K/model/latest.pth TAG=MOA1_BLD sbatch scripts/test_tnt_umhpc.sh      # 旧 moa1
 #   SCENES="intermediate/Family advanced/Temple" sbatch ...             # 子集
 #   PHASE=fuse CONF=0.3 PLY_DIR=log/tnt/xxx/ply_c03 sbatch ...          # 只换阈值重融
 #
 # 步骤:
-#   1. DA3 缓存 log/da3_cache_tnt (原生 1920, DA3_SHARDS 进程; 断点续跑)
+#   1. DA3 缓存 log/da3_cache_tnt —— 只有旧 (DINOv3) checkpoint 需要; DA3 特征的新模型 (LAPE) 在网络里
+#      在线推理 DA3, 自动跳过这一步 (按 checkpoint 快照里的 feat.backbone 判断)
 #   2. test_tt_moa.py: 1920x1080 整幅, NUM_VIEWS 个视角 (默认 7; 本地实测 7 视角 720x1280 峰值
 #      12.6 GiB, 1080p 外推约 28 GiB), 逐视角缓存 -> MonoMVSNet 动态几何一致性融合
 #   输出: $OUT/depth/<split>/<Scene>/*.npz,  $PLY_DIR/<Scene>.ply (默认 $OUT/ply)
@@ -39,7 +41,7 @@ PROJECT_DIR=${PROJECT_DIR:-${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]
 [[ -f "$PROJECT_DIR/test_tt_moa.py" ]] || { echo "PROJECT_DIR=$PROJECT_DIR 不是仓库根目录" >&2; exit 2; }
 cd "$PROJECT_DIR"
 
-CKPT=${CKPT:-log/experiments/MOA1_BLD_30K/model/latest.pth}
+CKPT=${CKPT:-log/experiments/LAPE_BLD_E10/model/latest.pth}
 TAG=${TAG:-$(basename "$(dirname "$(dirname "$CKPT")")")}
 TNT_ROOT=${TNT_ROOT:-/scr/user/qinglong/dataset/TankandTemples}
 SCENES=${SCENES:-}                      # 空 = TNT_ROOT 下找得到的全部 14 个
@@ -82,8 +84,18 @@ echo " out=$OUT  ply=$PLY_DIR  da3=$DA3_ROOT"
 echo "=================================================================="
 nvidia-smi -L || true
 
+NEEDS_DA3_CACHE=0
 if [[ "$PHASE" != "fuse" ]]; then
     python -c 'import sys, torch; sys.exit(0 if torch.cuda.is_available() else "CUDA 不可用 —— 需要 --gres=gpu:1")'
+    NEEDS_DA3_CACHE=$(python - "$CKPT" <<'PY'
+import sys, torch
+arch = torch.load(sys.argv[1], map_location="cpu", weights_only=False).get("arch", {})
+print(0 if arch.get("feat", {}).get("backbone") == "da3" else 1)
+PY
+)
+    echo "=== DA3: $([[ $NEEDS_DA3_CACHE == 1 ]] && echo '旧模型, 用离线缓存' || echo '网络内在线推理, 跳过缓存') ==="
+fi
+if [[ "$NEEDS_DA3_CACHE" == "1" ]]; then
     # ---- 1. DA3 cache (native 1920; resumable) --------------------------------
     DA3_ARGS=(--dataset tnt --root "$TNT_ROOT" --out "$DA3_ROOT" ${SCENE_ARGS[@]+"${SCENE_ARGS[@]}"})
     python scripts/build_da3_cache_mvs.py "${DA3_ARGS[@]}" --dry-run

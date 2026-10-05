@@ -98,6 +98,83 @@ class MoAConfig:
 
 
 @dataclass(frozen=True)
+class FeatureConfig:
+    """Which frozen ViT feeds the SVA, and where the monocular depth comes from.
+
+    ``da3``: Depth Anything 3 (DA3MONO-LARGE, DINOv2 ViT-L/14) replaces DINOv3 — the
+    MonoMVSNet recipe of taking the monocular model's own encoder features. One DA3
+    forward per step serves both consumers: the intermediate tokens of every view go
+    through ``SVAFusion`` into the FPN exactly where the DINOv3 tokens used to, and
+    the DPT head on the reference view gives the online monocular depth (no cache).
+    ``dinov3``: the old MVSFormer++-style DINOv3 ViT-B/16 + the offline DA3 cache —
+    only for checkpoints trained before this section existed (moa1 / moa2).
+    """
+
+    backbone: str = "da3"                       # da3 | dinov3 (legacy)
+    # DA3 input: longest side -> process_res, then each side rounded to a multiple of 14
+    # (DA3's own upper_bound_resize). 518 is where its shape is best (test18).
+    process_res: int = 518
+    sva_layers: tuple[int, ...] = (0, 1, 2, 3)  # indices into DA3's out_layers (4, 11, 17, 23)
+    sky_threshold: float = 0.3                  # DA3 sky probability above this -> no mono depth
+
+
+@dataclass(frozen=True)
+class LAPEConfig:
+    """Local-Affine Prior Evidence (docs: LAPE 终版方案). ``enabled=False`` = the MoA cascade.
+
+    (1) RAC: sequential multi-model RANSAC + Tukey global alignment, each pixel takes
+    the model voted by the anchors of its DA3-edge-bounded region; (2) four monocular
+    experts (RAC region model + 3x3 / 7x7 / 11x11 local WLS), each with a calibrated
+    sigma; (3) normal-consistent evidence: neighbours' matching cost carried along the
+    monocular plane (GoMVS-style), stages 1-3; (4) low-frequency recall: re-centre the
+    next window on the monocular depth where MVS has visibly collapsed; (5) the prior's
+    bin mass enters the cost volume (gated adapter) and the logits (bounded gamma*log q).
+    Stage 1 is regularised twice on the same cost volume.
+    """
+
+    enabled: bool = True
+    stage1_two_pass: bool = True
+    # (1) RAC
+    rac_max_models: int = 3
+    rac_a_ratio: tuple[float, float] = (0.5, 2.0)
+    rac_min_frac: float = 0.1
+    # (2) local experts: 3x3 dense, 7x7 dense, 11x11 on offsets {0, +-1, +-3, +-5}
+    spatial_sigma: tuple[float, float, float] = (1.0, 2.0, 4.0)
+    min_neff: tuple[float, float, float] = (3.0, 6.0, 8.0)   # Kish effective anchors per window
+    sigma_floor_bins: float = 0.1               # c0, in stage-1 bins
+    delta0: float = 4.0                         # anchor-distance scale, parent pixels
+    # (3) normal-consistent evidence, per stage 1..4
+    nce_stages: tuple[bool, bool, bool, bool] = (True, True, True, False)
+    nce_dilation: tuple[int, int, int, int] = (1, 1, 2, 1)
+    nce_radius: int = 2                         # 5x5 neighbourhood
+    nce_kappa_init: float = 0.25
+    # (4) low-frequency recall, per transition (->stage 2/3/4). Off at the last one: its
+    # window is ~0.2 stage-1 bins wide, finer than DA3 is accurate after any alignment.
+    lfr: bool = True
+    lfr_levels: tuple[bool, bool, bool] = (True, True, False)
+    lfr_tau_rgb: float = 0.5
+    lfr_tau_mono: float = 0.25
+    lfr_rho: float = 4.0
+    lfr_gap_floor_bins: float = 2.0             # C3 also needs |y - mu_RAC| > this many stage-1 bins
+    lfr_slope_min: float = 0.3                  # C4b: MVS ignores the mono shape (collapsed) ...
+    lfr_mono_var_bins: float = 0.25             # ... where the mono depth varies >= this (parent bins)
+    lfr_tau_region: float = 0.5
+    lfr_delta_max: float = 16.0
+    # C0: the matching is not trusted there (7x7 mean of the MoA confidence head). "y does not
+    # follow x" alone cannot tell a collapsed MVS from a wrongly shaped DA3; low confidence can.
+    lfr_conf_max: float = 0.5
+    # (5) candidate evidence + bounded fusion
+    mass_min: float = 0.2
+    eps_floor: float = 0.05
+    log_prior_clip: float = 4.0
+    gamma_max: float = 2.0
+    gamma_bias_init: float = -4.0
+    reliable_mass: float = 0.9                  # v_M: posterior mass within +-1 bin of the argmax
+    reliable_src_std: float = 1.0               # v_M: normalised source disagreement at the argmax
+    reliable_nvalid: float = 0.5                # v_M: fraction of sources that see the argmax voxel
+
+
+@dataclass(frozen=True)
 class MoALossConfig:
     stage_weights: tuple[float, float, float, float] = (1.0, 1.0, 1.5, 2.0)
     moa_stage_weights: tuple[float, float, float] = (1.0, 1.0, 1.0)
@@ -106,19 +183,24 @@ class MoALossConfig:
     w_conf: float = 0.5
     # GT depth discontinuity (log-depth jump between neighbours) excluded from L_shape
     gt_edge_tau: float = 0.03
+    # LAPE: deep supervision of stage-1 pass A, and the Gaussian NLL that calibrates sigma
+    w_ce_stage1a: float = 0.5
+    w_sigma_nll: float = 0.1
+    sigma_nll_cap_bins: float = 20.0            # residuals beyond this (stage-1 bins) are capped
+    sigma_nll_huber: float = 3.0                # NLL tails become linear beyond this many sigma
 
 
 @dataclass(frozen=True)
 class MoATrainConfig:
     profile: str = "umhpc"
-    epochs: int = 15
+    epochs: int = 10
     max_steps: int = 0                 # 0 = epochs x steps_per_epoch
     lr_schedule_steps: int = 0         # 0 = 跟随实际停止步数
-    batch_size: int = 4
+    batch_size: int = 2
     val_batch_size: int = 4
     num_views: int = 5
     num_workers: int = 12
-    lr: float = 4.243e-4
+    lr: float = 3e-4
     weight_decay: float = 1.0e-4
     warmup_steps: int = 1000
     grad_clip: float = 1.0
@@ -131,8 +213,13 @@ class MoATrainConfig:
     multi_scale: bool = True
     height: int = 512                  # used when multi_scale is off
     width: int = 640
-    da3_missing: str = "error"         # error / skip
+    da3_missing: str = "error"         # error / skip (legacy offline DA3 cache only)
     nan_grad_patience: int = 10
+    # LAPE training-time prior augmentation (per sample, train mode only):
+    # drop the whole monocular prior, or perturb one 64x64 block of the DA3 depth
+    # (scale +-10%, shift +-2% of the block median) before RAC sees it.
+    prior_dropout: float = 0.3
+    mono_perturb: float = 0.3
 
 
 def _train_profile(profile: str) -> MoATrainConfig:
@@ -156,6 +243,8 @@ class MoAMVSConfig:
     dino_fusion: SPREConfig = field(default_factory=SPREConfig)
     cascade: CascadeConfig = field(default_factory=CascadeConfig)
     moa: MoAConfig = field(default_factory=MoAConfig)
+    feat: FeatureConfig = field(default_factory=FeatureConfig)
+    lape: LAPEConfig = field(default_factory=LAPEConfig)
     loss: MoALossConfig = field(default_factory=MoALossConfig)
     augment: AugmentConfig = field(default_factory=AugmentConfig)
     train: MoATrainConfig = field(default_factory=lambda: _train_profile(
@@ -169,7 +258,15 @@ def build_moa_config(profile: str | None = None) -> MoAMVSConfig:
 
 # Sections that define the network. Saved in every checkpoint and restored by
 # test_moa.py, so inference rebuilds exactly what was trained.
-ARCH_SECTIONS = ("fpn", "sva", "dino", "dino_fusion", "cascade", "moa")
+ARCH_SECTIONS = ("fpn", "sva", "dino", "dino_fusion", "cascade", "moa", "feat", "lape")
+
+# What a section means when a checkpoint predates it. A whole missing section is
+# not "today's default": moa1 / moa2 were trained with DINOv3 features, the offline
+# DA3 cache and no LAPE, so that is what they must be rebuilt with.
+LEGACY_SECTIONS = {
+    "feat": FeatureConfig(backbone="dinov3"),
+    "lape": LAPEConfig(enabled=False),
+}
 
 
 def _to_plain(v):
@@ -221,7 +318,11 @@ def apply_arch_snapshot(cfg: MoAMVSConfig, snapshot: dict) -> MoAMVSConfig:
     """
     hints = typing.get_type_hints(MoAMVSConfig)
     upd = {name: _from_dict(hints[name], snapshot[name]) for name in ARCH_SECTIONS if name in snapshot}
-    out = dataclasses.replace(cfg, **upd)
+    legacy = {name: LEGACY_SECTIONS[name] for name in LEGACY_SECTIONS if name not in snapshot}
+    if legacy:
+        print(f"[config] 快照里没有 {sorted(legacy)} 段 (旧 checkpoint): 按旧语义重建 "
+              f"(feat.backbone=dinov3 + 离线 DA3 缓存, lape.enabled=False)")
+    out = dataclasses.replace(cfg, **upd, **legacy)
     missing = [f"{sec}.{f.name}={getattr(getattr(out, sec), f.name)!r}"
                for sec in ARCH_SECTIONS if sec in snapshot
                for f in dataclasses.fields(getattr(out, sec)) if f.name not in snapshot[sec]]

@@ -454,7 +454,10 @@ def test_network_moa_loss_does_not_touch_backbone():
     from train_moa import synthetic_batch
 
     cfg = build_moa_config("local")
-    cfg = dataclasses.replace(cfg, moa=dataclasses.replace(cfg.moa, global_min_eff=16.0))
+    # the MoA (pre-LAPE) network: DINOv3 features, offline mono depth, prior only sets centres
+    cfg = dataclasses.replace(cfg, moa=dataclasses.replace(cfg.moa, global_min_eff=16.0),
+                              feat=dataclasses.replace(cfg.feat, backbone="dinov3"),
+                              lape=dataclasses.replace(cfg.lape, enabled=False))
     dev = torch.device("cuda")
     net = MoAMVSNet(cfg).to(dev).train()
     batch = synthetic_batch(cfg, dev, 1, (128, 160))

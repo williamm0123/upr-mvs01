@@ -1,32 +1,29 @@
-"""Fine-tune a DTU-trained MoAMVSNet (moa1) on BlendedMVS (balanced with DTU by default).
+"""Fine-tune a DTU-trained MoAMVSNet on BlendedMVS, balanced with DTU (MVSFormer++ recipe).
 
-    python train_blended.py --name MOA1_BLD_30K --init-from log/experiments/MOA_E15/model/latest.pth \
-        --blended-root /scr/user/qinglong/dataset/BlendedMVS_lowres --max-steps 30000 --lr 1e-4
+    python train_blended.py --name LAPE_BLD_E10 --init-from log/experiments/LAPE_DTU_E10/model/latest.pth \
+        --blended-root /scr/user/qinglong/dataset/BlendedMVS_lowres --epochs 10 --lr 1e-4
 
-Same training loop as train_moa.py (train_moa.run); only the config source and
-the dataset change:
+Same training loop as train_moa.py (train_moa.run); only the config source and the
+dataset change:
 
 * The architecture comes from the ``--init-from`` checkpoint's snapshot, not from
-  today's defaults — main has since moved to warp 128x4 / RANSAC / moa_gain /
-  edge_snap. The three behaviour-only fields that moa1's snapshot predates are
-  pinned to moa1's semantics (``--moa1-semantics on``, the default):
-      global_solver = huber x3   (moa1 had only the Huber IRLS solver)
-      moa_gain      = 1, 1, 1    (no per-stage cap on the mono experts)
-      edge_snap     = off        (no hard surface pick at DA3 edges)
-  The init is strict: every trainable weight must be in the checkpoint.
-* Weights only: a fresh optimizer and a fresh warmup + cosine schedule over
-  ``--max-steps``. Requeues resume from this run's own latest.pth as usual.
-* Data: data/blended_moa.py, multi-scale crops up to the native 576x768, DA3 from
-  a separate cache (scripts/build_da3_cache_mvs.py --dataset blended). Default
-  lists are the official BlendedMVS split MVSFormer++ uses (lists/blended/, 106/7
-  scenes of the original low-res release, not BlendedMVS+).
+  today's defaults, and the init is strict (every trainable weight must be found).
+  A LAPE checkpoint (feat.backbone = da3) runs DA3 online: no DA3 cache is read or
+  built for DTU or Blended. Legacy moa1 checkpoints still work: their snapshot lacks
+  the ``feat`` / ``lape`` sections, so they are rebuilt with DINOv3 + the DA3 cache, and
+  ``--moa1-semantics auto`` pins the three behaviour fields moa1 predates
+  (global_solver = huber, moa_gain = 1,1,1, edge_snap = off).
+* Weights only: a fresh optimizer and a fresh warmup + cosine schedule. Requeues
+  resume from this run's own latest.pth as usual.
+* Data: data/blended_moa.py — the original low-res BlendedMVS (576x768) with the
+  official 106/7 split MVSFormer++ uses (lists/blended/), multi-scale crops up to the
+  native frame.
 * ``--mix-dtu on`` (default) = MVSFormer++'s ``--balanced_training``
-  (reference/MVSFormerPlusPlus datasets/balanced_sampling.py): each epoch takes
-  min(len) samples from DTU (lists/dtu/trainval.txt, as their mvsformer++_ft.json)
-  and from Blended-train and shuffles them together; one crop size per batch across
-  both (their CustomConcatDataset.reset_dataset). DTU keeps its own 1600 DA3 cache;
-  both use BLENDED_SCALES. Validation: Blended-val only (MVSFormer++ also runs DTU
-  test as an extra, non-monitored val set). ``--mix-dtu off`` = Blended only.
+  (reference/MVSFormerPlusPlus datasets/balanced_sampling.py + config/mvsformer++_ft.json):
+  each epoch takes min(len) samples from DTU (lists/dtu/trainval.txt) and from
+  Blended-train and shuffles them together; one crop size per batch across both
+  (their CustomConcatDataset.reset_dataset); 10 epochs, lr 1e-4, warmup 500.
+  Validation: Blended-val. ``--mix-dtu off`` = Blended only.
 * ``--mvsformer-sampling on`` (default), as their *_dataset_ms.py in training:
   sources = random nviews-1 of pair.txt's top 7 (Blended) / all 10 (DTU), and a
   random crop is re-drawn while its 1/8 GT mask is empty.
@@ -66,11 +63,12 @@ def parse_args(argv=None):
                    help="random sources (Blended top-7 / DTU all) + re-draw crops with an empty GT mask")
     p.add_argument("--arch-from", default=None,
                    help="checkpoint whose architecture snapshot builds the net (default: --init-from)")
-    p.add_argument("--moa1-semantics", choices=["on", "off"], default="on",
-                   help="on: global_solver=huber, moa_gain=1,1,1, edge_snap=off (moa1)")
+    p.add_argument("--moa1-semantics", choices=["auto", "on", "off"], default="auto",
+                   help="auto: pin global_solver=huber, moa_gain=1,1,1, edge_snap=off only when the "
+                        "checkpoint's snapshot predates those fields (moa1); on: always; off: never")
     p.set_defaults(train_list=str(REPO / "lists/blended/training_list.txt"),
                    val_list=str(REPO / "lists/blended/validation_list.txt"),
-                   da3_root=str(REPO / "log/da3_cache_blended"))
+                   da3_root=str(REPO / "log/da3_cache_blended"), lr=1e-4, warmup_steps=500, epochs=10)
     args = p.parse_args(argv)
     if args.warp_channels or args.moa_dim:
         p.error("--warp-channels / --moa-dim come from the checkpoint's architecture here")
@@ -84,7 +82,8 @@ def build_config(args):
     src = args.arch_from or args.init_from
     arch = torch.load(src, map_location="cpu", weights_only=False)["arch"]
     cfg = apply_arch_snapshot(cfg, arch)
-    if args.moa1_semantics == "on":
+    predates = [k for k in MOA1_SEMANTICS if k not in arch.get("moa", {})]
+    if args.moa1_semantics == "on" or (args.moa1_semantics == "auto" and predates):
         cfg = dataclasses.replace(cfg, moa=dataclasses.replace(cfg.moa, **MOA1_SEMANTICS))
     cfg = dataclasses.replace(cfg, moa=dataclasses.replace(cfg.moa, enabled=args.moa == "on"),
                               augment=dataclasses.replace(cfg.augment, scales=BLENDED_SCALES))
@@ -92,6 +91,7 @@ def build_config(args):
     print(f"[blended] mix_dtu={args.mix_dtu}  mvsformer_sampling={args.mvsformer_sampling}  "
           f"scales={BLENDED_SCALES}")
     print(f"[blended] arch from {src}: warp={cfg.cascade.warp_channels} depths={cfg.cascade.num_depths} "
+          f"feat={cfg.feat.backbone} lape={'on' if cfg.lape.enabled else 'off'} "
           f"moa={'on' if m.enabled else 'off'} global_solver={m.global_solver} "
           f"moa_gain={m.moa_gain} edge_snap={m.edge_snap}")
     return cfg
@@ -99,8 +99,9 @@ def build_config(args):
 
 def build_datasets(cfg, args):
     t, aug = cfg.train, cfg.augment
+    load_mono = train_moa.mono_from_cache(cfg)        # False with the DA3 backbone: mono depth is online
     common = dict(nviews=t.num_views, seed=t.seed, da3_root=Path(args.da3_root),
-                  load_mono=cfg.moa.enabled, da3_missing=t.da3_missing)
+                  load_mono=load_mono, da3_missing=t.da3_missing)
     train_kw = dict(
         mode="train",
         aug=PhotometricAug(brightness=aug.brightness, contrast=aug.contrast, saturation=aug.saturation,

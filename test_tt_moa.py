@@ -64,7 +64,8 @@ def parse_args(argv=None):
     p.add_argument("--resize-scale", type=float, default=1.0)
     p.add_argument("--max-refs", type=int, default=0)
     p.add_argument("--num-workers", type=int, default=4)
-    p.add_argument("--da3-root", default=str(REPO / "log/da3_cache_tnt"))
+    p.add_argument("--da3-root", default=str(REPO / "log/da3_cache_tnt"),
+                   help="DA3 cache, only for legacy (DINOv3) checkpoints; DA3-backbone models run it online")
     p.add_argument("--conf-window", type=int, default=1)
     p.add_argument("--out", required=True)
     p.add_argument("--skip-existing", action=argparse.BooleanOptionalAction, default=True)
@@ -103,6 +104,7 @@ def build_model(args, device):
         print(f"[tnt] snapshot predates {sorted(pre)} -> moa1 semantics {pre}")
     m = cfg.moa
     print(f"[tnt] {args.ckpt} step {ck.get('step')}: warp={cfg.cascade.warp_channels} "
+          f"feat={cfg.feat.backbone} lape={'on' if cfg.lape.enabled else 'off'} "
           f"global_solver={m.global_solver} moa_gain={m.moa_gain} edge_snap={m.edge_snap}")
     model = MoAMVSNet(cfg).to(device)
     load_model_state(model, ck["model"])
@@ -121,13 +123,15 @@ def infer(args, scenes) -> dict:
     report = {}
     for scene in scenes:
         ds = MoATnTScene(args.tt_root, scene, nviews=args.num_views, resize_scale=args.resize_scale,
-                         da3_root=args.da3_root if model.uses_mono else None, max_refs=args.max_refs)
+                         da3_root=args.da3_root if model.needs_mono_cache else None, max_refs=args.max_refs)
         d = out_root / "depth" / scene
         d.mkdir(parents=True, exist_ok=True)
         todo = [i for i, (ref, _) in enumerate(ds.metas)
                 if not (args.skip_existing and valid_depth_cache(d / f"{ref:08d}.npz"))]
+        da3_res = model.da3_process_res if model.da3_sva is not None else ds.da3_process_res
         print(f"[tnt] {scene}: {len(ds)} refs, {len(ds) - len(todo)} cached, {len(todo)} to run, "
-              f"{args.num_views} views, DA3 process_res={ds.da3_process_res}", flush=True)
+              f"{args.num_views} views, DA3 {'online' if model.da3_sva is not None else 'cache'} "
+              f"process_res={da3_res}", flush=True)
         t0, gok = time.time(), []
         loader = DataLoader(torch.utils.data.Subset(ds, todo), batch_size=1, shuffle=False,
                             num_workers=args.num_workers, collate_fn=collate, pin_memory=True)
@@ -163,7 +167,7 @@ def infer(args, scenes) -> dict:
                 dt = time.time() - t0
                 print(f"[tnt] {scene} {k + 1}/{len(todo)}  {dt / (k + 1):.2f}s/view  "
                       f"peak {torch.cuda.max_memory_allocated() / 2**30 if use_amp else 0:.1f}G", flush=True)
-        report[scene] = {"refs": len(ds), "inferred": len(todo), "da3_process_res": ds.da3_process_res,
+        report[scene] = {"refs": len(ds), "inferred": len(todo), "da3_process_res": da3_res,
                          "moa2_global_ok": float(np.mean(gok)) if gok else None}
     manifest = {
         "timestamp": datetime.datetime.now().astimezone().isoformat(),
@@ -171,7 +175,8 @@ def infer(args, scenes) -> dict:
                        "arch": ck.get("arch"), "git": ck.get("git")},
         "code_git": git_state(),
         "inference": {"num_views": args.num_views, "resize_scale": args.resize_scale,
-                      "da3_root": args.da3_root, "conf_window": args.conf_window, "tt_root": args.tt_root},
+                      "da3": "online" if model.da3_sva is not None else args.da3_root,
+                      "conf_window": args.conf_window, "tt_root": args.tt_root},
         "scenes": report,
     }
     path = out_root / "run_manifest.json"

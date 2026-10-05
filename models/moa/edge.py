@@ -86,16 +86,24 @@ class NeighborhoodBarrier(nn.Module):
     padded supercover path table ``path_idx`` [K, L] (indices into offsets).
     """
 
-    def __init__(self, radius: int = 3) -> None:
+    def __init__(self, radius: int = 3, subset: list[tuple[int, int]] | None = None) -> None:
+        """``subset``: only these offsets get a pass mask (LAPE's 3/7/11 union, NCE's dilated
+        5x5). Paths are still traced through every cell of the full square, so a skipped
+        pixel's edge still blocks the offsets behind it. ``None`` = the whole square."""
         super().__init__()
         self.radius = int(radius)
         r = self.radius
-        offsets = [(dy, dx) for dy in range(-r, r + 1) for dx in range(-r, r + 1)]
-        index = {o: k for k, o in enumerate(offsets)}
+        full = [(dy, dx) for dy in range(-r, r + 1) for dx in range(-r, r + 1)]
+        index = {o: k for k, o in enumerate(full)}
+        offsets = full if subset is None else [tuple(int(v) for v in o) for o in subset]
+        bad = [o for o in offsets if o not in index]
+        if bad:
+            raise ValueError(f"offsets {bad[:4]} lie outside radius {r}")
         paths = [[index[c] for c in supercover_path(dy, dx)] for dy, dx in offsets]
         L = max(len(p) for p in paths)
         # Pad with the endpoint itself: repeating a path cell never changes the max.
         padded = [p + [p[-1]] * (L - len(p)) for p in paths]
+        self.full_offsets = full
         self.offset_list = offsets
         self.register_buffer("offsets", torch.tensor(offsets, dtype=torch.long), persistent=False)
         self.register_buffer("ring", torch.tensor([max(abs(a), abs(b)) for a, b in offsets],
@@ -120,7 +128,7 @@ class NeighborhoodBarrier(nn.Module):
         v = valid.float()
         e = edge.float()
         lz = log_z.float()
-        e_views = torch.stack(shifted_views(e, self.offset_list, r, 0.0), dim=0)   # [K,B,1,H,W]
+        e_views = torch.stack(shifted_views(e, self.full_offsets, r, 0.0), dim=0)  # [Kfull,B,1,H,W]
         v_views = shifted_views(v, self.offset_list, r, 0.0)
         lz_views = shifted_views(lz, self.offset_list, r, 0.0)
         pas, pair = [], []

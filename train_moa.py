@@ -42,7 +42,8 @@ except Exception:  # tensorboard not installed
     SummaryWriter = None
 
 EXIT_REQUEUE = 124
-FROZEN_PREFIX = "dino_sva.dino."        # frozen DINOv3 weights: reloaded from file, not checkpointed
+# frozen ViT weights (DINOv3 for legacy runs, DA3 now): reloaded from file, never checkpointed
+FROZEN_PREFIXES = FROZEN_PREFIX = ("dino_sva.dino.", "da3_sva.da3.")
 
 
 # --------------------------------------------------------------------------- #
@@ -213,10 +214,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--height", type=int, default=None, help="crop height without multi-scale")
     p.add_argument("--width", type=int, default=None)
     p.add_argument("--moa", choices=["on", "off"], default="on",
-                   help="off = pure 4-stage MVS cascade (MoA.md stage A baseline); no DA3 needed")
+                   help="off = pure 4-stage MVS cascade (no monocular prior at all)")
+    p.add_argument("--lape", choices=["on", "off"], default=None,
+                   help="LAPE (default on): RAC + calibrated experts + normal evidence + LFR + prior "
+                        "fusion; off = the MoA cascade (prior only sets the window centres)")
+    p.add_argument("--feat-backbone", choices=["da3", "dinov3"], default=None,
+                   help="da3 (default): DA3 tokens feed the SVA and its head gives the online mono "
+                        "depth; dinov3: the old DINOv3 + offline DA3 cache")
+    p.add_argument("--da3-process-res", type=int, default=None, help="DA3 input long side (default 518)")
     p.add_argument("--moa-dim", type=int, default=None,
                    help="MoA width: emb/feat/evidence = D, hidden layers = 2D (default 16)")
-    p.add_argument("--da3-root", default=None, help="DA3 cache root (default cfg.paths.da3_cache_path)")
+    p.add_argument("--da3-root", default=None,
+                   help="DA3 cache root, only for --feat-backbone dinov3 (default cfg.paths.da3_cache_path)")
     p.add_argument("--da3-missing", choices=["error", "skip"], default=None)
     p.add_argument("--train-list", default=None)
     p.add_argument("--val-list", default=None)
@@ -265,6 +274,15 @@ def build_config(args) -> MoAMVSConfig:
             raise SystemExit("--warp-channels 需要四个值, 例如 128,128,64,64")
         cfg = dataclasses.replace(cfg, cascade=dataclasses.replace(cfg.cascade, warp_channels=wc))
     moa = dataclasses.replace(cfg.moa, enabled=args.moa == "on")
+    if args.lape is not None:
+        cfg = dataclasses.replace(cfg, lape=dataclasses.replace(cfg.lape, enabled=args.lape == "on"))
+    feat_upd = {}
+    if args.feat_backbone is not None:
+        feat_upd["backbone"] = args.feat_backbone
+    if args.da3_process_res is not None:
+        feat_upd["process_res"] = int(args.da3_process_res)
+    if feat_upd:
+        cfg = dataclasses.replace(cfg, feat=dataclasses.replace(cfg.feat, **feat_upd))
     if args.moa_dim:
         d = int(args.moa_dim)
         moa = dataclasses.replace(moa, emb_dim=d, feat_dim=d, evidence_dim=d, evidence_hidden=d,
@@ -275,7 +293,7 @@ def build_config(args) -> MoAMVSConfig:
 def build_datasets(cfg: MoAMVSConfig, args):
     t = cfg.train
     da3_root = Path(args.da3_root) if args.da3_root else Path(cfg.paths.da3_cache_path)
-    load_mono = cfg.moa.enabled
+    load_mono = mono_from_cache(cfg)
     aug = cfg.augment
     train_ds = MoADTUDataset(
         cfg.paths.dtu_train_root, args.train_list or str(cfg.paths.train_list_file),
@@ -294,6 +312,11 @@ def build_datasets(cfg: MoAMVSConfig, args):
         idx = np.linspace(0, len(val_ds.metas) - 1, args.max_val_samples).round().astype(int)
         val_ds.metas = [val_ds.metas[i] for i in idx]
     return train_ds, val_ds
+
+
+def mono_from_cache(cfg: MoAMVSConfig) -> bool:
+    """Only legacy (DINOv3) MoA reads the offline DA3 cache; the DA3 backbone runs it online."""
+    return bool(cfg.moa.enabled and cfg.feat.backbone != "da3")
 
 
 def synthetic_batch(cfg: MoAMVSConfig, device, batch_size: int, hw) -> dict:
@@ -319,7 +342,8 @@ def synthetic_batch(cfg: MoAMVSConfig, device, batch_size: int, hw) -> dict:
 def set_train_mode(model: MoAMVSNet, freeze_backbone: bool) -> None:
     model.train()
     if freeze_backbone:
-        for m in (model.dino_sva, model.fpn, model.sva_pathway, model.cost_volumes, model.decoders):
+        for m in (model.dino_sva, model.da3_sva, model.fpn, model.sva_pathway, model.cost_volumes,
+                  model.decoders):
             if m is not None:
                 m.eval()
 
@@ -430,6 +454,12 @@ def validate(model, loader, loss_fn, cfg, device, freeze_backbone: bool) -> dict
     return m
 
 
+def da3_resolution(model, ds):
+    if getattr(model, "da3_sva", None) is not None:
+        return model.da3_process_res
+    return getattr(ds, "da3_process_res", None)
+
+
 def fmt(m: dict, keys=("abs_err", "acc_2mm", "acc_4mm")) -> str:
     return "  ".join(f"{k}={m[k]:.4f}" for k in keys if k in m)
 
@@ -453,7 +483,7 @@ def run(args, config_fn=build_config, datasets_fn=build_datasets) -> None:
     if args.init_from:
         ck = load_checkpoint(args.init_from, map_location="cpu")
         missing, unexpected = model.load_state_dict(ck["model"], strict=False)
-        missing = [k for k in missing if not k.startswith(FROZEN_PREFIX)]
+        missing = [k for k in missing if not k.startswith(FROZEN_PREFIXES)]
         print(f"[init] {args.init_from} (step {ck.get('step')}): {len(missing)} params kept at init "
               f"(e.g. {missing[:3]}), {len(unexpected)} unexpected")
         if getattr(args, "init_strict", False) and (missing or unexpected):
@@ -461,7 +491,8 @@ def run(args, config_fn=build_config, datasets_fn=build_datasets) -> None:
     if args.freeze_backbone:
         if model.moa is None:
             raise SystemExit("--freeze-backbone with --moa off leaves nothing to train")
-        for m in (model.fpn, model.sva_pathway, model.cost_volumes, model.decoders, model.dino_sva):
+        for m in (model.fpn, model.sva_pathway, model.cost_volumes, model.decoders, model.dino_sva,
+                  model.da3_sva):
             if m is not None:
                 m.requires_grad_(False)
     moa_ids = {id(p) for p in model.moa.parameters()} if model.moa is not None else set()
@@ -472,7 +503,8 @@ def run(args, config_fn=build_config, datasets_fn=build_datasets) -> None:
     all_params = params["backbone"] + params["moa"]
     print(f"[model] trainable backbone {sum(p.numel() for p in params['backbone']) / 1e6:.2f}M + "
           f"MoA {sum(p.numel() for p in params['moa']) / 1e6:.3f}M params, "
-          f"moa={'on' if model.moa is not None else 'off'}, sva_full={cfg.sva.full}")
+          f"moa={'on' if model.moa is not None else 'off'} lape={'on' if model.lape_on else 'off'} "
+          f"feat={cfg.feat.backbone} sva_full={cfg.sva.full}")
     optimizer = torch.optim.AdamW(all_params, lr=t.lr, weight_decay=t.weight_decay)
     scaler = (torch.amp.GradScaler("cuda") if (t.amp and t.amp_dtype == "fp16" and device.type == "cuda")
               else None)
@@ -547,7 +579,9 @@ def run(args, config_fn=build_config, datasets_fn=build_datasets) -> None:
     print(f" warp_channels={cfg.cascade.warp_channels}  num_depths={cfg.cascade.num_depths}")
     print(f" batch={t.batch_size} views={t.num_views} lr={t.lr:g} warmup={t.warmup_steps} "
           f"amp={t.amp}/{t.amp_dtype} multi_scale={t.multi_scale}")
-    print(f" train={len(train_ds)} samples  val={len(val_ds)} samples  DA3 process_res={train_ds.da3_process_res}")
+    da3_res = da3_resolution(model, train_ds)
+    print(f" train={len(train_ds)} samples  val={len(val_ds)} samples  "
+          f"DA3 {'online' if model.da3_sva is not None else 'cache'} process_res={da3_res}")
     print(f" ckpt -> {logger.model_dir}/{{latest,best}}.pth   tensorboard -> {logger.tb_dir}")
     print("=" * 72)
 
@@ -563,7 +597,7 @@ def run(args, config_fn=build_config, datasets_fn=build_datasets) -> None:
     def save(name: str, step: int, epoch: int) -> None:
         opt = optimizer if name == "latest.pth" else None
         logger.save(name, make_payload(model, opt, cfg, step, epoch, steps_per_epoch, max_steps,
-                                       logger.best, train_ds.da3_process_res))
+                                       logger.best, da3_res))
 
     last_val = {"step": -1}
 
