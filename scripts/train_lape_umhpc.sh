@@ -3,9 +3,9 @@
 #SBATCH --partition=gpu-a100
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=16
-#SBATCH --mem=96G
+#SBATCH --gres=gpu:2
+#SBATCH --cpus-per-task=32
+#SBATCH --mem=192G
 #SBATCH --qos=long
 #SBATCH --time=3-00:00:00
 #SBATCH --signal=B:USR1@900
@@ -14,10 +14,10 @@
 
 # =============================================================================
 # LAPE (DA3 特征 + 在线 DA3 单目深度 + 五个先验模块) —— DTU 从头训练 10 个 epoch。
-# 单卡 A100-80GB, sbatch 提交 (不是 bash)。
+# 双卡 A100-80GB (单节点 DDP), sbatch 提交 (不是 bash)。
 #
 #   cd <本 checkout 的根目录> && git pull && mkdir -p logs
-#   sbatch scripts/train_lape_umhpc.sh                       # 默认: LAPE_DTU_E10, 10 epoch, batch 2
+#   sbatch scripts/train_lape_umhpc.sh                       # 默认: LAPE_DTU_E10, 10 epoch, 每卡 batch 2 / 全局 batch 4
 #   LAPE=off sbatch scripts/train_lape_umhpc.sh              # 同口径对照: DA3 特征 + MoA (先验只定中心)
 #   EPOCHS=1 RUN_NAME=LAPE_DTU_E1 sbatch scripts/train_lape_umhpc.sh   # 先跑 1 个 epoch 看速度
 #
@@ -28,17 +28,17 @@
 #     stage1 两遍正则 (见 docs: LAPE 终版方案)。
 #   必须从 step 0 训练 (项目惯例), 不能从 moa1/moa2 续训。
 #
-# 时长: DTU train 27097 个样本, batch 2 -> 每 epoch 13549 步, 10 epoch = 135490 步。
-#   本地 5060Ti 实测 (batch 1, 5 视角): 384x512 1.38 s/步 峰值 10.5 GiB, 448x576 1.83 s/步 13.2 GiB;
-#   同尺寸 LAPE=off 1.02 s/步 10.2 GiB (LAPE 多 ~36% 时间, 显存几乎不变)。按这两点线性外推,
-#   最大训练尺度 640x896 + batch 2 峰值约 52 GiB, 80GB 卡放得下。A100 上的速度**没有实测**,
-#   估计约 1.5-2 s/步, 10 epoch 约 60-75 小时 —— 会超过 3 天上限, 靠下面的自动续投接着跑。
-#   第一份日志的 "s/step" 和 "mem=" 就是实测值; 如果显存吃紧 (>75G) 用 PER_GPU_BATCH=1 重投。
-#   提交前也可以在 interactive 里先测最大尺度:
-#     python train_moa.py --profile umhpc --smoke --smoke-steps 5 --batch-size 2 --num-views 5 --smoke-hw 640 896
+# 双卡: torchrun 每卡一个进程; 每卡 batch 2, 全局 batch 4。
+#   每个 epoch 丢弃不足一个全局 batch 的尾部样本; 实际步数由 DataLoader 决定。
+#   学习率仍按原平方根规则, 3e-4 @ 全局 batch 2 -> 4.243e-4 @ 全局 batch 4。
+#   NUM_WORKERS=12 是每进程的 worker 数 (双卡共 24), 验证 batch 4 也是每卡值。
+#   A100 双卡的速度/峰值显存尚未实测; 以日志为准。
+#   已分配双卡的 interactive 节点可先测最大尺度:
+#     torchrun --standalone --nnodes=1 --nproc-per-node=2 train_moa.py --profile umhpc --smoke --smoke-steps 5 --batch-size 2 --num-views 5 --smoke-hw 640 896
 #
-# 超时自动续投: slurm 在超时前 15 分钟发 USR1, train_moa.py 跑完当前 step 写 latest.pth 并以 124
-# 退出, 本脚本用 FRESH=0 (--resume auto) 重投自己。手动续训: FRESH=0 sbatch scripts/train_lape_umhpc.sh
+# 超时自动续投: slurm 在超时前 15 分钟发 USR1, 所有 rank 跑完当前 step,
+# 同步保存 latest.pth 后正常退出 torchrun; 脚本通过 stop-file 识别并用 FRESH=0 重投。
+# 手动续训: FRESH=0 sbatch scripts/train_lape_umhpc.sh
 #
 # 输出: log/experiments/$RUN_NAME/{model/{latest,best}.pth, tensorboard, config.json}
 # 训完: DTU 测试 sbatch scripts/test_lape_dtu_umhpc.sh;  BlendedMVS 微调 sbatch scripts/train_lape_blended_umhpc.sh
@@ -62,7 +62,9 @@ esac
 EPOCHS=${EPOCHS:-10}
 STEPS=${STEPS:-0}                        # >0 则按步数跑 (覆盖 EPOCHS); 0 = 按 EPOCHS
 WARP_CHANNELS=${WARP_CHANNELS:-128,128,128,128}
+NPROC=2                                 # 单节点双卡, 一卡一个训练进程
 PER_GPU_BATCH=${PER_GPU_BATCH:-2}
+GLOBAL_BATCH=$((NPROC * PER_GPU_BATCH))
 VAL_BATCH_SIZE=${VAL_BATCH_SIZE:-4}
 NUM_VIEWS=${NUM_VIEWS:-5}
 NUM_WORKERS=${NUM_WORKERS:-12}
@@ -79,7 +81,7 @@ MAX_CHAIN=${MAX_CHAIN:-4}
 # lr: 3e-4 @ 全局 batch 2, 按 sqrt 缩放 (与 train_moa_umhpc.sh 同一规则)
 LR_REF=${LR_REF:-3e-4}
 LR_REF_BATCH=${LR_REF_BATCH:-2}
-LR=${LR:-$(awk -v l="$LR_REF" -v g="$PER_GPU_BATCH" -v r="$LR_REF_BATCH" 'BEGIN{printf "%.4g", l*sqrt(g/r)}')}
+LR=${LR:-$(awk -v l="$LR_REF" -v g="$GLOBAL_BATCH" -v r="$LR_REF_BATCH" 'BEGIN{printf "%.4g", l*sqrt(g/r)}')}
 
 set +u
 source ~/.bashrc
@@ -117,19 +119,21 @@ GIT_SHA=$(git rev-parse HEAD 2>/dev/null || echo unknown)
 echo "=================================================================="
 echo " LAPE DTU  lape=$LAPE  run=$RUN_NAME  job=${SLURM_JOB_ID:-manual}  host=$(hostname)"
 echo " git=${GIT_SHA:0:12}  chain=$CHAIN/$MAX_CHAIN  fresh=$FRESH  resume=$RESUME"
-echo " epochs=$EPOCHS steps=$STEPS batch=$PER_GPU_BATCH views=$NUM_VIEWS warp=$WARP_CHANNELS da3_res=$DA3_RES"
+echo " epochs=$EPOCHS steps=$STEPS per_gpu_batch=$PER_GPU_BATCH global_batch=$GLOBAL_BATCH gpus=$NPROC views=$NUM_VIEWS warp=$WARP_CHANNELS da3_res=$DA3_RES"
 echo " lr=$LR warmup=$WARMUP_STEPS seed=$SEED"
 echo "=================================================================="
 nvidia-smi -L || true
-python - "$PER_GPU_BATCH" <<'PY' || exit 1
+python - "$PER_GPU_BATCH" "$NPROC" <<'PY' || exit 1
 import sys, torch
 from base.config import ProjectPaths
-if not torch.cuda.is_available():
-    sys.exit("CUDA 不可用 —— 这个作业需要 --gres=gpu:1")
-gib = torch.cuda.get_device_properties(0).total_memory / 2**30
-print(f"=== GPU {torch.cuda.get_device_name(0)}  {gib:.0f} GiB ===")
-if gib < 70 and int(sys.argv[1]) >= 2:
-    sys.exit(f"只分到 {gib:.0f} GiB 的卡, batch {sys.argv[1]} 需要 80GB A100; 换节点或 PER_GPU_BATCH=1 重投")
+if not torch.cuda.is_available() or torch.cuda.device_count() < int(sys.argv[2]):
+    sys.exit("需要两张可见 GPU —— 这个作业需要 --gres=gpu:2")
+for i in range(int(sys.argv[2])):
+    prop = torch.cuda.get_device_properties(i)
+    gib = prop.total_memory / 2**30
+    print(f"=== GPU {i}: {prop.name}  {gib:.0f} GiB ===")
+    if "A100" not in prop.name or gib < 70:
+        sys.exit(f"GPU {i} 是 {prop.name} / {gib:.0f} GiB; 本脚本要求两张 A100 80GB")
 w = ProjectPaths().da3_weights_file
 if not (w / "model.safetensors").is_file():
     sys.exit(f"DA3 权重不在 {w} (需要 config.json + model.safetensors)")
@@ -163,17 +167,27 @@ else
 fi
 [[ "$DETERMINISTIC" == "1" ]] && args+=(--deterministic)
 
-python train_moa.py "${args[@]}" &
+# 不向 torchrun 父进程发 USR1 (会直接终止 launcher)。共享文件让所有 rank
+# 在完成当前训练 step 后同步存档; launcher 正常退出后再触发原自动续投逻辑。
+STOP_FILE=$(mktemp "$PROJECT_DIR/logs/lape_stop_${SLURM_JOB_ID:-manual}.XXXXXX")
+rm -f "$STOP_FILE"
+trap 'echo "=== 收到超时信号, 请求所有 rank 存档 ==="; touch "$STOP_FILE"' USR1 TERM
+python -m torch.distributed.run --standalone --nnodes=1 --nproc-per-node="$NPROC" --max-restarts=0 \
+    train_moa.py "${args[@]}" --stop-file "$STOP_FILE" &
 PID=$!
-trap 'echo "=== 收到 USR1 (即将超时), 通知训练进程存档 ==="; kill -USR1 "$PID" 2>/dev/null || true' USR1
 set +e
 wait "$PID"
 RC=$?
-if [[ $RC -gt 128 ]]; then
+while [[ $RC -gt 128 ]] && kill -0 "$PID" 2>/dev/null; do
     wait "$PID"
     RC=$?
-fi
+done
 set -e
+if [[ $RC -eq 0 && -f "$STOP_FILE" ]]; then
+    RC=124
+fi
+rm -f "$STOP_FILE"
+trap - USR1 TERM
 
 if [[ $RC -eq 124 ]]; then
     if [[ $CHAIN -ge $MAX_CHAIN ]]; then

@@ -1,14 +1,16 @@
-"""Train MoAMVSNet (single GPU, epoch-based).
+"""Train MoAMVSNet (single GPU or torchrun DDP, epoch-based).
 
     python train_moa.py --profile umhpc --name MOA_v1 --epochs 15
     python train_moa.py --profile local --name moa_local --smoke          # synthetic batches
+    torchrun --standalone --nproc-per-node=2 train_moa.py --profile umhpc --batch-size 2
 
 Run layout: log/experiments/<name>/{model/latest.pth, model/best.pth, tensorboard/}.
 ``steps_per_epoch`` is ``len(train_loader)`` (drop_last) and the cosine LR horizon is
 ``epochs * steps_per_epoch``, both computed here rather than by the launcher.
 
-SIGUSR1 / SIGTERM (slurm's pre-timeout signal) finish the current step, write
-latest.pth and exit with code 124, so a launcher can requeue with --resume auto.
+SIGUSR1 / SIGTERM (slurm's pre-timeout signal) finish the current step and write
+latest.pth. Single GPU exits 124; DDP workers exit cleanly and the launcher's
+shared --stop-file requests requeue with --resume auto.
 
 This entry point never imports models.network / the prior cache / SPRE.
 """
@@ -28,6 +30,8 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 
 from base.config_moa import MoAMVSConfig, arch_snapshot, build_moa_config, config_snapshot
@@ -44,6 +48,88 @@ except Exception:  # tensorboard not installed
 EXIT_REQUEUE = 124
 # frozen ViT weights (DINOv3 for legacy runs, DA3 now): reloaded from file, never checkpointed
 FROZEN_PREFIXES = FROZEN_PREFIX = ("dino_sva.dino.", "da3_sva.da3.")
+
+
+def world_size() -> int:
+    return dist.get_world_size() if dist.is_initialized() else 1
+
+
+def rank() -> int:
+    return dist.get_rank() if dist.is_initialized() else 0
+
+
+def unwrap_model(model):
+    return model.module.network if isinstance(model, DDP) else model
+
+
+class DistributedTrainModule(torch.nn.Module):
+    """Expose only the loss graph to DDP's unused-parameter traversal.
+
+    LAPE returns dataclasses and auxiliary tensors whose graphs may not be used
+    by the loss. Finding unused parameters on those outputs would misclassify
+    parameters. Compute the loss inside forward; metrics need only detached depth.
+    """
+
+    def __init__(self, network, loss_fn):
+        super().__init__()
+        self.network, self.loss_fn = network, loss_fn
+
+    def forward(self, batch, diagnostics=False):
+        out = self.network(batch)
+        with torch.autocast(device_type=batch["images"].device.type, enabled=False):
+            loss, logs = self.loss_fn(out, batch, diagnostics=diagnostics)
+        return {"depth_full": out["depth_full"].detach()}, loss, logs
+
+
+def wrap_distributed(model, loss_fn, device):
+    if world_size() == 1:
+        return model
+    return DDP(DistributedTrainModule(model, loss_fn),
+               device_ids=[device.index] if device.type == "cuda" else None,
+               find_unused_parameters=True)
+
+
+def collective_flag(value: bool, device) -> bool:
+    flag = torch.tensor(int(value), device=device)
+    if world_size() > 1:
+        dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+    return bool(flag.item())
+
+
+def mean_logs(logs: dict, device) -> dict:
+    if world_size() == 1:
+        return logs
+    keys = sorted(logs)
+    values = torch.tensor([float(logs[k]) for k in keys], dtype=torch.float64, device=device)
+    dist.all_reduce(values)
+    values /= world_size()
+    return dict(zip(keys, values.cpu().tolist()))
+
+
+class ShardedEpochSampler(torch.utils.data.Sampler):
+    """Shard complete global batches without padding or changing epoch ordering."""
+
+    def __init__(self, base, batch_size: int, rank_id: int, replicas: int):
+        self.base, self.batch_size = base, batch_size
+        self.rank_id, self.replicas = rank_id, replicas
+
+    def set_epoch(self, epoch):
+        self.base.set_epoch(epoch)
+
+    def global_order(self):
+        order = list(self.base)
+        size = self.batch_size * self.replicas
+        return order[:len(order) // size * size]
+
+    def __iter__(self):
+        order = self.global_order()
+        size = self.batch_size * self.replicas
+        offset = self.rank_id * self.batch_size
+        return iter([idx for start in range(0, len(order), size)
+                     for idx in order[start + offset:start + offset + self.batch_size]])
+
+    def __len__(self):
+        return len(self.base) // (self.batch_size * self.replicas) * self.batch_size
 
 
 # --------------------------------------------------------------------------- #
@@ -111,7 +197,7 @@ def seed_everything(seed: int, deterministic: bool) -> None:
 def rng_state() -> dict:
     return {"python": random.getstate(), "numpy": np.random.get_state(),
             "torch": torch.get_rng_state(),
-            "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None}
+            "cuda_local": torch.cuda.get_rng_state() if torch.cuda.is_available() else None}
 
 
 def restore_rng(state: dict | None) -> None:
@@ -121,8 +207,11 @@ def restore_rng(state: dict | None) -> None:
         random.setstate(state["python"])
         np.random.set_state(state["numpy"])
         torch.set_rng_state(state["torch"].cpu())
-        if state.get("cuda") is not None and torch.cuda.is_available():
-            torch.cuda.set_rng_state_all([s.cpu() for s in state["cuda"]])
+        if state.get("cuda_local") is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state(state["cuda_local"].cpu())
+        elif state.get("cuda") is not None and torch.cuda.is_available():
+            states = state["cuda"]
+            torch.cuda.set_rng_state(states[min(torch.cuda.current_device(), len(states) - 1)].cpu())
     except Exception as exc:
         print(f"[resume] RNG state not restored ({exc}); continuing")
 
@@ -141,6 +230,7 @@ def load_checkpoint(path, map_location=None) -> dict:
 
 
 def trainable_state_dict(model: torch.nn.Module) -> dict:
+    model = unwrap_model(model)
     return {k: v for k, v in model.state_dict().items() if not k.startswith(FROZEN_PREFIX)}
 
 
@@ -188,6 +278,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--profile", choices=["local", "umhpc"], default=os.environ.get("UPRMVS_PROFILE", "umhpc"))
     p.add_argument("--name", default="MOA")
     p.add_argument("--device", default="cuda:0")
+    p.add_argument("--stop-file", default=None, help="launcher's shared graceful-stop request file")
     p.add_argument("--epochs", type=int, default=None)
     p.add_argument("--max-steps", type=int, default=None, help="hard stop; 0 = epochs x steps_per_epoch")
     p.add_argument("--lr-schedule-steps", type=int, default=None,
@@ -341,6 +432,7 @@ def synthetic_batch(cfg: MoAMVSConfig, device, batch_size: int, hw) -> dict:
 
 def set_train_mode(model: MoAMVSNet, freeze_backbone: bool) -> None:
     model.train()
+    model = unwrap_model(model)
     if freeze_backbone:
         for m in (model.dino_sva, model.da3_sva, model.fpn, model.sva_pathway, model.cost_volumes,
                   model.decoders):
@@ -355,10 +447,11 @@ class RunLogger:
     def __init__(self, name: str, project: Path) -> None:
         self.root = project / "log" / "experiments" / name
         self.model_dir = self.root / "model"
-        self.model_dir.mkdir(parents=True, exist_ok=True)
+        if rank() == 0:
+            self.model_dir.mkdir(parents=True, exist_ok=True)
         self.tb_dir = self.root / "tensorboard"
-        self.tb = SummaryWriter(str(self.tb_dir)) if SummaryWriter else None
-        if self.tb is None:
+        self.tb = SummaryWriter(str(self.tb_dir)) if SummaryWriter and rank() == 0 else None
+        if self.tb is None and rank() == 0:
             print("[log] WARNING tensorboard 不可用 (torch.utils.tensorboard 导入失败), "
                   "本次训练只有 stdout, 不会写 tfevents")
         self.best = float("inf")
@@ -371,11 +464,17 @@ class RunLogger:
                 self.tb.add_scalar(f"{prefix}/{k}", float(v), step)
 
     def save(self, name: str, payload: dict) -> Path:
+        if self.tb is not None:
+            self.tb.flush()
         path = self.model_dir / name
         tmp = path.with_suffix(".tmp")
         torch.save(payload, tmp)
         os.replace(tmp, path)
         return path
+
+    def close(self):
+        if self.tb is not None:
+            self.tb.close()
 
 
 def make_payload(model, optimizer, cfg, step, epoch, steps_per_epoch, max_steps, best, da3_res) -> dict:
@@ -403,9 +502,13 @@ def train_step(model, loss_fn, optimizer, scaler, params, batch, cfg, device, di
     amp_dtype = torch.bfloat16 if t.amp_dtype == "bf16" else torch.float16
     optimizer.zero_grad(set_to_none=True)
     with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-        out = model(batch)
-    loss, logs = loss_fn(out, batch, diagnostics=diag)
-    if not torch.isfinite(loss):
+        if isinstance(model, DDP):
+            out, loss, logs = model(batch, diagnostics=diag)
+        else:
+            out = model(batch)
+    if not isinstance(model, DDP):
+        loss, logs = loss_fn(out, batch, diagnostics=diag)
+    if collective_flag(not bool(torch.isfinite(loss)), device):
         bad = {k: float(v) for k, v in logs.items() if not torch.isfinite(v)}
         raise NonFiniteError(f"non-finite loss; offending terms: {bad} "
                              f"samples: {list(zip(batch.get('scan', []), batch.get('ref_view', [])))}")
@@ -418,7 +521,7 @@ def train_step(model, loss_fn, optimizer, scaler, params, batch, cfg, device, di
     # shrink the backbone's update, coupling the two through the optimizer even
     # though no MoA gradient reaches the backbone.
     norms = {name: torch.nn.utils.clip_grad_norm_(ps, t.grad_clip) for name, ps in params.items() if ps}
-    ok = all(bool(torch.isfinite(n)) for n in norms.values())
+    ok = not collective_flag(not all(bool(torch.isfinite(n)) for n in norms.values()), device)
     if scaler is not None:
         scaler.step(optimizer)
         scaler.update()
@@ -434,7 +537,13 @@ def validate(model, loader, loss_fn, cfg, device, freeze_backbone: bool) -> dict
     t = cfg.train
     use_amp = t.amp and device.type == "cuda"
     amp_dtype = torch.bfloat16 if t.amp_dtype == "bf16" else torch.float16
-    model.eval()
+    # Validation shards can have different lengths, so bypass DDP's forward
+    # collectives and synchronize running buffers once before evaluating.
+    network = unwrap_model(model)
+    if world_size() > 1:
+        for buffer in network.buffers():
+            dist.broadcast(buffer, src=0)
+    network.eval()
     sums = torch.zeros(6, dtype=torch.float64, device=device)
     agg: dict[str, float] = {}
     n = 0
@@ -442,12 +551,23 @@ def validate(model, loader, loss_fn, cfg, device, freeze_backbone: bool) -> dict
         batch = {k: (v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v)
                  for k, v in batch.items()}
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-            out = model(batch)
+            out = network(batch)
         sums += depth_errors(out["depth_full"], batch["depth_gt"], metric_mask(batch), batch.get("metric_scale"))
         _, logs = loss_fn(out, batch, diagnostics=True)
+        weight = len(batch["depth_gt"]) if world_size() > 1 else 1
         for k, v in logs.items():
-            agg[k] = agg.get(k, 0.0) + float(v)
-        n += 1
+            agg[k] = agg.get(k, 0.0) + float(v) * weight
+        n += weight
+    if world_size() > 1:
+        dist.all_reduce(sums)
+        key_lists = [None] * world_size()
+        dist.all_gather_object(key_lists, sorted(agg))
+        keys = sorted({k for ks in key_lists for k in ks})
+        values = torch.tensor([n] + [agg.get(k, 0.0) for k in keys],
+                              dtype=torch.float64, device=device)
+        dist.all_reduce(values)
+        n = float(values[0])
+        agg = dict(zip(keys, values[1:].cpu().tolist()))
     set_train_mode(model, freeze_backbone)
     m = metrics_from_sums(sums)
     m.update({k: v / max(n, 1) for k, v in agg.items()})
@@ -455,6 +575,7 @@ def validate(model, loader, loss_fn, cfg, device, freeze_backbone: bool) -> dict
 
 
 def da3_resolution(model, ds):
+    model = unwrap_model(model)
     if getattr(model, "da3_sva", None) is not None:
         return model.da3_process_res
     return getattr(ds, "da3_process_res", None)
@@ -469,12 +590,26 @@ def main(argv=None) -> None:
 
 
 def run(args, config_fn=build_config, datasets_fn=build_datasets) -> None:
+    owns_group = int(os.environ.get("WORLD_SIZE", "1")) > 1 and not dist.is_initialized()
+    if owns_group:
+        if torch.cuda.is_available():
+            torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+        dist.init_process_group(backend="nccl" if torch.cuda.is_available() else "gloo")
+    try:
+        _run(args, config_fn, datasets_fn)
+    finally:
+        if owns_group:
+            dist.destroy_process_group()
+
+
+def _run(args, config_fn=build_config, datasets_fn=build_datasets) -> None:
     """Training loop. ``config_fn(args)`` / ``datasets_fn(cfg, args)`` let another
     entry point (train_blended.py) swap the dataset and the config source."""
     cfg = config_fn(args)
     t = cfg.train
     project = Path(cfg.paths.project_path)
-    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    device = torch.device(f"cuda:{os.environ['LOCAL_RANK']}" if world_size() > 1 and torch.cuda.is_available()
+                          else args.device if torch.cuda.is_available() else "cpu")
     if device.type == "cuda":
         torch.cuda.set_device(device)
     seed_everything(t.seed, args.deterministic)
@@ -511,6 +646,9 @@ def run(args, config_fn=build_config, datasets_fn=build_datasets) -> None:
     loss_fn = MoALoss(cfg.loss, cfg.cascade.num_depths[0])
 
     if args.smoke:
+        model = wrap_distributed(model, loss_fn, device)
+        if world_size() > 1:
+            seed_everything(t.seed + rank(), args.deterministic)
         run_smoke(model, loss_fn, optimizer, scaler, params, cfg, device, args)
         return
 
@@ -518,14 +656,18 @@ def run(args, config_fn=build_config, datasets_fn=build_datasets) -> None:
     # a dataset may bring its own epoch sampler (train_blended.py's balanced DTU+Blended mix)
     sampler = (train_ds.make_sampler(t.seed) if hasattr(train_ds, "make_sampler")
                else EpochShuffleSampler(len(train_ds), t.seed))
+    if world_size() > 1:
+        sampler = ShardedEpochSampler(sampler, t.batch_size, rank(), world_size())
     gen = torch.Generator()
-    gen.manual_seed(t.seed)
+    gen.manual_seed(t.seed + rank())
+    worker_context = {"multiprocessing_context": "spawn"} if world_size() > 1 and t.num_workers > 0 else {}
     loader = DataLoader(train_ds, batch_size=t.batch_size, sampler=sampler, num_workers=t.num_workers,
                         collate_fn=collate, worker_init_fn=worker_init, generator=gen,
-                        pin_memory=True, drop_last=True, persistent_workers=False)
-    val_loader = DataLoader(val_ds, batch_size=t.val_batch_size, shuffle=False,
+                        pin_memory=True, drop_last=True, persistent_workers=False, **worker_context)
+    val_loader = DataLoader(val_ds, batch_size=t.val_batch_size,
+                            sampler=range(rank(), len(val_ds), world_size()),
                             num_workers=t.num_workers, collate_fn=collate, worker_init_fn=worker_init,
-                            pin_memory=True, drop_last=False)
+                            pin_memory=True, drop_last=False, **worker_context)
     steps_per_epoch = len(loader)
     if steps_per_epoch == 0:
         raise SystemExit(f"train split has {len(train_ds)} samples < batch {t.batch_size}")
@@ -535,6 +677,8 @@ def run(args, config_fn=build_config, datasets_fn=build_datasets) -> None:
     horizon = t.lr_schedule_steps if t.lr_schedule_steps and t.lr_schedule_steps > 0 else max_steps
 
     logger = RunLogger(args.name, project)
+    if world_size() > 1:
+        dist.barrier()
     start_step = 0
     ckpt_path = None
     if args.resume == "auto":
@@ -561,7 +705,12 @@ def run(args, config_fn=build_config, datasets_fn=build_datasets) -> None:
             raise SystemExit(f"[resume] {ckpt_path} has no optimizer state (weights-only); "
                              f"use --init-from for weights, or resume from latest.pth")
         optimizer.load_state_dict(ck["optimizer"])
-        restore_rng(ck.get("rng"))
+        states = ck.get("rng_by_rank")
+        if states is not None and len(states) != world_size():
+            raise SystemExit("[resume] checkpoint world size differs; use --init-from for a new run")
+        restore_rng(states[rank()] if states is not None else ck.get("rng"))
+        if scaler is not None and ck.get("scaler") is not None:
+            scaler.load_state_dict(ck["scaler"])
         start_step = int(ck["step"])
         logger.best = float(ck.get("best_metric", float("inf")))
         if int(ck.get("steps_per_epoch", steps_per_epoch)) != steps_per_epoch:
@@ -570,20 +719,29 @@ def run(args, config_fn=build_config, datasets_fn=build_datasets) -> None:
         print(f"[resume] {ckpt_path} at step {start_step}")
     if start_step >= max_steps:
         print(f"[done] {args.name} already at step {start_step} >= {max_steps}; nothing to train")
+        logger.close()
         return
 
-    (logger.root / "config.json").write_text(json.dumps(config_snapshot(cfg), indent=2))
+    if rank() == 0:
+        snapshot = config_snapshot(cfg)
+        snapshot["distributed"] = {"world_size": world_size(), "global_batch_size": t.batch_size * world_size()}
+        (logger.root / "config.json").write_text(json.dumps(snapshot, indent=2))
     print("=" * 72)
     print(f" run={args.name}  epochs={t.epochs}  steps/epoch={steps_per_epoch}  max_steps={max_steps}"
           f"  lr_horizon={horizon}" + ("  (!= max_steps: 结束时不会退火到底)" if horizon != max_steps else ""))
     print(f" warp_channels={cfg.cascade.warp_channels}  num_depths={cfg.cascade.num_depths}")
-    print(f" batch={t.batch_size} views={t.num_views} lr={t.lr:g} warmup={t.warmup_steps} "
+    print(f" rank={rank()}/{world_size()} per_gpu_batch={t.batch_size} global_batch={t.batch_size * world_size()} "
+          f"views={t.num_views} lr={t.lr:g} warmup={t.warmup_steps} "
           f"amp={t.amp}/{t.amp_dtype} multi_scale={t.multi_scale}")
     da3_res = da3_resolution(model, train_ds)
     print(f" train={len(train_ds)} samples  val={len(val_ds)} samples  "
           f"DA3 {'online' if model.da3_sva is not None else 'cache'} process_res={da3_res}")
     print(f" ckpt -> {logger.model_dir}/{{latest,best}}.pth   tensorboard -> {logger.tb_dir}")
     print("=" * 72)
+
+    model = wrap_distributed(model, loss_fn, device)
+    if ckpt_path is None and world_size() > 1:
+        seed_everything(t.seed + rank(), args.deterministic)
 
     stop = {"sig": None}
 
@@ -596,8 +754,19 @@ def run(args, config_fn=build_config, datasets_fn=build_datasets) -> None:
 
     def save(name: str, step: int, epoch: int) -> None:
         opt = optimizer if name == "latest.pth" else None
-        logger.save(name, make_payload(model, opt, cfg, step, epoch, steps_per_epoch, max_steps,
-                                       logger.best, da3_res))
+        states = [rng_state()]
+        if world_size() > 1:
+            states = [None] * world_size()
+            dist.all_gather_object(states, rng_state())
+        if rank() == 0:
+            payload = make_payload(model, opt, cfg, step, epoch, steps_per_epoch, max_steps,
+                                   logger.best, da3_res)
+            payload.update(rng_by_rank=states, world_size=world_size(),
+                           global_batch_size=t.batch_size * world_size(),
+                           scaler=scaler.state_dict() if scaler is not None else None)
+            logger.save(name, payload)
+        if world_size() > 1:
+            dist.barrier()
 
     last_val = {"step": -1}
 
@@ -611,7 +780,8 @@ def run(args, config_fn=build_config, datasets_fn=build_datasets) -> None:
         if improved:
             logger.best = m["abs_err"]
             save("best.pth", step, epoch)
-        print(f"[val step {step} epoch {epoch}] {fmt(m)}{'  *best*' if improved else ''}", flush=True)
+        if rank() == 0:
+            print(f"[val step {step} epoch {epoch}] {fmt(m)}{'  *best*' if improved else ''}", flush=True)
 
     set_train_mode(model, args.freeze_backbone)
     step = start_step
@@ -624,7 +794,8 @@ def run(args, config_fn=build_config, datasets_fn=build_datasets) -> None:
     while step < max_steps:
         sampler.set_epoch(epoch)
         train_ds.set_epoch(epoch)
-        train_ds.reset_scale_plan(list(sampler), t.batch_size)
+        order = sampler.global_order() if isinstance(sampler, ShardedEpochSampler) else list(sampler)
+        train_ds.reset_scale_plan(order, t.batch_size * world_size())
         if skip:
             print(f"[resume] skipping the first {skip} batches of epoch {epoch}")
         for i, batch in enumerate(loader):
@@ -644,9 +815,12 @@ def run(args, config_fn=build_config, datasets_fn=build_datasets) -> None:
                 raise NonFiniteError(f"{bad_grads} consecutive non-finite gradients at step {step}")
             if diag:
                 with torch.no_grad():
-                    logs.update({f"train_{k}": v for k, v in metrics_from_sums(
-                        depth_errors(out["depth_full"], batch["depth_gt"], metric_mask(batch),
-                                     batch.get("metric_scale"))).items()})
+                    sums = depth_errors(out["depth_full"], batch["depth_gt"], metric_mask(batch),
+                                        batch.get("metric_scale"))
+                    if world_size() > 1:
+                        dist.all_reduce(sums)
+                    logs = mean_logs(logs, device)
+                    logs.update({f"train_{k}": v for k, v in metrics_from_sums(sums).items()})
                 vals = {k: float(v) for k, v in logs.items()}
                 logger.scalars("train", vals, step)
                 logger.scalars("train", {"lr": lr, "epoch": epoch + i / steps_per_epoch}, step)
@@ -658,16 +832,25 @@ def run(args, config_fn=build_config, datasets_fn=build_datasets) -> None:
                        if device.type == "cuda" else "")
                 moa = "".join(f" c{s}={vals[f'moa{s}_err_center_mm']:.2f}/{vals[f'moa{s}_err_mvs_mm']:.2f}"
                               for s in (2, 3, 4) if f"moa{s}_err_center_mm" in vals)
-                print(f"[step {step} ep {epoch}] loss={vals['loss']:.4f} "
-                      f"abs_err={vals.get('train_abs_err', float('nan')):.2f} "
-                      f"cover={vals.get('cover_s2', 0):.3f}/{vals.get('cover_s3', 0):.3f}/"
-                      f"{vals.get('cover_s4', 0):.3f}{moa} lr={lr:.2e} {sps:.2f}s/step "
-                      f"eta={eta_h:.1f}h{mem}", flush=True)
+                if rank() == 0:
+                    print(f"[step {step} ep {epoch}] loss={vals['loss']:.4f} "
+                          f"abs_err={vals.get('train_abs_err', float('nan')):.2f} "
+                          f"cover={vals.get('cover_s2', 0):.3f}/{vals.get('cover_s3', 0):.3f}/"
+                          f"{vals.get('cover_s4', 0):.3f}{moa} lr={lr:.2e} {sps:.2f}s/step "
+                          f"eta={eta_h:.1f}h{mem}", flush=True)
             step += 1
-            if stop["sig"] is not None:
+            requested = stop["sig"] is not None or bool(args.stop_file and Path(args.stop_file).exists())
+            if collective_flag(requested, device):
                 save("latest.pth", step, epoch)
-                print(f"[signal] saved latest.pth at step {step}; exiting {EXIT_REQUEUE} for requeue",
-                      flush=True)
+                logger.close()
+                if rank() == 0:
+                    print(f"[signal] saved latest.pth at step {step}; requesting requeue", flush=True)
+                if world_size() > 1:
+                    # torchrun translates nonzero worker exits to launcher failure.
+                    # The sbatch launcher checks the stop file after a clean exit.
+                    if args.stop_file:
+                        Path(args.stop_file).touch()
+                    return
                 sys.exit(EXIT_REQUEUE)
             if t.val_interval > 0 and step % t.val_interval == 0 and step % steps_per_epoch != 0:
                 run_val(step, epoch)
@@ -676,15 +859,17 @@ def run(args, config_fn=build_config, datasets_fn=build_datasets) -> None:
         skip = 0
         if step % steps_per_epoch == 0 and step > start_step:
             done_epoch = step // steps_per_epoch
+            run_val(step, done_epoch)
             save("latest.pth", step, done_epoch)
             if args.keep_epoch_ckpts:
                 save(f"epoch_{done_epoch:02d}.pth", step, done_epoch)
-            run_val(step, done_epoch)
         epoch += 1
 
-    save("latest.pth", step, step // steps_per_epoch)
     run_val(step, step // steps_per_epoch)
-    print(f"[done] {args.name}: {step} steps, best val abs_err {logger.best:.4f}")
+    save("latest.pth", step, step // steps_per_epoch)
+    logger.close()
+    if rank() == 0:
+        print(f"[done] {args.name}: {step} steps, best val abs_err {logger.best:.4f}")
 
 
 def run_smoke(model, loss_fn, optimizer, scaler, params, cfg, device, args) -> None:
